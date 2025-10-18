@@ -32,7 +32,7 @@ import (
 )
 
 // ==========================================================
-// --- 1. 配置与结构体定义 ---
+// --- 1. 配置与结构体定义 ---嘻嘻嘻
 // ==========================================================
 
 const ConfigFile = "ws_config.json"
@@ -185,7 +185,7 @@ func defaultConfig() *Config {
 			DefaultTargetHost:            "127.0.0.1",
 			DefaultTargetPort:            22,
 			BufferSize:                   32768,
-			HandshakePeek:                1024,
+			HandshakePeek:                8, // A smaller peek is enough for protocol detection
 			HandshakeTimeout:             10,
 			IdleTimeout:                  300,
 			MaxConns:                     4096,
@@ -237,6 +237,19 @@ func LoadConfig() (*Config, error) {
 // ==========================================================
 // --- 2. Proxy 核心实现 (生命周期, 监听, 协议嗅探) ---
 // ==========================================================
+
+// preloadedConn is a net.Conn wrapper that includes a buffer of pre-peeked data.
+// Its Read() method will first read from the buffer and then from the underlying connection.
+// This is crucial for allowing the tls.Server to correctly perform a handshake
+// on a connection where we've already peeked at the initial bytes.
+type preloadedConn struct {
+	net.Conn
+	preloaded *bufio.Reader
+}
+
+func (c *preloadedConn) Read(p []byte) (int, error) {
+	return c.preloaded.Read(p)
+}
 
 func NewProxy(cfg *Config) (*Proxy, error) {
 	ctx, cancel := context.WithCancel(context.Background())
@@ -380,8 +393,10 @@ func (p *Proxy) handleConnection(conn net.Conn) {
 	if isTLS(peekedBytes) {
 		p.handleTLSConnection(conn, reader)
 	} else if isHTTP(peekedBytes) {
+		// For HTTP, the preloaded reader is passed directly, as http.ReadRequest handles it correctly.
 		p.handleHTTPPayloadConnection(conn, reader)
 	} else {
+		// For direct TCP, we also pass the preloaded reader.
 		p.handleDirectConnection(conn, reader)
 	}
 }
@@ -400,7 +415,8 @@ func (p *Proxy) release() {
 }
 
 func isTLS(peekedBytes []byte) bool {
-	return len(peekedBytes) > 5 && peekedBytes[0] == 0x16 && peekedBytes[1] == 0x03
+	// TLS record header starts with 0x16
+	return len(peekedBytes) > 0 && peekedBytes[0] == 0x16
 }
 
 func isHTTP(peekedBytes []byte) bool {
@@ -414,32 +430,38 @@ func isHTTP(peekedBytes []byte) bool {
 // --- 3. 协议处理器和核心转发逻辑 ---
 // ==========================================================
 
-func (p *Proxy) handleTLSConnection(conn net.Conn, reader *bufio.Reader) {
+func (p *Proxy) handleTLSConnection(rawConn net.Conn, reader *bufio.Reader) {
 	if p.tlsConfig == nil {
-		p.Print("[!] TLS connection from %s rejected: TLS not configured", conn.RemoteAddr())
+		p.Print("[!] TLS connection from %s rejected: TLS not configured", rawConn.RemoteAddr())
 		return
 	}
-	tlsConn := tls.Server(conn, p.tlsConfig)
+
+	// Wrap the raw connection with our preloadedConn to "return" the peeked data.
+	preloaded := &preloadedConn{Conn: rawConn, preloaded: reader}
+
+	tlsConn := tls.Server(preloaded, p.tlsConfig)
 
 	err := tlsConn.SetReadDeadline(time.Now().Add(time.Duration(p.cfg.Settings.HandshakeTimeout) * time.Second))
 	if err != nil {
-		p.Print("[!] Failed to set TLS handshake deadline for %s: %v", conn.RemoteAddr(), err)
+		p.Print("[!] Failed to set TLS handshake deadline for %s: %v", rawConn.RemoteAddr(), err)
 		return
 	}
+
+	p.Print("[*] Performing TLS handshake for %s", rawConn.RemoteAddr())
 	if err := tlsConn.Handshake(); err != nil {
 		if err != io.EOF && !strings.Contains(err.Error(), "read: connection reset by peer") {
-			p.Print("[!] TLS handshake error from %s: %v", conn.RemoteAddr(), err)
+			p.Print("[!] TLS handshake error from %s: %v", rawConn.RemoteAddr(), err)
 		}
 		return
 	}
 	tlsConn.SetReadDeadline(time.Time{})
+	p.Print("[*] TLS handshake successful for %s", rawConn.RemoteAddr())
 
+	// After the handshake, the tlsConn itself handles all further I/O.
+	// We create a new bufio.Reader for the now-decrypted stream.
 	p.handleHTTPPayloadConnection(tlsConn, bufio.NewReader(tlsConn))
 }
 
-// ##################################################################
-// ####################    MODIFICATION START    ####################
-// ##################################################################
 func (p *Proxy) handleHTTPPayloadConnection(conn net.Conn, reader *bufio.Reader) {
 	remoteIP, _, _ := net.SplitHostPort(conn.RemoteAddr().String())
 	connKey := fmt.Sprintf("%s-%d", remoteIP, time.Now().UnixNano())
@@ -487,21 +509,45 @@ func (p *Proxy) handleHTTPPayloadConnection(conn net.Conn, reader *bufio.Reader)
 		req.Body.Close()
 		initialData = body
 
-		// ======================================================================
-		// --- AUTHENTICATION DISABLED FOR TESTING ---
-		// The original authentication block has been commented out.
-		// A default device ID is assigned for logging purposes.
-		//
-		// if p.cfg.Settings.EnableAuth {
-		// 	credential := req.Header.Get("X-Device-ID")
-		// 	... (full authentication logic here) ...
-		// }
-		//
-		connInfo.mu.Lock()
-		connInfo.deviceID = fmt.Sprintf("Unauthenticated-%s", remoteIP)
-		connInfo.mu.Unlock()
-		// --- END OF DISABLED AUTHENTICATION ---
-		// ======================================================================
+		if p.cfg.Settings.EnableAuth {
+			credential := req.Header.Get("X-Device-ID")
+			if credential == "" {
+				p.Print("[!] Auth Failed: Missing 'X-Device-ID' header from %s", remoteIP)
+				sendHTTPErrorAndClose(conn, http.StatusUnauthorized, "Unauthorized", "Missing Credentials")
+				return
+			}
+
+			p.cfg.lock.RLock()
+			deviceInfo, found := p.cfg.DeviceIDs[credential]
+			p.cfg.lock.RUnlock()
+
+			if !found {
+				p.Print("[!] Auth Failed: Invalid 'X-Device-ID' [%s] from %s", credential, remoteIP)
+				sendHTTPErrorAndClose(conn, http.StatusUnauthorized, "Unauthorized", "Invalid Credentials")
+				return
+			}
+			if !deviceInfo.Enabled {
+				p.Print("[!] Auth Failed: Device '%s' is disabled for %s", deviceInfo.FriendlyName, remoteIP)
+				sendHTTPErrorAndClose(conn, http.StatusForbidden, "Forbidden", "账号被禁止,请联系管理员解锁")
+				return
+			}
+			expiry, err := time.Parse("2006-01-02", deviceInfo.Expiry)
+			if err != nil || time.Now().After(expiry.Add(24*time.Hour)) {
+				p.Print("[!] Auth Failed: Device '%s' has expired for %s", deviceInfo.FriendlyName, remoteIP)
+				sendHTTPErrorAndClose(conn, http.StatusForbidden, "Forbidden", "账号已到期，请联系管理员充值")
+				return
+			}
+
+			connInfo.mu.Lock()
+			connInfo.deviceID = deviceInfo.FriendlyName
+			connInfo.credential = credential
+			connInfo.mu.Unlock()
+		} else {
+			// If auth is disabled in config, assign a default ID
+			connInfo.mu.Lock()
+			connInfo.deviceID = fmt.Sprintf("Unauthenticated-%s", remoteIP)
+			connInfo.mu.Unlock()
+		}
 
 		ua := req.UserAgent()
 		if p.cfg.Settings.UAKeywordProbe != "" && strings.Contains(ua, p.cfg.Settings.UAKeywordProbe) {
@@ -524,9 +570,6 @@ func (p *Proxy) handleHTTPPayloadConnection(conn net.Conn, reader *bufio.Reader)
 	conn.SetReadDeadline(time.Time{})
 	p.forwardToTarget(conn, reader, connInfo, headersText, initialData)
 }
-// ##################################################################
-// ####################     MODIFICATION END     ####################
-// ##################################################################
 
 func (p *Proxy) handleDirectConnection(conn net.Conn, reader *bufio.Reader) {
 	remoteIP, _, _ := net.SplitHostPort(conn.RemoteAddr().String())
@@ -545,6 +588,7 @@ func (p *Proxy) handleDirectConnection(conn net.Conn, reader *bufio.Reader) {
 	p.AddActiveConn(connKey, connInfo)
 	defer p.RemoveActiveConn(connKey)
 
+	// For direct connection, the 'reader' contains all the data from the client.
 	p.forwardToTarget(conn, reader, connInfo, "", nil)
 }
 
@@ -612,7 +656,7 @@ func (p *Proxy) pipeTraffic(wg *sync.WaitGroup, dst net.Conn, src io.Reader, con
 		case <-p.ctx.Done():
 		default:
 			if err != io.EOF && !strings.Contains(err.Error(), "use of closed network connection") {
-				// Silently ignore pipe errors as they are expected when one side closes.
+				// Silently ignore pipe errors
 			}
 		}
 	}
