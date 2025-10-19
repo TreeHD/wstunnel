@@ -1,3 +1,4 @@
+// ssh_relay_complete.go
 package main
 
 import (
@@ -163,11 +164,13 @@ func handleConnWithHTTPAuth(c net.Conn, config *ssh.ServerConfig) {
 				newChan.Reject(ssh.ConnectionFailed, "bad payload")
 				continue
 			}
-			ch, err := newChan.Accept()
+
+			ch, _, err := newChan.Accept() // 修正：新版库 Accept() 返回两个值
 			if err != nil {
 				log.Println("accept channel err:", err)
 				continue
 			}
+
 			go handleDirectTCPIP(ch, payload.Host, payload.Port)
 		} else {
 			newChan.Reject(ssh.UnknownChannelType, "only direct-tcpip allowed")
