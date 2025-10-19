@@ -1,4 +1,4 @@
-// wstunnel_full.go
+// wstunnel_full.go 成功上网版本
 package main
 
 import (
