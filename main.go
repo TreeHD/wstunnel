@@ -1,7 +1,8 @@
-// ssh_relay.go
+// wstunnel_full.go
 package main
 
 import (
+	"bufio"
 	"crypto/ed25519"
 	"crypto/rand"
 	"flag"
@@ -9,13 +10,14 @@ import (
 	"io"
 	"log"
 	"net"
+	"strings"
 	"sync/atomic"
 
 	"golang.org/x/crypto/ssh"
 )
 
 var (
-	listenAddr = flag.String("addr", ":2222", "SSH listen address")
+	listenAddr = flag.String("addr", ":2222", "Listen address")
 	socksAddr  = flag.String("socks", "127.0.0.1:1080", "Local SOCKS5 address")
 	user       = flag.String("user", "a555", "SSH username")
 	pass       = flag.String("pass", "a444", "SSH password")
@@ -27,7 +29,7 @@ func handleDirectTCPIP(ch ssh.Channel, destHost string, destPort uint32) {
 	atomic.AddInt64(&activeConn, 1)
 	defer atomic.AddInt64(&activeConn, -1)
 
-	// 连接本地 SOCKS5
+	// TCP 透传到 SOCKS5
 	socksConn, err := net.Dial("tcp", *socksAddr)
 	if err != nil {
 		log.Printf("connect to SOCKS5 fail: %v", err)
@@ -36,7 +38,6 @@ func handleDirectTCPIP(ch ssh.Channel, destHost string, destPort uint32) {
 	}
 	defer socksConn.Close()
 
-	// 双向透传
 	done := make(chan struct{}, 2)
 	go func() {
 		io.Copy(socksConn, ch)
@@ -49,6 +50,34 @@ func handleDirectTCPIP(ch ssh.Channel, destHost string, destPort uint32) {
 		done <- struct{}{}
 	}()
 	<-done
+}
+
+// 检查 HTTP 请求头 User-Agent
+func httpHandshake(conn net.Conn) error {
+	reader := bufio.NewReader(conn)
+	for {
+		line, err := reader.ReadString('\n')
+		if err != nil {
+			return fmt.Errorf("read http header fail: %v", err)
+		}
+		line = strings.TrimSpace(line)
+		if line == "" { // headers end
+			break
+		}
+		if strings.HasPrefix(strings.ToLower(line), "user-agent:") {
+			if strings.Contains(line, "26.4.0") {
+				// 返回 200 OK
+				_, err := conn.Write([]byte("HTTP/1.1 200 OK\r\n\r\n"))
+				if err != nil {
+					return fmt.Errorf("write http response fail: %v", err)
+				}
+				return nil
+			} else {
+				return fmt.Errorf("invalid user-agent")
+			}
+		}
+	}
+	return fmt.Errorf("user-agent not found")
 }
 
 func main() {
@@ -65,7 +94,7 @@ func main() {
 	}
 
 	// 生成 Ed25519 host key
-	pub, priv, err := ed25519.GenerateKey(rand.Reader)
+	_, priv, err := ed25519.GenerateKey(rand.Reader)
 	if err != nil {
 		log.Fatalf("generate host key fail: %v", err)
 	}
@@ -90,14 +119,26 @@ func main() {
 		}
 
 		go func(c net.Conn) {
+			atomic.AddInt64(&activeConn, 1)
+			defer atomic.AddInt64(&activeConn, -1)
+
+			// HTTP 阶段握手
+			if err := httpHandshake(c); err != nil {
+				log.Printf("http handshake failed: %v", err)
+				c.Close()
+				return
+			}
+			log.Printf("Phase 1 OK: HTTP handshake passed, waiting SSH payload")
+
+			// SSH 握手
 			sshConn, chans, reqs, err := ssh.NewServerConn(c, config)
 			if err != nil {
-				log.Printf("ssh handshake fail: %v", err)
+				log.Printf("ssh handshake failed: %v", err)
 				c.Close()
 				return
 			}
 			defer sshConn.Close()
-			log.Printf("new SSH conn from %s", sshConn.RemoteAddr())
+			log.Printf("Phase 2: SSH handshake success from %s", sshConn.RemoteAddr())
 			go ssh.DiscardRequests(reqs)
 
 			for newChan := range chans {
@@ -111,7 +152,6 @@ func main() {
 					continue
 				}
 
-				// 解析目标地址
 				var payload struct {
 					Host       string
 					Port       uint32
@@ -126,6 +166,7 @@ func main() {
 
 				go handleDirectTCPIP(ch, payload.Host, payload.Port)
 			}
+
 		}(conn)
 	}
 }
