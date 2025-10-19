@@ -2,6 +2,8 @@
 package main
 
 import (
+	"crypto/ed25519"
+	"crypto/rand"
 	"flag"
 	"fmt"
 	"io"
@@ -61,10 +63,15 @@ func main() {
 			return nil, fmt.Errorf("invalid credentials")
 		},
 	}
-	// 临时生成 host key
-	privateKey, err := ssh.NewSignerFromKey(generateHostKey())
+
+	// 生成 Ed25519 host key
+	pub, priv, err := ed25519.GenerateKey(rand.Reader)
 	if err != nil {
-		log.Fatalf("host key error: %v", err)
+		log.Fatalf("generate host key fail: %v", err)
+	}
+	privateKey, err := ssh.NewSignerFromKey(priv)
+	if err != nil {
+		log.Fatalf("create signer fail: %v", err)
 	}
 	config.AddHostKey(privateKey)
 
@@ -122,20 +129,3 @@ func main() {
 		}(conn)
 	}
 }
-
-// generateHostKey 临时生成 Ed25519 私钥
-func generateHostKey() interface{} {
-	// 使用标准库生成 Ed25519 key
-	// 也可以换成 rsa.GenerateKey(rand.Reader, 2048)
-	_, priv, err := ed25519GenerateKey()
-	if err != nil {
-		log.Fatalf("generate host key fail: %v", err)
-	}
-	return priv
-}
-
-// 使用标准库生成 Ed25519
-func ed25519GenerateKey() (pub, priv interface{}, err error) {
-	return ed25519.GenerateKey(nil)
-}
-
