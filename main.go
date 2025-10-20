@@ -4,7 +4,6 @@ import (
 	"bufio"
 	"crypto/ed25519"
 	"crypto/rand"
-	// "crypto/sha256" // [核心修复] 移除了这个未使用的包
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
@@ -39,43 +38,25 @@ type Config struct {
 var globalConfig *Config
 var activeConn int64
 
-// --- 在线用户管理 (无改动) ---
+// --- 在线用户及会话管理 (无改动) ---
 type OnlineUser struct {
-	ConnID string `json:"conn_id"`
-	Username string `json:"username"`
-	RemoteAddr string `json:"remote_addr"`
-	ConnectTime time.Time `json:"connect_time"`
-	sshConn ssh.Conn
+	ConnID string `json:"conn_id"`; Username string `json:"username"`; RemoteAddr string `json:"remote_addr"`; ConnectTime time.Time `json:"connect_time"`; sshConn ssh.Conn
 }
 var onlineUsers sync.Map
 func addOnlineUser(user *OnlineUser) { onlineUsers.Store(user.ConnID, user) }
 func removeOnlineUser(connID string) { onlineUsers.Delete(connID) }
-
-// --- 会话管理 (无改动) ---
 const sessionCookieName = "wstunnel_admin_session"
-type Session struct {
-	Username string
-	Expiry   time.Time
-}
+type Session struct { Username string; Expiry time.Time }
 var sessions = make(map[string]Session)
 var sessionsLock sync.RWMutex
-
 func createSession(username string) *http.Cookie {
-	sessionTokenBytes := make([]byte, 32)
-	rand.Read(sessionTokenBytes)
-	sessionToken := hex.EncodeToString(sessionTokenBytes)
-	expiry := time.Now().Add(12 * time.Hour)
-	sessionsLock.Lock()
-	sessions[sessionToken] = Session{Username: username, Expiry: expiry}
-	sessionsLock.Unlock()
+	sessionTokenBytes := make([]byte, 32); rand.Read(sessionTokenBytes); sessionToken := hex.EncodeToString(sessionTokenBytes)
+	expiry := time.Now().Add(12 * time.Hour); sessionsLock.Lock(); sessions[sessionToken] = Session{Username: username, Expiry: expiry}; sessionsLock.Unlock()
 	return &http.Cookie{Name: sessionCookieName, Value: sessionToken, Expires: expiry, Path: "/", HttpOnly: true}
 }
 func validateSession(r *http.Request) bool {
-	cookie, err := r.Cookie(sessionCookieName)
-	if err != nil { return false }
-	sessionsLock.RLock()
-	session, ok := sessions[cookie.Value]
-	sessionsLock.RUnlock()
+	cookie, err := r.Cookie(sessionCookieName); if err != nil { return false }
+	sessionsLock.RLock(); session, ok := sessions[cookie.Value]; sessionsLock.RUnlock()
 	if !ok || time.Now().After(session.Expiry) {
 		if ok { sessionsLock.Lock(); delete(sessions, cookie.Value); sessionsLock.Unlock() }
 		return false
@@ -84,7 +65,7 @@ func validateSession(r *http.Request) bool {
 }
 
 // --- 网络核心逻辑 (无改动) ---
-func socks5Connect(socksAddr string, destHost string, destPort uint16) (net.Conn, error) { /* ...内容不变... */ 
+func socks5Connect(socksAddr string, destHost string, destPort uint16) (net.Conn, error) { /* ...内容不变... */
 	c, err := net.Dial("tcp", socksAddr); if err != nil { return nil, err }
 	_, err = c.Write([]byte{0x05, 0x01, 0x00}); if err != nil { c.Close(); return nil, err }
 	buf := make([]byte, 2); if _, err := io.ReadFull(c, buf); err != nil { c.Close(); return nil, err }
@@ -98,7 +79,7 @@ func socks5Connect(socksAddr string, destHost string, destPort uint16) (net.Conn
 	}
 	return c, nil
 }
-func handleDirectTCPIP(ch ssh.Channel, destHost string, destPort uint32) { /* ...内容不变... */ 
+func handleDirectTCPIP(ch ssh.Channel, destHost string, destPort uint32) { /* ...内容不变... */
 	atomic.AddInt64(&activeConn, 1); defer atomic.AddInt64(&activeConn, -1)
 	globalConfig.lock.RLock(); socksServerAddr := globalConfig.SocksAddr; globalConfig.lock.RUnlock()
 	socksConn, err := socks5Connect(socksServerAddr, destHost, uint16(destPort)); if err != nil { log.Printf("connect to SOCKS5 fail: %v", err); ch.Close(); return }
@@ -139,47 +120,57 @@ func safeSaveConfig() error { /* ...内容不变... */
 	return ioutil.WriteFile("config.json", data, 0644)
 }
 
-// --- Web服务器逻辑 (无改动) ---
-func authMiddleware(next http.HandlerFunc) http.HandlerFunc {
+// ==============================================================================
+// === 核心修复点: 将所有错误的 `global` 修正为 `globalConfig` ===
+// ==============================================================================
+
+// Web服务器逻辑
+func authMiddleware(next http.HandlerFunc) http.HandlerFunc { /* ...内容不变... */
 	return func(w http.ResponseWriter, r *http.Request) {
-		if validateSession(r) {
-			next.ServeHTTP(w, r)
-		} else {
+		if validateSession(r) { next.ServeHTTP(w, r) } else {
 			if strings.HasPrefix(r.URL.Path, "/api/") { http.Error(w, `{"message":"Unauthorized"}`, http.StatusUnauthorized) } else { http.ServeFile(w, r, "login.html") }
 		}
 	}
 }
-func loginHandler(w http.ResponseWriter, r *http.Request) {
+func loginHandler(w http.ResponseWriter, r *http.Request) { /* ...内容不变... */
 	if r.Method != http.MethodPost { http.Error(w, "Method not allowed", http.StatusMethodNotAllowed); return }
-	var creds struct { Username string `json:"username"`; Password string `json:"password"` }
-	if err := json.NewDecoder(r.Body).Decode(&creds); err != nil { http.Error(w, `{"message":"无效的请求格式"}`, http.StatusBadRequest); return }
+	var creds struct { Username string `json:"username"`; Password string `json:"password"` }; if err := json.NewDecoder(r.Body).Decode(&creds); err != nil { http.Error(w, `{"message":"无效的请求格式"}`, http.StatusBadRequest); return }
 	globalConfig.lock.RLock(); storedPass, ok := globalConfig.AdminAccounts[creds.Username]; globalConfig.lock.RUnlock()
 	if !ok || creds.Password != storedPass { http.Error(w, `{"message":"用户名或密码错误"}`, http.StatusUnauthorized); return }
 	cookie := createSession(creds.Username); http.SetCookie(w, cookie); w.WriteHeader(http.StatusOK)
 }
-func logoutHandler(w http.ResponseWriter, r *http.Request) {
+func logoutHandler(w http.ResponseWriter, r *http.Request) { /* ...内容不变... */
 	cookie, err := r.Cookie(sessionCookieName); if err == nil { sessionsLock.Lock(); delete(sessions, cookie.Value); sessionsLock.Unlock() }
 	http.SetCookie(w, &http.Cookie{Name: sessionCookieName, Value: "", Path: "/", MaxAge: -1}); http.Redirect(w, r, "/", http.StatusFound)
 }
-func apiHandler(w http.ResponseWriter, r *http.Request) { /* ...内容不变... */ 
-	w.Header().Set("Content-Type", "application/json"); switch {
-	case r.URL.Path == "/api/online-users" && r.Method == "GET": var users []*OnlineUser; onlineUsers.Range(func(key, value interface{}) bool { users = append(users, value.(*OnlineUser)); return true }); json.NewEncoder(w).Encode(users)
-	case r.URL.Path == "/api/accounts" && r.Method == "GET": globalConfig.lock.RLock(); defer globalConfig.lock.RUnlock(); json.NewEncoder(w).Encode(global.Accounts)
-	case strings.HasPrefix(r.URL.Path, "/api/accounts/") && r.Method == "POST": username := strings.TrimPrefix(r.URL.Path, "/api/accounts/"); var accInfo AccountInfo; if err := json.NewDecoder(r.Body).Decode(&accInfo); err != nil { http.Error(w, `{"message":"无效的请求体"}`, http.StatusBadRequest); return }; globalConfig.lock.Lock(); globalConfig.Accounts[username] = accInfo; globalConfig.lock.Unlock(); if err := safeSaveConfig(); err != nil { http.Error(w, `{"message":"保存配置文件失败"}`, http.StatusInternalServerError); return }; json.NewEncoder(w).Encode(map[string]string{"message": fmt.Sprintf("账户 %s 添加成功", username)})
-	case strings.HasPrefix(r.URL.Path, "/api/accounts/") && r.Method == "DELETE": username := strings.TrimPrefix(r.URL.Path, "/api/accounts/"); globalConfig.lock.Lock(); delete(globalConfig.Accounts, username); globalConfig.lock.Unlock(); if err := safeSaveConfig(); err != nil { http.Error(w, `{"message":"保存配置文件失败"}` , http.StatusInternalServerError); return }; json.NewEncoder(w).Encode(map[string]string{"message": fmt.Sprintf("账户 %s 删除成功", username)})
-	case strings.HasSuffix(r.URL.Path, "/status") && r.Method == "PUT": pathParts := strings.Split(r.URL.Path, "/"); username := pathParts[3]; var payload struct { Enabled bool `json:"enabled"` }; if err := json.NewDecoder(r.Body).Decode(&payload); err != nil { http.Error(w, `{"message":"无效的请求体"}`, http.StatusBadRequest); return }; globalConfig.lock.Lock(); if acc, ok := globalConfig.Accounts[username]; ok { acc.Enabled = payload.Enabled; global.Accounts[username] = acc }; globalConfig.lock.Unlock(); if err := safeSaveConfig(); err != nil { http.Error(w, `{"message":"保存配置文件失败"}`, http.StatusInternalServerError); return }; json.NewEncoder(w).Encode(map[string]string{"message": fmt.Sprintf("账户 %s 状态更新成功", username)})
-	case strings.HasPrefix(r.URL.Path, "/api/connections/") && r.Method == "DELETE": connID := strings.TrimPrefix(r.URL.Path, "/api/connections/"); if user, ok := onlineUsers.Load(connID); ok { user.(*OnlineUser).sshConn.Close(); removeOnlineUser(connID); json.NewEncoder(w).Encode(map[string]string{"message": "连接已断开"}) } else { http.Error(w, `{"message":"连接未找到"}`, http.StatusNotFound) }
-	default: http.NotFound(w, r)
+func apiHandler(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+	switch {
+	case r.URL.Path == "/api/online-users" && r.Method == "GET":
+		var users []*OnlineUser; onlineUsers.Range(func(key, value interface{}) bool { users = append(users, value.(*OnlineUser)); return true }); json.NewEncoder(w).Encode(users)
+	case r.URL.Path == "/api/accounts" && r.Method == "GET":
+		globalConfig.lock.RLock(); defer globalConfig.lock.RUnlock()
+		json.NewEncoder(w).Encode(globalConfig.Accounts) // [修正点 1]
+	case strings.HasPrefix(r.URL.Path, "/api/accounts/") && r.Method == "POST":
+		username := strings.TrimPrefix(r.URL.Path, "/api/accounts/"); var accInfo AccountInfo; if err := json.NewDecoder(r.Body).Decode(&accInfo); err != nil { http.Error(w, `{"message":"无效的请求体"}`, http.StatusBadRequest); return }; globalConfig.lock.Lock(); globalConfig.Accounts[username] = accInfo; globalConfig.lock.Unlock(); if err := safeSaveConfig(); err != nil { http.Error(w, `{"message":"保存配置文件失败"}`, http.StatusInternalServerError); return }; json.NewEncoder(w).Encode(map[string]string{"message": fmt.Sprintf("账户 %s 添加成功", username)})
+	case strings.HasPrefix(r.URL.Path, "/api/accounts/") && r.Method == "DELETE":
+		username := strings.TrimPrefix(r.URL.Path, "/api/accounts/"); globalConfig.lock.Lock(); delete(globalConfig.Accounts, username); globalConfig.lock.Unlock(); if err := safeSaveConfig(); err != nil { http.Error(w, `{"message":"保存配置文件失败"}` , http.StatusInternalServerError); return }; json.NewEncoder(w).Encode(map[string]string{"message": fmt.Sprintf("账户 %s 删除成功", username)})
+	case strings.HasSuffix(r.URL.Path, "/status") && r.Method == "PUT":
+		pathParts := strings.Split(r.URL.Path, "/"); username := pathParts[3]; var payload struct { Enabled bool `json:"enabled"` }; if err := json.NewDecoder(r.Body).Decode(&payload); err != nil { http.Error(w, `{"message":"无效的请求体"}`, http.StatusBadRequest); return }
+		globalConfig.lock.Lock(); if acc, ok := globalConfig.Accounts[username]; ok { acc.Enabled = payload.Enabled; globalConfig.Accounts[username] = acc }; globalConfig.lock.Unlock(); // [修正点 2]
+		if err := safeSaveConfig(); err != nil { http.Error(w, `{"message":"保存配置文件失败"}`, http.StatusInternalServerError); return }; json.NewEncoder(w).Encode(map[string]string{"message": fmt.Sprintf("账户 %s 状态更新成功", username)})
+	case strings.HasPrefix(r.URL.Path, "/api/connections/") && r.Method == "DELETE":
+		connID := strings.TrimPrefix(r.URL.Path, "/api/connections/"); if user, ok := onlineUsers.Load(connID); ok { user.(*OnlineUser).sshConn.Close(); removeOnlineUser(connID); json.NewEncoder(w).Encode(map[string]string{"message": "连接已断开"}) } else { http.Error(w, `{"message":"连接未找到"}`, http.StatusNotFound) }
+	default:
+		http.NotFound(w, r)
 	}
 }
 
-// --- main 函数 (无改动) ---
+// main 函数
 func main() {
 	configFile, err := os.ReadFile("config.json"); if err != nil { log.Fatalf("FATAL: 无法读取 config.json 文件: %v", err) }
 	globalConfig = &Config{}; err = json.Unmarshal(configFile, globalConfig); if err != nil { log.Fatalf("FATAL: 解析 config.json 文件失败: %v", err) }
-	if globalConfig.ListenAddr == "" || globalConfig.SocksAddr == "" || len(globalConfig.AdminAccounts) == 0 {
-		log.Fatalf("FATAL: config.json 缺少必要配置项 (listen_addr, socks_addr, admin_accounts)")
-	}
+	if globalConfig.ListenAddr == "" || globalConfig.SocksAddr == "" || len(globalConfig.AdminAccounts) == 0 { log.Fatalf("FATAL: config.json 缺少必要配置项 (listen_addr, socks_addr, admin_accounts)") }
 	if globalConfig.AdminAddr == "" { globalConfig.AdminAddr = "127.0.0.1:9090" }
 	
 	go func() {
@@ -187,7 +178,7 @@ func main() {
 		adminHandler := func(w http.ResponseWriter, r *http.Request) { http.ServeFile(w, r, "admin.html") }
 		mux.HandleFunc("/", authMiddleware(adminHandler)); mux.HandleFunc("/api/", authMiddleware(apiHandler))
 		log.Printf("Admin panel listening on http://%s", globalConfig.AdminAddr)
-		if err := http.ListenAndServe(global.AdminAddr, mux); err != nil { log.Fatalf("FATAL: 无法启动Admin panel: %v", err) }
+		if err := http.ListenAndServe(globalConfig.AdminAddr, mux); err != nil { log.Fatalf("FATAL: 无法启动Admin panel: %v", err) } // [修正点 3]
 	}()
 	
 	sshCfg := &ssh.ServerConfig{
