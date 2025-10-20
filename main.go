@@ -15,6 +15,7 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -33,7 +34,7 @@ type AccountInfo struct {
 type Config struct {
 	ListenAddr          string                 `json:"listen_addr"`
 	SocksAddrs          []string               `json:"socks_addrs"`
-	UdpSocksAddr        string                 `json:"udp_socks_addr,omitempty"` // *** 新增: UDP专用SOCKS5地址 ***
+	UdpSocksAddr        string                 `json:"udp_socks_addr,omitempty"` // *** UDP专用SOCKS5地址 ***
 	AdminAddr           string                 `json:"admin_addr"`
 	AdminAccounts       map[string]string      `json:"admin_accounts"`
 	Accounts            map[string]AccountInfo `json:"accounts"`
@@ -46,7 +47,6 @@ type Config struct {
 	lock                sync.RWMutex
 }
 
-// ... (其他全局变量和结构体保持不变)
 var globalConfig *Config
 var activeConn int64
 type OnlineUser struct { ConnID, Username, RemoteAddr string; ConnectTime time.Time; sshConn ssh.Conn }
@@ -63,33 +63,70 @@ var bufferPool = sync.Pool{New: func() interface{} { b := make([]byte, 64*1024);
 
 
 // ==============================================================================
-// === 核心升级: UDP-over-TCP 协议解析辅助函数 ===
+// === 核心升级: UDP-over-TCP 协议解析/封装辅助函数 ===
 // ==============================================================================
 
-// readFramedPacket 从 reader 中读取一个 [2字节长度][数据] 格式的包
-// 这是“解外套”的核心
-func readFramedPacket(r io.Reader) ([]byte, error) {
-	var length uint16
-	// 1. 读取2字节的长度头
-	if err := binary.Read(r, binary.BigEndian, &length); err != nil {
-		if err == io.EOF {
-			return nil, io.EOF // 正常关闭
-		}
-		return nil, fmt.Errorf("failed to read frame length: %w", err)
+// readUdpOverTcpPacket 从 reader 中解析一个包含目标地址的、封装好的数据包
+// 这是“解外套”的最终形态
+func readUdpOverTcpPacket(r io.Reader) (destAddr string, payload []byte, err error) {
+	var totalLength uint16
+	// 1. 读取总长度
+	if err = binary.Read(r, binary.BigEndian, &totalLength); err != nil {
+		return "", nil, err // 如果是EOF，直接返回
 	}
 
-	// 2. 根据长度读取完整的数据包
-	packet := make([]byte, length)
-	if _, err := io.ReadFull(r, packet); err != nil {
-		return nil, fmt.Errorf("failed to read frame payload: %w", err)
+	if totalLength < 4 { // 至少需要 ATYP + Port
+		return "", nil, fmt.Errorf("invalid packet: total length %d is too short", totalLength)
 	}
-	return packet, nil
+
+	// 临时读取整个包的内容
+	fullPacket := make([]byte, totalLength)
+	if _, err = io.ReadFull(r, fullPacket); err != nil {
+		return "", nil, fmt.Errorf("failed to read full packet payload: %w", err)
+	}
+
+	// 2. 解析地址
+	offset := 0
+	atyp := fullPacket[offset]
+	offset++
+
+	var host string
+	switch atyp {
+	case 0x01: // IPv4
+		if len(fullPacket) < offset+4 { return "", nil, fmt.Errorf("invalid ipv4 packet") }
+		host = net.IP(fullPacket[offset : offset+4]).String()
+		offset += 4
+	case 0x03: // Domain
+		if len(fullPacket) < offset+1 { return "", nil, fmt.Errorf("invalid domain packet: no length") }
+		domainLen := int(fullPacket[offset])
+		offset++
+		if len(fullPacket) < offset+domainLen { return "", nil, fmt.Errorf("invalid domain packet: length mismatch") }
+		host = string(fullPacket[offset : offset+domainLen])
+		offset += domainLen
+	case 0x04: // IPv6
+		if len(fullPacket) < offset+16 { return "", nil, fmt.Errorf("invalid ipv6 packet") }
+		host = net.IP(fullPacket[offset : offset+16]).String()
+		offset += 16
+	default:
+		return "", nil, fmt.Errorf("unsupported atyp: %d", atyp)
+	}
+
+	// 3. 解析端口
+	if len(fullPacket) < offset+2 { return "", nil, fmt.Errorf("packet too short for port") }
+	port := binary.BigEndian.Uint16(fullPacket[offset : offset+2])
+	offset += 2
+	
+	destAddr = fmt.Sprintf("%s:%d", host, port)
+	payload = fullPacket[offset:]
+
+	return destAddr, payload, nil
 }
 
 // writeFramedPacket 将一个数据包以 [2字节长度][数据] 的格式写入 writer
 // 这是“穿外套”的核心
 func writeFramedPacket(w io.Writer, packet []byte) error {
 	length := uint16(len(packet))
+	// 注意: 客户端的回传协议可能不需要地址，所以我们只封装长度和内容
 	// 1. 写入2字节的长度头
 	if err := binary.Write(w, binary.BigEndian, length); err != nil {
 		return fmt.Errorf("failed to write frame length: %w", err)
@@ -101,107 +138,88 @@ func writeFramedPacket(w io.Writer, packet []byte) error {
 	return nil
 }
 
-// parseSocks5UDPResponse 解析SOCKS5服务器返回的UDP包，去掉SOCKS5头部
-func parseSocks5UDPResponse(packet []byte) ([]byte, error) {
-	if len(packet) < 4 {
-		return nil, fmt.Errorf("udp response packet too short")
+// buildSocks5UDPRequest 将裸UDP包和目标地址，封装成SOCKS5 UDP请求格式
+func buildSocks5UDPRequest(destAddr string, payload []byte) ([]byte, error) {
+	host, portStr, err := net.SplitHostPort(destAddr)
+	if err != nil {
+		return nil, fmt.Errorf("invalid dest addr '%s': %w", destAddr, err)
 	}
-	// RSV(2), FRAG(1)
-	offset := 3
-	atyp := packet[offset]
-	offset++
-
-	switch atyp {
-	case 0x01: // IPv4
-		offset += 4 // a.b.c.d
-	case 0x03: // Domain
-		domainLen := int(packet[offset])
-		offset++
-		offset += domainLen
-	case 0x04: // IPv6
-		offset += 16
-	default:
-		return nil, fmt.Errorf("unsupported atyp in udp response: %d", atyp)
+	port, err := strconv.Atoi(portStr)
+	if err != nil {
+		return nil, fmt.Errorf("invalid port '%s': %w", portStr, err)
 	}
 
-	offset += 2 // Port
-	if len(packet) < offset {
-		return nil, fmt.Errorf("udp response packet too short after header parsing")
+	addrBytes := []byte(host)
+	atyp := byte(0x03) // Domain
+	if ip := net.ParseIP(host); ip != nil {
+		if ip.To4() != nil {
+			atyp = 0x01 // IPv4
+			addrBytes = ip.To4()
+		} else {
+			atyp = 0x04 // IPv6
+			addrBytes = ip.To16()
+		}
 	}
-	return packet[offset:], nil
+
+	// SOCKS5 UDP Request Header: RSV(2), FRAG(1), ATYP(1), DST.ADDR, DST.PORT
+	header := []byte{0x00, 0x00, 0x00} // RSV, FRAG
+	header = append(header, atyp)
+	if atyp == 0x03 { // Domain
+		header = append(header, byte(len(addrBytes)))
+	}
+	header = append(header, addrBytes...)
+	header = binary.BigEndian.AppendUint16(header, uint16(port))
+
+	return append(header, payload...), nil
 }
-
 
 // ==============================================================================
 // === 核心升级: SOCKS5 UDP ASSOCIATE 客户端实现 ===
 // ==============================================================================
 
 // socks5UdpAssociate 与SOCKS5服务器执行UDP ASSOCIATE命令，并返回一个可用的UDP连接
-// 同时返回TCP控制连接，调用方必须在最后关闭它以释放资源
 func socks5UdpAssociate(socksAddr string) (net.PacketConn, net.Conn, *net.UDPAddr, error) {
-	// 1. 建立TCP控制连接
 	tcpConn, err := net.DialTimeout("tcp", socksAddr, 5*time.Second)
-	if err != nil {
-		return nil, nil, nil, fmt.Errorf("failed to dial socks5 server: %w", err)
-	}
-
-	// 2. 发送认证请求 (假设是NOAUTH)
+	if err != nil { return nil, nil, nil, fmt.Errorf("failed to dial socks5 server: %w", err) }
+	
 	if _, err := tcpConn.Write([]byte{0x05, 0x01, 0x00}); err != nil {
-		tcpConn.Close()
-		return nil, nil, nil, fmt.Errorf("failed to write auth request: %w", err)
+		tcpConn.Close(); return nil, nil, nil, fmt.Errorf("failed to write auth request: %w", err)
 	}
-
-	// 3. 读取认证响应
 	resp := make([]byte, 2)
 	if _, err := io.ReadFull(tcpConn, resp); err != nil {
-		tcpConn.Close()
-		return nil, nil, nil, fmt.Errorf("failed to read auth response: %w", err)
+		tcpConn.Close(); return nil, nil, nil, fmt.Errorf("failed to read auth response: %w", err)
 	}
 	if resp[0] != 0x05 || resp[1] != 0x00 {
-		tcpConn.Close()
-		return nil, nil, nil, fmt.Errorf("socks5 auth failed, received: %v", resp)
+		tcpConn.Close(); return nil, nil, nil, fmt.Errorf("socks5 auth failed, received: %v", resp)
 	}
-
-	// 4. 发送 UDP ASSOCIATE 请求 (请求服务器为我们分配IP和端口)
 	req := []byte{0x05, 0x03, 0x00, 0x01, 0, 0, 0, 0, 0, 0}
 	if _, err := tcpConn.Write(req); err != nil {
-		tcpConn.Close()
-		return nil, nil, nil, fmt.Errorf("failed to write udp associate request: %w", err)
+		tcpConn.Close(); return nil, nil, nil, fmt.Errorf("failed to write udp associate request: %w", err)
 	}
-
-	// 5. 读取 UDP ASSOCIATE 响应
 	resp = make([]byte, 10) // 假设是IPv4响应
 	if _, err := io.ReadFull(tcpConn, resp); err != nil {
-		tcpConn.Close()
-		return nil, nil, nil, fmt.Errorf("failed to read udp associate response: %w", err)
+		tcpConn.Close(); return nil, nil, nil, fmt.Errorf("failed to read udp associate response: %w", err)
 	}
 	if resp[1] != 0x00 {
-		tcpConn.Close()
-		return nil, nil, nil, fmt.Errorf("udp associate failed, status: %d", resp[1])
+		tcpConn.Close(); return nil, nil, nil, fmt.Errorf("udp associate failed, status: %d", resp[1])
 	}
 
-	// 6. 解析服务器为我们准备的UDP端口和地址
 	relayIP := net.IP(resp[4:8]).String()
 	relayPort := binary.BigEndian.Uint16(resp[8:10])
 	relayAddr, err := net.ResolveUDPAddr("udp", fmt.Sprintf("%s:%d", relayIP, relayPort))
 	if err != nil {
-		tcpConn.Close()
-		return nil, nil, nil, fmt.Errorf("failed to resolve relay udp addr: %w", err)
+		tcpConn.Close(); return nil, nil, nil, fmt.Errorf("failed to resolve relay udp addr: %w", err)
 	}
-
-	// 7. 创建一个本地UDP连接，用来和SOCKS5服务器的UDP端口通信
 	udpConn, err := net.ListenPacket("udp", "")
 	if err != nil {
-		tcpConn.Close()
-		return nil, nil, nil, fmt.Errorf("failed to listen on local udp port: %w", err)
+		tcpConn.Close(); return nil, nil, nil, fmt.Errorf("failed to listen on local udp port: %w", err)
 	}
-
 	return udpConn, tcpConn, relayAddr, nil
 }
 
 
 // ==============================================================================
-// === 核心升级: 全新的UDP流量处理函数 ===
+// === 核心升级: 全新的UDP流量处理函数 (最终版) ===
 // ==============================================================================
 
 func handleUdpProxy(ch ssh.Channel, sshConn ssh.Conn) {
@@ -212,8 +230,6 @@ func handleUdpProxy(ch ssh.Channel, sshConn ssh.Conn) {
 		log.Printf("ERROR: udp_socks_addr is not configured. Cannot handle UDP traffic for %s.", sshConn.RemoteAddr())
 		return
 	}
-
-	// 1. 与后端SOCKS5代理建立UDP转发通道
 	udpRelay, tcpControlConn, relayAddr, err := socks5UdpAssociate(udpSocksAddr)
 	if err != nil {
 		log.Printf("SOCKS5 UDP Associate failed for %s: %v", sshConn.RemoteAddr(), err)
@@ -225,39 +241,30 @@ func handleUdpProxy(ch ssh.Channel, sshConn ssh.Conn) {
 
 	done := make(chan struct{})
 
-	// 2. 启动goroutine: 从SSH隧道读取 -> 解外套 -> 发给SOCKS UDP
-	go func() {
-		defer func() {
-			udpRelay.Close() // 关闭UDP连接以唤醒另一个goroutine
-			close(done)
-		}()
+	go func() { // 从SSH读取 -> 解外套(带地址) -> 封装SOCKS5 UDP头 -> 发给SOCKS UDP
+		defer func() { udpRelay.Close(); close(done) }()
 		for {
-			// 解外套
-			rawUDPPacket, err := readFramedPacket(ch)
+			destAddr, payload, err := readUdpOverTcpPacket(ch)
 			if err != nil {
-				if err != io.EOF {
-					log.Printf("Error reading framed packet from client %s: %v", sshConn.RemoteAddr(), err)
-				}
+				if err != io.EOF { log.Printf("Error reading UdpOverTcpPacket from client %s: %v", sshConn.RemoteAddr(), err) }
 				return
 			}
-			
-			// 通过SOCKS UDP通道发送出去
-			// 注意: SOCKS5 UDP没有内置目标地址，Xray/V2Ray默认会使用TProxy进行透明代理
-			// 所以我们直接发送裸UDP包即可
-			_, err = udpRelay.WriteTo(rawUDPPacket, relayAddr)
+			socksRequest, err := buildSocks5UDPRequest(destAddr, payload)
 			if err != nil {
+				log.Printf("Error building SOCKS5 UDP request for %s: %v", destAddr, err)
+				continue
+			}
+			if _, err := udpRelay.WriteTo(socksRequest, relayAddr); err != nil {
 				log.Printf("Error writing to UDP relay for client %s: %v", sshConn.RemoteAddr(), err)
 				return
 			}
 		}
 	}()
 
-	// 3. 在当前goroutine: 从SOCKS UDP读取 -> 穿外套 -> 写回SSH隧道
-	for {
-		buf := make([]byte, 65535) // UDP最大包大小
+	for { // 从SOCKS UDP读取 -> 解析SOCKS5 UDP头 -> 穿上自定义外套 -> 写回SSH隧道
+		buf := make([]byte, 65535)
 		n, _, err := udpRelay.ReadFrom(buf)
 		if err != nil {
-			// 连接已关闭，正常退出
 			select {
 			case <-done:
 			default:
@@ -266,12 +273,10 @@ func handleUdpProxy(ch ssh.Channel, sshConn ssh.Conn) {
 			return
 		}
 
-		// SOCKS5服务器返回的包需要去掉头部
-		// 对于Xray/V2Ray，当它作为客户端时，它返回的包不包含SOCKS5头，可以直接使用
-		// 如果是标准SOCKS5服务器，需要调用 parseSocks5UDPResponse(buf[:n])
-		responsePacket := buf[:n] 
+		// Xray/V2Ray 返回的UDP包不含SOCKS5头，直接就是裸数据包。
+		// 标准SOCKS5服务器会包含头部，需要解析。我们假设前者。
+		responsePacket := buf[:n]
 
-		// 穿外套
 		if err := writeFramedPacket(ch, responsePacket); err != nil {
 			log.Printf("Error writing framed packet to client %s: %v", sshConn.RemoteAddr(), err)
 			return
@@ -291,7 +296,7 @@ func handleSshConnection(c net.Conn, sshCfg *ssh.ServerConfig) {
 	connID := sshConn.RemoteAddr().String() + "-" + hex.EncodeToString(sshConn.SessionID())
 	onlineUser := &OnlineUser{ ConnID: connID, Username: sshConn.User(), RemoteAddr: sshConn.RemoteAddr().String(), ConnectTime: time.Now(), sshConn: sshConn, }
 	addOnlineUser(onlineUser)
-	log.Printf("SSH handshake success from %s for user '%s'", sshConn.RemoteAddr(), sshConn.User())
+	log.Printf("SSH handshake success from %s for user '%s'", sshConn.User(), sshConn.RemoteAddr())
 	defer removeOnlineUser(connID)
 	go ssh.DiscardRequests(reqs)
 	for newChan := range chans {
@@ -301,22 +306,19 @@ func handleSshConnection(c net.Conn, sshCfg *ssh.ServerConfig) {
 		var payload struct { Host string; Port uint32; OriginAddr string; OriginPort uint32 }
 		if err := ssh.Unmarshal(newChan.ExtraData(), &payload); err != nil { log.Printf("bad payload: %v", err); ch.Close(); continue }
 		
-		// ================== 核心劫持逻辑 ==================
 		if payload.Host == "127.0.0.1" && payload.Port == 7300 {
 			log.Printf("Hijacking UDP-over-TCP stream for user '%s' from %s", sshConn.User(), sshConn.RemoteAddr())
 			go handleUdpProxy(ch, sshConn)
 		} else {
 			go handleDirectTCPIP(ch, payload.Host, payload.Port)
 		}
-		// ========================================================
 	}
 }
 
 // ==============================================================================
-// === 其余代码保持不变 (为了完整性全部粘贴) ===
+// === 其余代码保持不变 ===
 // ==============================================================================
 
-// --- handleDirectTCPIP (TCP流量处理，无变化) ---
 func handleDirectTCPIP(ch ssh.Channel, destHost string, destPort uint32) {
 	atomic.AddInt64(&activeConn, 1); defer atomic.AddInt64(&activeConn, -1)
 	var bestProxy *pooledProxy; minConns := int64(math.MaxInt64)
@@ -340,8 +342,6 @@ func handleDirectTCPIP(ch ssh.Channel, destHost string, destPort uint32) {
 	timedCopy(ch, socksConn, idleTimeout)
 	<-done
 }
-
-// ... (main, Web服务器, httpHandshake, sendKeepAlives, timedCopy, socks5Connect, 等所有其他函数都粘贴在这里，它们无需任何修改)
 func NewPooledProxy(addr string, poolSize int) *pooledProxy {
 	return &pooledProxy{ addr: addr, status: StatusUp, pool: make(chan net.Conn, poolSize), }
 }
@@ -508,7 +508,7 @@ func main() {
 	log.Printf("Loaded %d SOCKS5 proxies for 'Least Connections' load balancing.", len(proxyPool))
 	log.Printf("Handshake: timeout=%ds, UA='%s'. Forwarding buffer: %d KB. Idle Timeout: %ds", globalConfig.HandshakeTimeout, globalConfig.ConnectUA, globalConfig.BufferSizeKB, globalConfig.IdleTimeoutSeconds)
 	go func() {
-		mux := http.NewServeMux(); mux.HandleFunc("/login.html", func(w http.ResponseWriter, r *http.Request) { http.ServeFile(w, r, "login.html") }); mux.HandleFunc("/login", loginHandler); mux.HandleFunc("/logout", authMiddleware(logoutHandler)); mux.HandleFunc("/api/", authMiddleware(apiHandler)); adminHandler := func(w http.ResponseWriter, r *http.Request) { http.ServeFile(w, r, "admin.html") }; mux.HandleFunc("/admin.html", authMiddleware(adminHandler)); mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) { if r.URL.Path != "/" { http.NotFound(w, r); return }; if validateSession(r) { http.Redirect(w, r, "/admin.html", http.StatusFound) } else { http.Redirect(w, r, "/login.html", http.StatusFound) } }); log.Printf("Admin panel listening on http://%s", globalConfig.AdminAddr); if err := http.ListenAndServe(globalConfig.AdminAddr, mux); err != nil { log.Fatalf("FATAL: 无法启动Admin panel: %v", err) }
+		mux := http.NewServeMux(); mux.HandleFunc("/login.html", func(w http.ResponseWriter, r *http.Request) { http.ServeFile(w, r, "login.html") }); mux.HandleFunc("/login", loginHandler); mux.HandleFunc("/logout", authMiddleware(logoutHandler)); mux.HandleFunc("/api/", authMiddleware(apiHandler)); adminHandler := func(w http.ResponseWriter, r *http.Request) { http.ServeFile(w, r, "admin.html") }; mux.HandleFunc("/admin.html", authMiddleware(adminHandler)); mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) { if r.URL.Path != "/" { http.NotFound(w, r); return }; if validateSession(r) { http.Redirect(w, r, "/admin.html", http.StatusFound) } else { http.Redirect(w, r, "/login.html", http.StatusFound) } }); log.Printf("Admin panel listening on http://%s", globalConfig.AdminAddr); if err := http.ListenAndServe(global.AdminAddr, mux); err != nil { log.Fatalf("FATAL: 无法启动Admin panel: %v", err) }
 	}()
 	sshCfg := &ssh.ServerConfig{ PasswordCallback: func(c ssh.ConnMetadata, p []byte) (*ssh.Permissions, error) {
 		globalConfig.lock.RLock(); accountInfo, userExists := globalConfig.Accounts[c.User()]; globalConfig.lock.RUnlock(); if !userExists { return nil, fmt.Errorf("invalid credentials") }; if !accountInfo.Enabled { return nil, fmt.Errorf("user disabled") }; if accountInfo.ExpiryDate != "" { expiry, err := time.Parse("2006-01-02", accountInfo.ExpiryDate); if err != nil || time.Now().After(expiry.Add(24*time.Hour)) { return nil, fmt.Errorf("user expired") } }; if string(p) == accountInfo.Password { log.Printf("Auth successful for user: '%s'", c.User()); return nil, nil }; log.Printf("Auth failed for user '%s'", c.User()); return nil, fmt.Errorf("invalid credentials")
