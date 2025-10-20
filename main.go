@@ -41,7 +41,7 @@ type Config struct {
 	DeviceIDs map[string]DeviceInfo `json:"device_ids"`
 	lock      sync.RWMutex
 }
-var globalConfig *Config
+
 func loadConfig(file string) (*Config, error) {
 	cfg := &Config{DeviceIDs: make(map[string]DeviceInfo)}
 	data, err := ioutil.ReadFile(file); if err != nil { return nil, fmt.Errorf("无法读取配置文件 %s: %w", file, err) }
@@ -53,26 +53,19 @@ func loadConfig(file string) (*Config, error) {
 	return cfg, nil
 }
 
-// ==============================================================================
-// === 核心修复 1: 全新的、正确的连接包装器 ===
-// ==============================================================================
-// prefixedConn 会优先读取prefix中的数据，读完后，它就变成一个完全透明的net.Conn代理
+// --- 连接包装器 (用于解决bufio预读问题，逻辑正确) ---
 type prefixedConn struct {
 	net.Conn
 	prefix *bytes.Reader
 }
-
 func (c *prefixedConn) Read(p []byte) (n int, err error) {
-	if c.prefix.Len() > 0 {
-		return c.prefix.Read(p)
-	}
-	// prefix读完后，所有操作都直接交给原始的Conn
+	if c.prefix.Len() > 0 { return c.prefix.Read(p) }
 	return c.Conn.Read(p)
 }
 
 
-// --- SOCKS5 逻辑 (不变, 逻辑是正确的) ---
-func socks5Connect(socksAddr, destHost string, destPort uint16) (net.Conn, error) { /* ... 内容不变 ... */ 
+// --- SOCKS5 和 SSH 转发逻辑 (逻辑正确) ---
+func socks5Connect(socksAddr, destHost string, destPort uint16) (net.Conn, error) {
 	c, err := net.Dial("tcp", socksAddr); if err != nil { return nil, err }
 	_, err = c.Write([]byte{0x05, 0x01, 0x00}); if err != nil { c.Close(); return nil, err }
 	buf := make([]byte, 2); if _, err := io.ReadFull(c, buf); err != nil { c.Close(); return nil, err }
@@ -82,14 +75,13 @@ func socks5Connect(socksAddr, destHost string, destPort uint16) (net.Conn, error
 	rep := make([]byte, 4); if _, err := io.ReadFull(c, rep); err != nil { c.Close(); return nil, err }
 	if rep[1] != 0x00 { c.Close(); return nil, fmt.Errorf("socks5 connect failed, status: %x", rep[1]) }
 	switch rep[3] {
-	case 0x01: io.CopyN(io.Discard, c, 4+2)
-	case 0x03: alen := make([]byte, 1); io.ReadFull(c, alen); io.CopyN(io.Discard, c, int64(alen[0])+2)
-	case 0x04: io.CopyN(io.Discard, c, 16+2)
+	case 0x01: io.CopyN(io.Discard, c, 4+2); case 0x03: alen := make([]byte, 1); io.ReadFull(c, alen); io.CopyN(io.Discard, c, int64(alen[0])+2); case 0x04: io.CopyN(io.Discard, c, 16+2)
 	}
 	return c, nil
 }
-func handleDirectTCPIP(ch ssh.Channel, destHost string, destPort uint32) { /* ... 内容不变 ... */ 
-	socksServerAddr := globalConfig.Settings.Socks5Addr
+
+func handleDirectTCPIP(cfg *Config, ch ssh.Channel, destHost string, destPort uint32) {
+	socksServerAddr := cfg.Settings.Socks5Addr // 从传入的cfg获取，更安全
 	socksConn, err := socks5Connect(socksServerAddr, destHost, uint16(destPort))
 	if err != nil { log.Printf("[SOCKS5] Connect failed: %v", err); ch.Close(); return }
 	defer socksConn.Close()
@@ -101,9 +93,9 @@ func handleDirectTCPIP(ch ssh.Channel, destHost string, destPort uint32) { /* ..
 
 
 // ==============================================================================
-// === 核心修复 2: 全新的、正确的握手处理器 ===
+// === 核心修复: handleConnection 函数不再依赖全局变量，而是接收cfg作为参数 ===
 // ==============================================================================
-func handleConnection(conn net.Conn, sshConfig *ssh.ServerConfig) {
+func handleConnection(conn net.Conn, sshConfig *ssh.ServerConfig, cfg *Config) {
 	remoteIP, _, _ := net.SplitHostPort(conn.RemoteAddr().String())
 	log.Printf("[+] Connection opened from %s", remoteIP)
 	defer func() {
@@ -111,29 +103,32 @@ func handleConnection(conn net.Conn, sshConfig *ssh.ServerConfig) {
 		conn.Close()
 	}()
 
-	// 1. 创建临时的 bufio.Reader，只用于HTTP握手
 	reader := bufio.NewReader(conn)
 	
-	_ = conn.SetReadDeadline(time.Now().Add(time.Duration(globalConfig.Settings.Timeout) * time.Second))
+	// 使用传入的cfg，而不是globalConfig
+	_ = conn.SetReadDeadline(time.Now().Add(time.Duration(cfg.Settings.Timeout) * time.Second))
 	req, err := http.ReadRequest(reader)
 	if err != nil {
 		if err != io.EOF { log.Printf("[-] Handshake read error from %s: %v", remoteIP, err) }
 		return
 	}
 	
-	// 2. 执行认证
 	passAuth := false
-	if globalConfig.Settings.EnableDeviceIDAuth {
+	if cfg.Settings.EnableDeviceIDAuth {
 		credential := req.Header.Get("Sec-WebSocket-Key")
 		ua := req.UserAgent()
-		globalConfig.lock.RLock()
-		deviceInfo, found := globalConfig.DeviceIDs[credential]
-		globalConfig.lock.RUnlock()
-		if found && deviceInfo.Enabled && strings.Contains(ua, globalConfig.Settings.UAKeywordWS) {
-			passAuth = true
+		cfg.lock.RLock()
+		deviceInfo, found := cfg.DeviceIDs[credential]
+		cfg.lock.RUnlock()
+		if found && deviceInfo.Enabled && strings.Contains(ua, cfg.Settings.UAKeywordWS) {
+			// [!!] 修复一个隐藏的bug，time.Parse的格式化字符串是 "2006-01-02"
+			expiry, err := time.Parse("2006-01-02", deviceInfo.Expiry)
+			if err == nil && time.Now().Before(expiry.Add(24*time.Hour)) {
+				passAuth = true
+			}
 		}
 	} else {
-		if strings.Contains(req.UserAgent(), globalConfig.Settings.UAKeywordWS) {
+		if strings.Contains(req.UserAgent(), cfg.Settings.UAKeywordWS) {
 			passAuth = true
 		}
 	}
@@ -144,12 +139,10 @@ func handleConnection(conn net.Conn, sshConfig *ssh.ServerConfig) {
 		return
 	}
 
-	// 3. 发送您客户端期望的 200 OK 响应 (或者101，根据您的确认，两者都行)
 	log.Printf("[*] Handshake auth successful for %s.", remoteIP)
 	_, err = conn.Write([]byte("HTTP/1.1 200 OK\r\n\r\n"))
 	if err != nil { return }
 	
-	// 4. "拯救"被 bufio.Reader 预读的数据
 	var prefixBytes []byte
 	if reader.Buffered() > 0 {
 		prefixBytes = make([]byte, reader.Buffered())
@@ -157,13 +150,11 @@ func handleConnection(conn net.Conn, sshConfig *ssh.ServerConfig) {
 		prefixBytes = prefixBytes[:n]
 	}
 
-	// 5. 创建我们新的 prefixedConn，并彻底抛弃旧的 reader
 	pConn := &prefixedConn{
 		Conn:   conn,
 		prefix: bytes.NewReader(prefixBytes),
 	}
 
-	// 6. 将这个干净的、行为可预测的连接交给SSH库
 	_ = conn.SetReadDeadline(time.Time{})
 	sshConn, chans, reqs, err := ssh.NewServerConn(pConn, sshConfig)
 	if err != nil {
@@ -173,7 +164,6 @@ func handleConnection(conn net.Conn, sshConfig *ssh.ServerConfig) {
 	defer sshConn.Close()
 	log.Printf("[SSH] Session started for %s (%s)", sshConn.User(), sshConn.RemoteAddr())
 
-	// 7. 后续逻辑完全不变
 	go ssh.DiscardRequests(reqs)
 	for newChan := range chans {
 		if newChan.ChannelType() != "direct-tcpip" {
@@ -188,16 +178,18 @@ func handleConnection(conn net.Conn, sshConfig *ssh.ServerConfig) {
 			ch.Close()
 			continue
 		}
-		go handleDirectTCPIP(ch, payload.Host, payload.Port)
+		// 将cfg也传递给下一层，保持依赖注入
+		go handleDirectTCPIP(cfg, ch, payload.Host, payload.Port)
 	}
 }
 
 // --- 主函数 ---
 func main() {
 	var configFile = "ws_config.json"
-	globalConfig, err := loadConfig(configFile); if err != nil { log.Fatalf("FATAL: %v", err) }
+	// 仍然需要一个全局变量，但在main函数中初始化后，通过参数传递给goroutine
+	cfg, err := loadConfig(configFile); if err != nil { log.Fatalf("FATAL: %v", err) }
 	
-	settings := globalConfig.Settings
+	settings := cfg.Settings
 	sshConfig := &ssh.ServerConfig{
 		PasswordCallback: func(c ssh.ConnMetadata, p []byte) (*ssh.Permissions, error) {
 			if c.User() == settings.SshUser && string(p) == settings.SshPass { return nil, nil }
@@ -214,6 +206,9 @@ func main() {
 
 	for {
 		conn, err := ln.Accept(); if err != nil { log.Printf("[!] Accept error: %v", err); continue }
-		go handleConnection(conn, sshConfig)
+		// ==============================================================================
+		// === 核心修复: 将cfg作为参数，明确地传递给新的goroutine ===
+		// ==============================================================================
+		go handleConnection(conn, sshConfig, cfg)
 	}
 }
