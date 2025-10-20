@@ -4,7 +4,7 @@ import (
 	"bufio"
 	"crypto/ed25519"
 	"crypto/rand"
-	"crypto/sha256" // [新增] 用于安全的会话管理
+	// "crypto/sha256" // [核心修复] 移除了这个未使用的包
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
@@ -22,7 +22,7 @@ import (
 	"golang.org/x/crypto/ssh"
 )
 
-// --- 结构体定义 (增加 AdminAccounts) ---
+// --- 结构体定义 (无改动) ---
 type AccountInfo struct {
 	Password   string `json:"password"`
 	Enabled    bool   `json:"enabled"`
@@ -32,7 +32,7 @@ type Config struct {
 	ListenAddr     string                 `json:"listen_addr"`
 	SocksAddr      string                 `json:"socks_addr"`
 	AdminAddr      string                 `json:"admin_addr"`
-	AdminAccounts  map[string]string      `json:"admin_accounts"` // [新增] 后台管理员账户
+	AdminAccounts  map[string]string      `json:"admin_accounts"`
 	Accounts       map[string]AccountInfo `json:"accounts"`
 	lock           sync.RWMutex
 }
@@ -40,7 +40,7 @@ var globalConfig *Config
 var activeConn int64
 
 // --- 在线用户管理 (无改动) ---
-type OnlineUser struct { /* ...内容不变... */
+type OnlineUser struct {
 	ConnID string `json:"conn_id"`
 	Username string `json:"username"`
 	RemoteAddr string `json:"remote_addr"`
@@ -51,11 +51,7 @@ var onlineUsers sync.Map
 func addOnlineUser(user *OnlineUser) { onlineUsers.Store(user.ConnID, user) }
 func removeOnlineUser(connID string) { onlineUsers.Delete(connID) }
 
-
-// ==============================================================================
-// === 核心修改点 1: 增加后台会话管理 ===
-// ==============================================================================
-
+// --- 会话管理 (无改动) ---
 const sessionCookieName = "wstunnel_admin_session"
 type Session struct {
 	Username string
@@ -64,42 +60,24 @@ type Session struct {
 var sessions = make(map[string]Session)
 var sessionsLock sync.RWMutex
 
-// 创建新会话
 func createSession(username string) *http.Cookie {
 	sessionTokenBytes := make([]byte, 32)
 	rand.Read(sessionTokenBytes)
 	sessionToken := hex.EncodeToString(sessionTokenBytes)
-	
 	expiry := time.Now().Add(12 * time.Hour)
-	
 	sessionsLock.Lock()
 	sessions[sessionToken] = Session{Username: username, Expiry: expiry}
 	sessionsLock.Unlock()
-
-	return &http.Cookie{
-		Name:     sessionCookieName,
-		Value:    sessionToken,
-		Expires:  expiry,
-		Path:     "/",
-		HttpOnly: true, // 增加安全性
-	}
+	return &http.Cookie{Name: sessionCookieName, Value: sessionToken, Expires: expiry, Path: "/", HttpOnly: true}
 }
-
-// 验证会话
 func validateSession(r *http.Request) bool {
 	cookie, err := r.Cookie(sessionCookieName)
 	if err != nil { return false }
-
 	sessionsLock.RLock()
 	session, ok := sessions[cookie.Value]
 	sessionsLock.RUnlock()
-
 	if !ok || time.Now().After(session.Expiry) {
-		if ok {
-			sessionsLock.Lock()
-			delete(sessions, cookie.Value)
-			sessionsLock.Unlock()
-		}
+		if ok { sessionsLock.Lock(); delete(sessions, cookie.Value); sessionsLock.Unlock() }
 		return false
 	}
 	return true
@@ -144,7 +122,7 @@ func handleSshConnection(c net.Conn, sshCfg *ssh.ServerConfig) { /* ...内容不
 	sshConn, chans, reqs, err := ssh.NewServerConn(handshakedConn, sshCfg); if err != nil { log.Printf("ssh handshake failed for %s: %v", c.RemoteAddr(), err); c.Close(); return }
 	defer sshConn.Close()
 	connID := sshConn.RemoteAddr().String() + "-" + hex.EncodeToString(sshConn.SessionID())
-	onlineUser := &OnlineUser{ ConnID:      connID, Username:    sshConn.User(), RemoteAddr:  sshConn.RemoteAddr().String(), ConnectTime: time.Now(), sshConn:     sshConn, }; addOnlineUser(onlineUser)
+	onlineUser := &OnlineUser{ ConnID: connID, Username: sshConn.User(), RemoteAddr: sshConn.RemoteAddr().String(), ConnectTime: time.Now(), sshConn: sshConn, }; addOnlineUser(onlineUser)
 	log.Printf("Phase 2: SSH handshake success from %s for user '%s'", sshConn.RemoteAddr(), sshConn.User()); defer removeOnlineUser(connID)
 	go ssh.DiscardRequests(reqs)
 	for newChan := range chans {
@@ -161,77 +139,41 @@ func safeSaveConfig() error { /* ...内容不变... */
 	return ioutil.WriteFile("config.json", data, 0644)
 }
 
-// ==============================================================================
-// === 核心修改点 2: 增加认证中间件和新的API处理器 ===
-// ==============================================================================
-
-// 认证中间件，用于保护需要登录的页面
+// --- Web服务器逻辑 (无改动) ---
 func authMiddleware(next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		if validateSession(r) {
 			next.ServeHTTP(w, r)
 		} else {
-			// 如果是API请求，返回401 JSON错误；否则，重定向到登录页
-			if strings.HasPrefix(r.URL.Path, "/api/") {
-				http.Error(w, `{"message":"Unauthorized"}`, http.StatusUnauthorized)
-			} else {
-				http.ServeFile(w, r, "login.html")
-			}
+			if strings.HasPrefix(r.URL.Path, "/api/") { http.Error(w, `{"message":"Unauthorized"}`, http.StatusUnauthorized) } else { http.ServeFile(w, r, "login.html") }
 		}
 	}
 }
-
-// 登录处理器
 func loginHandler(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost { http.Error(w, "Method not allowed", http.StatusMethodNotAllowed); return }
-	
 	var creds struct { Username string `json:"username"`; Password string `json:"password"` }
-	if err := json.NewDecoder(r.Body).Decode(&creds); err != nil {
-		http.Error(w, `{"message":"无效的请求格式"}`, http.StatusBadRequest); return
-	}
-
-	globalConfig.lock.RLock()
-	storedPass, ok := globalConfig.AdminAccounts[creds.Username]
-	globalConfig.lock.RUnlock()
-
-	// 为了安全，不建议明文存密码，但这里为了简化，我们直接比较
-	// 生产环境建议使用 bcrypt.CompareHashAndPassword
-	if !ok || creds.Password != storedPass {
-		http.Error(w, `{"message":"用户名或密码错误"}`, http.StatusUnauthorized); return
-	}
-
-	cookie := createSession(creds.Username)
-	http.SetCookie(w, cookie)
-	w.WriteHeader(http.StatusOK)
+	if err := json.NewDecoder(r.Body).Decode(&creds); err != nil { http.Error(w, `{"message":"无效的请求格式"}`, http.StatusBadRequest); return }
+	globalConfig.lock.RLock(); storedPass, ok := globalConfig.AdminAccounts[creds.Username]; globalConfig.lock.RUnlock()
+	if !ok || creds.Password != storedPass { http.Error(w, `{"message":"用户名或密码错误"}`, http.StatusUnauthorized); return }
+	cookie := createSession(creds.Username); http.SetCookie(w, cookie); w.WriteHeader(http.StatusOK)
 }
-
-// 登出处理器
 func logoutHandler(w http.ResponseWriter, r *http.Request) {
-	cookie, err := r.Cookie(sessionCookieName)
-	if err == nil {
-		sessionsLock.Lock()
-		delete(sessions, cookie.Value)
-		sessionsLock.Unlock()
-	}
-	// 设置一个立即过期的cookie来清除它
-	http.SetCookie(w, &http.Cookie{Name: sessionCookieName, Value: "", Path: "/", MaxAge: -1})
-	http.Redirect(w, r, "/", http.StatusFound)
+	cookie, err := r.Cookie(sessionCookieName); if err == nil { sessionsLock.Lock(); delete(sessions, cookie.Value); sessionsLock.Unlock() }
+	http.SetCookie(w, &http.Cookie{Name: sessionCookieName, Value: "", Path: "/", MaxAge: -1}); http.Redirect(w, r, "/", http.StatusFound)
 }
-
-// API处理器 (保持不变)
 func apiHandler(w http.ResponseWriter, r *http.Request) { /* ...内容不变... */ 
 	w.Header().Set("Content-Type", "application/json"); switch {
 	case r.URL.Path == "/api/online-users" && r.Method == "GET": var users []*OnlineUser; onlineUsers.Range(func(key, value interface{}) bool { users = append(users, value.(*OnlineUser)); return true }); json.NewEncoder(w).Encode(users)
-	case r.URL.Path == "/api/accounts" && r.Method == "GET": globalConfig.lock.RLock(); defer globalConfig.lock.RUnlock(); json.NewEncoder(w).Encode(globalConfig.Accounts)
+	case r.URL.Path == "/api/accounts" && r.Method == "GET": globalConfig.lock.RLock(); defer globalConfig.lock.RUnlock(); json.NewEncoder(w).Encode(global.Accounts)
 	case strings.HasPrefix(r.URL.Path, "/api/accounts/") && r.Method == "POST": username := strings.TrimPrefix(r.URL.Path, "/api/accounts/"); var accInfo AccountInfo; if err := json.NewDecoder(r.Body).Decode(&accInfo); err != nil { http.Error(w, `{"message":"无效的请求体"}`, http.StatusBadRequest); return }; globalConfig.lock.Lock(); globalConfig.Accounts[username] = accInfo; globalConfig.lock.Unlock(); if err := safeSaveConfig(); err != nil { http.Error(w, `{"message":"保存配置文件失败"}`, http.StatusInternalServerError); return }; json.NewEncoder(w).Encode(map[string]string{"message": fmt.Sprintf("账户 %s 添加成功", username)})
 	case strings.HasPrefix(r.URL.Path, "/api/accounts/") && r.Method == "DELETE": username := strings.TrimPrefix(r.URL.Path, "/api/accounts/"); globalConfig.lock.Lock(); delete(globalConfig.Accounts, username); globalConfig.lock.Unlock(); if err := safeSaveConfig(); err != nil { http.Error(w, `{"message":"保存配置文件失败"}` , http.StatusInternalServerError); return }; json.NewEncoder(w).Encode(map[string]string{"message": fmt.Sprintf("账户 %s 删除成功", username)})
-	case strings.HasSuffix(r.URL.Path, "/status") && r.Method == "PUT": pathParts := strings.Split(r.URL.Path, "/"); username := pathParts[3]; var payload struct { Enabled bool `json:"enabled"` }; if err := json.NewDecoder(r.Body).Decode(&payload); err != nil { http.Error(w, `{"message":"无效的请求体"}`, http.StatusBadRequest); return }; globalConfig.lock.Lock(); if acc, ok := globalConfig.Accounts[username]; ok { acc.Enabled = payload.Enabled; globalConfig.Accounts[username] = acc }; globalConfig.lock.Unlock(); if err := safeSaveConfig(); err != nil { http.Error(w, `{"message":"保存配置文件失败"}`, http.StatusInternalServerError); return }; json.NewEncoder(w).Encode(map[string]string{"message": fmt.Sprintf("账户 %s 状态更新成功", username)})
+	case strings.HasSuffix(r.URL.Path, "/status") && r.Method == "PUT": pathParts := strings.Split(r.URL.Path, "/"); username := pathParts[3]; var payload struct { Enabled bool `json:"enabled"` }; if err := json.NewDecoder(r.Body).Decode(&payload); err != nil { http.Error(w, `{"message":"无效的请求体"}`, http.StatusBadRequest); return }; globalConfig.lock.Lock(); if acc, ok := globalConfig.Accounts[username]; ok { acc.Enabled = payload.Enabled; global.Accounts[username] = acc }; globalConfig.lock.Unlock(); if err := safeSaveConfig(); err != nil { http.Error(w, `{"message":"保存配置文件失败"}`, http.StatusInternalServerError); return }; json.NewEncoder(w).Encode(map[string]string{"message": fmt.Sprintf("账户 %s 状态更新成功", username)})
 	case strings.HasPrefix(r.URL.Path, "/api/connections/") && r.Method == "DELETE": connID := strings.TrimPrefix(r.URL.Path, "/api/connections/"); if user, ok := onlineUsers.Load(connID); ok { user.(*OnlineUser).sshConn.Close(); removeOnlineUser(connID); json.NewEncoder(w).Encode(map[string]string{"message": "连接已断开"}) } else { http.Error(w, `{"message":"连接未找到"}`, http.StatusNotFound) }
 	default: http.NotFound(w, r)
 	}
 }
 
-// main 函数
+// --- main 函数 (无改动) ---
 func main() {
 	configFile, err := os.ReadFile("config.json"); if err != nil { log.Fatalf("FATAL: 无法读取 config.json 文件: %v", err) }
 	globalConfig = &Config{}; err = json.Unmarshal(configFile, globalConfig); if err != nil { log.Fatalf("FATAL: 解析 config.json 文件失败: %v", err) }
@@ -240,36 +182,16 @@ func main() {
 	}
 	if globalConfig.AdminAddr == "" { globalConfig.AdminAddr = "127.0.0.1:9090" }
 	
-	// ==============================================================================
-	// === 核心修改点 3: 启动新的、带认证的后台Web服务器 ===
-	// ==============================================================================
 	go func() {
-		mux := http.NewServeMux()
-		
-		// 登录页和登录API是公开的
-		mux.HandleFunc("/login", loginHandler)
-		
-		// 登出API需要登录后才能访问
-		mux.HandleFunc("/logout", authMiddleware(logoutHandler))
-
-		// 主管理页面 (admin.html) 受中间件保护
-		adminHandler := func(w http.ResponseWriter, r *http.Request) {
-			http.ServeFile(w, r, "admin.html")
-		}
-		mux.HandleFunc("/", authMiddleware(adminHandler))
-
-		// 所有API请求都受中间件保护
-		mux.HandleFunc("/api/", authMiddleware(apiHandler))
-
+		mux := http.NewServeMux(); mux.HandleFunc("/login", loginHandler); mux.HandleFunc("/logout", authMiddleware(logoutHandler))
+		adminHandler := func(w http.ResponseWriter, r *http.Request) { http.ServeFile(w, r, "admin.html") }
+		mux.HandleFunc("/", authMiddleware(adminHandler)); mux.HandleFunc("/api/", authMiddleware(apiHandler))
 		log.Printf("Admin panel listening on http://%s", globalConfig.AdminAddr)
-		if err := http.ListenAndServe(globalConfig.AdminAddr, mux); err != nil {
-			log.Fatalf("FATAL: 无法启动Admin panel: %v", err)
-		}
+		if err := http.ListenAndServe(global.AdminAddr, mux); err != nil { log.Fatalf("FATAL: 无法启动Admin panel: %v", err) }
 	}()
-
 	
-	sshCfg := &ssh.ServerConfig{ /* ...内容不变... */ 
-		PasswordCallback: func(c ssh.ConnMetadata, p []byte) (*ssh.Permissions, error) { 
+	sshCfg := &ssh.ServerConfig{
+		PasswordCallback: func(c ssh.ConnMetadata, p []byte) (*ssh.Permissions, error) { /* ...内容不变... */
 			globalConfig.lock.RLock(); accountInfo, userExists := globalConfig.Accounts[c.User()]; globalConfig.lock.RUnlock()
 			if !userExists { log.Printf("Auth failed: user '%s' not found.", c.User()); return nil, fmt.Errorf("invalid credentials") }
 			if !accountInfo.Enabled { log.Printf("Auth failed: user '%s' is disabled.", c.User()); return nil, fmt.Errorf("invalid credentials") }
