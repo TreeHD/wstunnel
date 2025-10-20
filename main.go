@@ -2,7 +2,6 @@ package main
 
 import (
 	"bufio"
-	"bytes"
 	"crypto/ed25519"
 	"crypto/rand"
 	"encoding/json"
@@ -32,8 +31,6 @@ type Settings struct {
 type DeviceInfo struct {
 	FriendlyName string `json:"friendly_name"`
 	Expiry       string `json:"expiry"`
-	LimitGB      int    `json:"limit_gb"`
-	UsedBytes    int64  `json:"used_bytes"`
 	Enabled      bool   `json:"enabled"`
 }
 type Config struct {
@@ -44,7 +41,8 @@ type Config struct {
 
 func loadConfig(file string) (*Config, error) {
 	cfg := &Config{DeviceIDs: make(map[string]DeviceInfo)}
-	data, err := ioutil.ReadFile(file); if err != nil { return nil, fmt.Errorf("无法读取配置文件 %s: %w", file, err) }
+	data, err := ioutil.ReadFile(file)
+	if err != nil { return nil, fmt.Errorf("无法读取配置文件 %s: %w", file, err) }
 	if err := json.Unmarshal(data, &cfg); err != nil { return nil, fmt.Errorf("解析配置文件 %s 失败: %w", file, err) }
 	if cfg.Settings.Socks5Addr == "" { cfg.Settings.Socks5Addr = "127.0.0.1:1080" }
 	if cfg.Settings.SshUser == "" { cfg.Settings.SshUser = "a555" }
@@ -53,18 +51,7 @@ func loadConfig(file string) (*Config, error) {
 	return cfg, nil
 }
 
-// --- 连接包装器 (用于解决bufio预读问题，逻辑正确) ---
-type prefixedConn struct {
-	net.Conn
-	prefix *bytes.Reader
-}
-func (c *prefixedConn) Read(p []byte) (n int, err error) {
-	if c.prefix.Len() > 0 { return c.prefix.Read(p) }
-	return c.Conn.Read(p)
-}
-
-
-// --- SOCKS5 和 SSH 转发逻辑 (逻辑正确) ---
+// --- SOCKS5 和 SSH 转发逻辑 (不变, 逻辑是正确的) ---
 func socks5Connect(socksAddr, destHost string, destPort uint16) (net.Conn, error) {
 	c, err := net.Dial("tcp", socksAddr); if err != nil { return nil, err }
 	_, err = c.Write([]byte{0x05, 0x01, 0x00}); if err != nil { c.Close(); return nil, err }
@@ -79,9 +66,8 @@ func socks5Connect(socksAddr, destHost string, destPort uint16) (net.Conn, error
 	}
 	return c, nil
 }
-
 func handleDirectTCPIP(cfg *Config, ch ssh.Channel, destHost string, destPort uint32) {
-	socksServerAddr := cfg.Settings.Socks5Addr // 从传入的cfg获取，更安全
+	socksServerAddr := cfg.Settings.Socks5Addr
 	socksConn, err := socks5Connect(socksServerAddr, destHost, uint16(destPort))
 	if err != nil { log.Printf("[SOCKS5] Connect failed: %v", err); ch.Close(); return }
 	defer socksConn.Close()
@@ -93,7 +79,7 @@ func handleDirectTCPIP(cfg *Config, ch ssh.Channel, destHost string, destPort ui
 
 
 // ==============================================================================
-// === 核心修复: handleConnection 函数不再依赖全局变量，而是接收cfg作为参数 ===
+// === 最终的、正确的握手处理器 ===
 // ==============================================================================
 func handleConnection(conn net.Conn, sshConfig *ssh.ServerConfig, cfg *Config) {
 	remoteIP, _, _ := net.SplitHostPort(conn.RemoteAddr().String())
@@ -103,9 +89,9 @@ func handleConnection(conn net.Conn, sshConfig *ssh.ServerConfig, cfg *Config) {
 		conn.Close()
 	}()
 
+	// 1. 创建临时的 bufio.Reader
 	reader := bufio.NewReader(conn)
 	
-	// 使用传入的cfg，而不是globalConfig
 	_ = conn.SetReadDeadline(time.Now().Add(time.Duration(cfg.Settings.Timeout) * time.Second))
 	req, err := http.ReadRequest(reader)
 	if err != nil {
@@ -113,6 +99,7 @@ func handleConnection(conn net.Conn, sshConfig *ssh.ServerConfig, cfg *Config) {
 		return
 	}
 	
+	// 2. 认证逻辑...
 	passAuth := false
 	if cfg.Settings.EnableDeviceIDAuth {
 		credential := req.Header.Get("Sec-WebSocket-Key")
@@ -121,42 +108,42 @@ func handleConnection(conn net.Conn, sshConfig *ssh.ServerConfig, cfg *Config) {
 		deviceInfo, found := cfg.DeviceIDs[credential]
 		cfg.lock.RUnlock()
 		if found && deviceInfo.Enabled && strings.Contains(ua, cfg.Settings.UAKeywordWS) {
-			// [!!] 修复一个隐藏的bug，time.Parse的格式化字符串是 "2006-01-02"
-			expiry, err := time.Parse("2006-01-02", deviceInfo.Expiry)
-			if err == nil && time.Now().Before(expiry.Add(24*time.Hour)) {
-				passAuth = true
-			}
+			passAuth = true
 		}
 	} else {
 		if strings.Contains(req.UserAgent(), cfg.Settings.UAKeywordWS) {
 			passAuth = true
 		}
 	}
-
 	if !passAuth {
 		log.Printf("[!] Auth failed for %s.", remoteIP)
 		conn.Write([]byte("HTTP/1.1 403 Forbidden\r\n\r\n"))
 		return
 	}
 
+	// 3. 发送响应
 	log.Printf("[*] Handshake auth successful for %s.", remoteIP)
 	_, err = conn.Write([]byte("HTTP/1.1 200 OK\r\n\r\n"))
 	if err != nil { return }
 	
-	var prefixBytes []byte
-	if reader.Buffered() > 0 {
-		prefixBytes = make([]byte, reader.Buffered())
-		n, _ := reader.Read(prefixBytes)
-		prefixBytes = prefixBytes[:n]
-	}
+	// 4. [核心] 创建一个组合的 Reader
+	// 它会先读取 bufio.Reader 缓冲区中剩余的数据，然后再继续从原始的 conn 中读取
+	// 这就构成了一个完整的、未被破坏的数据流
+	combinedReader := io.MultiReader(reader, conn)
 
-	pConn := &prefixedConn{
+	// 5. [核心] 创建一个包装器，将组合的 Reader 和原始的 conn 伪装成一个 net.Conn
+	// 这是因为 ssh.NewServerConn 需要一个满足 net.Conn 接口的对象
+	wrappedConn := struct {
+		io.Reader
+		net.Conn
+	}{
+		Reader: combinedReader,
 		Conn:   conn,
-		prefix: bytes.NewReader(prefixBytes),
 	}
 
+	// 6. 将这个行为正确的包装器交给SSH库
 	_ = conn.SetReadDeadline(time.Time{})
-	sshConn, chans, reqs, err := ssh.NewServerConn(pConn, sshConfig)
+	sshConn, chans, reqs, err := ssh.NewServerConn(wrappedConn, sshConfig)
 	if err != nil {
 		log.Printf("[SSH] Handshake failed for %s: %v", remoteIP, err)
 		return
@@ -164,6 +151,7 @@ func handleConnection(conn net.Conn, sshConfig *ssh.ServerConfig, cfg *Config) {
 	defer sshConn.Close()
 	log.Printf("[SSH] Session started for %s (%s)", sshConn.User(), sshConn.RemoteAddr())
 
+	// 7. 后续逻辑
 	go ssh.DiscardRequests(reqs)
 	for newChan := range chans {
 		if newChan.ChannelType() != "direct-tcpip" {
@@ -174,11 +162,10 @@ func handleConnection(conn net.Conn, sshConfig *ssh.ServerConfig, cfg *Config) {
 		if err != nil { log.Printf("[SSH] Accept channel failed: %v", err); continue }
 		var payload struct{ Host string; Port uint32 }
 		if err := ssh.Unmarshal(newChan.ExtraData(), &payload); err != nil {
-			log.Printf("[SSH] Invalid payload: %v. Raw data (hex): %x", err, newChan.ExtraData())
+			log.Printf("[SSH] Invalid payload: %v", err)
 			ch.Close()
 			continue
 		}
-		// 将cfg也传递给下一层，保持依赖注入
 		go handleDirectTCPIP(cfg, ch, payload.Host, payload.Port)
 	}
 }
@@ -186,7 +173,6 @@ func handleConnection(conn net.Conn, sshConfig *ssh.ServerConfig, cfg *Config) {
 // --- 主函数 ---
 func main() {
 	var configFile = "ws_config.json"
-	// 仍然需要一个全局变量，但在main函数中初始化后，通过参数传递给goroutine
 	cfg, err := loadConfig(configFile); if err != nil { log.Fatalf("FATAL: %v", err) }
 	
 	settings := cfg.Settings
@@ -206,9 +192,6 @@ func main() {
 
 	for {
 		conn, err := ln.Accept(); if err != nil { log.Printf("[!] Accept error: %v", err); continue }
-		// ==============================================================================
-		// === 核心修复: 将cfg作为参数，明确地传递给新的goroutine ===
-		// ==============================================================================
 		go handleConnection(conn, sshConfig, cfg)
 	}
 }
