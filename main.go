@@ -62,41 +62,28 @@ var poolLock sync.RWMutex
 var bufferPool = sync.Pool{New: func() interface{} { b := make([]byte, 64*1024); return &b }}
 
 // ==============================================================================
-// === 临时的、用于诊断的 readUdpOverTcpPacket 函数 ===
+// === 最终生产版: UDP-over-TCP 协议解析/封装辅助函数 ===
 // ==============================================================================
+
 func readUdpOverTcpPacket(r io.Reader) (destAddr string, payload []byte, err error) {
 	var totalLength uint16
-	// 1. 读取总长度
-	if err = binary.Read(r, binary.BigEndian, &totalLength); err != nil {
-		return "", nil, err 
+	if err = binary.Read(r, binary.BigEndian, &totalLength); err != nil { return "", nil, err }
+
+	if totalLength < 1 { // 至少要有 ATYP
+		return "", nil, fmt.Errorf("invalid packet: total length is zero or too small")
 	}
 
-	log.Printf("DIAGNOSTIC: Packet total length is: %d", totalLength)
-
-	// 读取整个包的内容
 	fullPacket := make([]byte, totalLength)
-	if _, err = io.ReadFull(r, fullPacket); err != nil {
-		return "", nil, fmt.Errorf("failed to read full packet payload: %w", err)
-	}
+	if _, err = io.ReadFull(r, fullPacket); err != nil { return "", nil, fmt.Errorf("failed to read full packet payload: %w", err) }
 
-	// ================== 核心诊断代码 ==================
-	// 打印出这个包的完整十六进制内容
-	log.Printf("DIAGNOSTIC: RAW PACKET HEX DUMP:\n%s", hex.Dump(fullPacket))
-	// ===============================================
-
-	if len(fullPacket) < 1 {
-		return "", nil, fmt.Errorf("packet is empty")
-	}
-
-	atyp := fullPacket[0]
-	
-	// --- 后面的代码保持原样，用于处理其他正常的包 ---
 	offset := 0
-	offset++ // atyp
+	atyp := fullPacket[offset]
+	offset++
+
 	var host string
 	switch atyp {
-	case 0x01: // IPv4
-		if len(fullPacket) < offset+4 { return "", nil, fmt.Errorf("invalid ipv4 packet") }
+	case 0x01, 0x02: // ================== 核心修正: 将 ATYP 2 当作 ATYP 1 (IPv4) 处理 ==================
+		if len(fullPacket) < offset+4 { return "", nil, fmt.Errorf("invalid ipv4 packet (atyp %d)", atyp) }
 		host = net.IP(fullPacket[offset : offset+4]).String()
 		offset += 4
 	case 0x03: // Domain
@@ -111,13 +98,13 @@ func readUdpOverTcpPacket(r io.Reader) (destAddr string, payload []byte, err err
 		host = net.IP(fullPacket[offset : offset+16]).String()
 		offset += 16
 	default:
-		// 主动返回错误以便我们能清晰地看到日志
-		log.Printf("DIAGNOSTIC: Detected problematic ATYP %d. Exiting for analysis.", atyp)
 		return "", nil, fmt.Errorf("unsupported atyp: %d", atyp)
 	}
+
 	if len(fullPacket) < offset+2 { return "", nil, fmt.Errorf("packet too short for port") }
 	port := binary.BigEndian.Uint16(fullPacket[offset : offset+2])
 	offset += 2
+	
 	destAddr = fmt.Sprintf("%s:%d", host, port)
 	payload = fullPacket[offset:]
 	return destAddr, payload, nil
