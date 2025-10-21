@@ -155,11 +155,18 @@ func handleDirectTCPIP(ch ssh.Channel, destHost string, destPort uint32, remoteA
 	atomic.AddInt64(&activeConn, 1)
 	defer atomic.AddInt64(&activeConn, -1)
 
+	// =======================================================
+	// =============== 最终的模式选择开关 ==============
+	// =======================================================
 	if destPort == 7300 {
-		handleIPTunnel(ch, remoteAddr)
+		// 端口 7300 专门用于 SOCKS5 UDP 代理
+		log.Printf("Detected SOCKS5 UDP request on port 7300 from %s", remoteAddr)
+		handleSocks5UDP(ch, remoteAddr) // 调用新的、正确的 SOCKS5 UDP 处理器
 		return
 	}
+	// =======================================================
 
+	// 其他端口继续走TCP直连转发
 	var destAddr string
 	if strings.Contains(destHost, ":") {
 		destAddr = fmt.Sprintf("[%s]:%d", destHost, destPort)
@@ -169,7 +176,7 @@ func handleDirectTCPIP(ch ssh.Channel, destHost string, destPort uint32, remoteA
 	
 	destConn, err := net.DialTimeout("tcp", destAddr, 10*time.Second)
 	if err != nil {
-		log.Printf("Failed to directly connect to %s: %v", destAddr, err)
+		log.Printf("TCP Proxy: Failed to connect to %s: %v", destAddr, err)
 		ch.Close()
 		return
 	}
@@ -259,6 +266,7 @@ func sendKeepAlives(sshConn ssh.Conn, done <-chan struct{}) {
 }
 
 func handleSshConnection(c net.Conn, sshCfg *ssh.ServerConfig) {
+	defer c.Close()
 	handshakedConn, err := httpHandshake(c)
 	if err != nil {
 		log.Printf("HTTP handshake failed for %s: %v", c.RemoteAddr(), err)
@@ -465,13 +473,8 @@ func main() {
 
 	bufferPool = sync.Pool{New: func() interface{} { b := make([]byte, globalConfig.BufferSizeKB*1024); return &b }}
 
-	if err := createTunDevice(); err != nil {
-		log.Fatalf("FATAL: Could not create TUN device: %v. Please ensure you are running as root and have TUN module loaded.", err)
-	}
-
-	go readFromTunAndDistribute()
-
-	log.Println("====== WSTUNNEL (TCP + IP Tunnel Mode) Starting ======")
+	// [重要] 不再需要创建TUN设备
+	log.Println("====== WSTUNNEL (TCP Proxy + SOCKS5 UDP Mode) Starting ======")
 	log.Printf("Config: HandshakeTimeout=%ds, ConnectUA='%s', BufferSize=%dKB, IdleTimeout=%ds",
 		globalConfig.HandshakeTimeout, globalConfig.ConnectUA, globalConfig.BufferSizeKB, globalConfig.IdleTimeoutSeconds)
 
@@ -532,7 +535,7 @@ func main() {
 	if err != nil {
 		log.Fatalf("listen fail: %v", err)
 	}
-	log.Printf("SSH server listening on %s. IP Tunnel traffic will be handled on port 7300.", globalConfig.ListenAddr)
+	log.Printf("SSH server listening on %s. SOCKS5 UDP traffic will be handled on port 7300.", globalConfig.ListenAddr)
 	for {
 		conn, err := l.Accept()
 		if err != nil {
@@ -549,7 +552,6 @@ func main() {
 				if r := recover(); r != nil {
 					log.Printf("FATAL: Panic recovered for %s: %v", c.RemoteAddr(), r)
 				}
-				c.Close()
 			}()
 			handleSshConnection(c, sshCfg)
 		}(conn)
