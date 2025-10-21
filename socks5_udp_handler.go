@@ -3,7 +3,7 @@ package main
 
 import (
 	"encoding/binary"
-	"fmt" // [核心修正] 添加回 fmt 包的导入
+	"fmt"
 	"io"
 	"log"
 	"net"
@@ -58,7 +58,7 @@ func handleSocks5UDP(ch ssh.Channel, remoteAddr net.Addr) {
 	go func() {
 		defer close(done)
 		for {
-			// 协议格式: [2字节总长度][4字节目标IPv4地址][2字节目标端口][UDP真实数据]
+			// 最终确定的协议格式: [2字节总长度][4字节目标IPv4地址][2字节目标端口][UDP真实数据]
 
 			// 1. 读取2字节的总长度
 			lenBytes := make([]byte, 2)
@@ -82,6 +82,11 @@ func handleSocks5UDP(ch ssh.Channel, remoteAddr net.Addr) {
 			destIP := net.IP(data[0:4])
 			destPort := binary.BigEndian.Uint16(data[4:6])
 			payload := data[6:]
+
+			// 检查负载是否为空，如果为空则忽略
+			if len(payload) == 0 {
+				continue
+			}
 
 			destAddrStr := fmt.Sprintf("%s:%d", destIP.String(), destPort)
 			destAddr, err := net.ResolveUDPAddr("udp", destAddrStr)
