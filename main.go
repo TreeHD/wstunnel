@@ -21,7 +21,7 @@ import (
 	"golang.org/x/crypto/ssh"
 )
 
-// --- 结构体及全局变量 (仅保留必要部分) ---
+// --- 结构体及全局变量 ---
 type AccountInfo struct {
 	Password   string `json:"password"`
 	Enabled    bool   `json:"enabled"`
@@ -29,25 +29,35 @@ type AccountInfo struct {
 }
 
 type Config struct {
-	ListenAddr       string                 `json:"listen_addr"`
-	AdminAddr        string                 `json:"admin_addr"`
-	AdminAccounts    map[string]string      `json:"admin_accounts"`
-	Accounts         map[string]AccountInfo `json:"accounts"`
-	HandshakeTimeout int                    `json:"handshake_timeout,omitempty"`
-	ConnectUA        string                 `json:"connect_ua,omitempty"`
-	lock             sync.RWMutex
+	ListenAddr         string                 `json:"listen_addr"`
+	AdminAddr          string                 `json:"admin_addr"`
+	AdminAccounts      map[string]string      `json:"admin_accounts"`
+	Accounts           map[string]AccountInfo `json:"accounts"`
+	HandshakeTimeout   int                    `json:"handshake_timeout,omitempty"`
+	ConnectUA          string                 `json:"connect_ua,omitempty"`
+	BufferSizeKB       int                    `json:"buffer_size_kb,omitempty"`
+	IdleTimeoutSeconds int                    `json:"idle_timeout_seconds,omitempty"`
+	lock               sync.RWMutex
 }
 
 var globalConfig *Config
 var activeConn int64
-type OnlineUser struct { ConnID, Username, RemoteAddr string; ConnectTime time.Time; sshConn ssh.Conn }
+
+type OnlineUser struct {
+	ConnID      string    `json:"conn_id"`
+	Username    string    `json:"username"`
+	RemoteAddr  string    `json:"remote_addr"`
+	ConnectTime time.Time `json:"connect_time"`
+	sshConn     ssh.Conn
+}
+
 var onlineUsers sync.Map
 const sessionCookieName = "wstunnel_admin_session"
 type Session struct { Username string; Expiry time.Time }
 var sessions = make(map[string]Session)
 var sessionsLock sync.RWMutex
 
-// --- 辅助函数 (无变化) ---
+// --- 辅助函数 ---
 func addOnlineUser(user *OnlineUser) { onlineUsers.Store(user.ConnID, user) }
 func removeOnlineUser(connID string) { onlineUsers.Delete(connID) }
 func createSession(username string) *http.Cookie {
@@ -69,60 +79,104 @@ func sendJSON(w http.ResponseWriter, code int, payload interface{}) {
 }
 
 
-// ==============================================================================
-// === 诊断模式核心: Hex Dump 数据记录仪 (已修正) ===
-// ==============================================================================
+// --- 核心数据转发逻辑 ---
+var bufferPool = sync.Pool{New: func() interface{} {
+	b := make([]byte, 64*1024) // 默认值，将在main函数中被配置值覆盖
+	return &b
+}}
 
-// handleDiagnosticMode 接收一个连接，并将其所有输入以Hex Dump格式打印
-func handleDiagnosticMode(ch ssh.Channel, destHost string, destPort uint32, remoteAddr net.Addr) {
-	clientAddrStr := remoteAddr.String()
-	log.Printf("====== [DIAGNOSTIC MODE] New connection to %s:%d from %s ======", destHost, destPort, clientAddrStr)
-	
-	defer func() {
-		log.Printf("====== [DIAGNOSTIC MODE] Connection closed for %s ======", clientAddrStr)
-		ch.Close()
-	}()
-
-	buf := make([]byte, 2048)
-	
+// timedCopy 实现了带I/O空闲超时的数据拷贝
+func timedCopy(dst io.Writer, src io.Reader, timeout time.Duration) (written int64, err error) {
+	bufPtr := bufferPool.Get().(*[]byte)
+	defer bufferPool.Put(bufPtr)
+	buf := *bufPtr
 	for {
-		n, err := ch.Read(buf)
-		if err != nil {
-			if err != io.EOF {
-				log.Printf("[DIAGNOSTIC MODE] Read error from %s: %v", clientAddrStr, err)
+		// 为读操作设置超时
+		if srcConn, ok := src.(net.Conn); ok {
+			if err := srcConn.SetReadDeadline(time.Now().Add(timeout)); err != nil {
+				return written, err
+			}
+		}
+
+		nr, er := src.Read(buf)
+		if nr > 0 {
+			// 为写操作设置超时
+			if dstConn, ok := dst.(net.Conn); ok {
+				if err := dstConn.SetWriteDeadline(time.Now().Add(timeout)); err != nil {
+					return written, err
+				}
+			}
+			nw, ew := dst.Write(buf[0:nr])
+			if nw < 0 || nr < nw {
+				nw = 0
+				if ew == nil {
+					ew = io.ErrShortWrite
+				}
+			}
+			written += int64(nw)
+			if ew != nil {
+				err = ew
+				break
+			}
+			if nr != nw {
+				err = io.ErrShortWrite
+				break
+			}
+		}
+		if er != nil {
+			if netErr, ok := er.(net.Error); ok && netErr.Timeout() {
+				// 如果是超时错误，则不视为严重错误，而是正常结束
+				err = nil
+			} else if er != io.EOF {
+				// 记录其他类型的错误
+				err = er
 			}
 			break
 		}
-
-		if n > 0 {
-			log.Printf("[DIAGNOSTIC MODE] Received %d bytes from %s:", n, clientAddrStr)
-			
-			// 直接将 hex.Dump 的输出打印到标准输出
-			fmt.Printf("--- Hex Dump Start (from %s) ---\n", clientAddrStr)
-			fmt.Print(hex.Dump(buf[:n]))
-			fmt.Printf("--- Hex Dump End (from %s) ---\n\n", clientAddrStr)
-		}
 	}
+	return written, err
 }
 
-
-// --- handleDirectTCPIP 现在是诊断模式的分发器 (已修正) ---
-func handleDirectTCPIP(ch ssh.Channel, destHost string, destPort uint32, remoteAddr net.Addr) {
+// handleDirectTCPIP 直接连接目标，处理TCP转发
+func handleDirectTCPIP(ch ssh.Channel, destHost string, destPort uint32) {
 	atomic.AddInt64(&activeConn, 1)
 	defer atomic.AddInt64(&activeConn, -1)
 
-	if destPort == 7300 {
-		handleDiagnosticMode(ch, destHost, destPort, remoteAddr)
-	} else {
-		log.Printf("Ignoring non-diagnostic connection to %s:%d from %s", destHost, destPort, remoteAddr.String())
+	destAddr := fmt.Sprintf("%s:%d", destHost, destPort)
+	
+	destConn, err := net.DialTimeout("tcp", destAddr, 10*time.Second) // 10秒连接超时
+	if err != nil {
+		log.Printf("Failed to directly connect to %s: %v", destAddr, err)
 		ch.Close()
+		return
 	}
+	defer destConn.Close()
+	
+	if tcpConn, ok := destConn.(*net.TCPConn); ok {
+		tcpConn.SetNoDelay(true)
+	}
+
+	done := make(chan struct{})
+	idleTimeout := time.Duration(globalConfig.IdleTimeoutSeconds) * time.Second
+
+	go func() {
+		defer func() { 
+			if tcpConn, ok := destConn.(*net.TCPConn); ok { 
+				tcpConn.CloseWrite() 
+			}
+			close(done) 
+		}()
+		timedCopy(destConn, ch, idleTimeout)
+	}()
+
+	timedCopy(ch, destConn, idleTimeout)
+	<-done
 }
 
-
-// --- httpHandshake 等保持不变 ---
+// --- SSH & HTTP 握手与连接管理 ---
 type combinedConn struct { net.Conn; reader io.Reader }
 func (c *combinedConn) Read(p []byte) (n int, err error) { return c.reader.Read(p) }
+
 func httpHandshake(conn net.Conn) (net.Conn, error) {
 	timeoutDuration := time.Duration(globalConfig.HandshakeTimeout) * time.Second; expectedUA := globalConfig.ConnectUA; reader := bufio.NewReader(conn)
 	for {
@@ -138,6 +192,7 @@ func httpHandshake(conn net.Conn) (net.Conn, error) {
 		}
 	}
 }
+
 func sendKeepAlives(sshConn ssh.Conn, done <-chan struct{}) {
 	ticker := time.NewTicker(30 * time.Second)
 	defer ticker.Stop()
@@ -145,34 +200,40 @@ func sendKeepAlives(sshConn ssh.Conn, done <-chan struct{}) {
 		select {
 		case <-ticker.C:
 			_, _, err := sshConn.SendRequest("keepalive@openssh.com", true, nil)
-			if err != nil { return }
+			if err != nil { log.Printf("Keepalive to %s failed: %v. Connection likely closed.", sshConn.RemoteAddr(), err); return }
 		case <-done:
-			return
+			log.Printf("Keepalive for %s stopped, connection closed.", sshConn.RemoteAddr()); return
 		}
 	}
 }
 
-// --- handleSshConnection (已修正调用) ---
 func handleSshConnection(c net.Conn, sshCfg *ssh.ServerConfig) {
-	handshakedConn, err := httpHandshake(c); if err != nil { return }
+	handshakedConn, err := httpHandshake(c)
+	if err != nil { log.Printf("HTTP handshake failed for %s: %v", c.RemoteAddr(), err); return }
+
 	sshConn, chans, reqs, err := ssh.NewServerConn(handshakedConn, sshCfg)
-	if err != nil { return }
+	if err != nil { log.Printf("SSH handshake failed for %s: %v", c.RemoteAddr(), err); return }
 	defer sshConn.Close()
+
 	done := make(chan struct{}); defer close(done); go sendKeepAlives(sshConn, done)
+
 	connID := sshConn.RemoteAddr().String() + "-" + hex.EncodeToString(sshConn.SessionID())
 	onlineUser := &OnlineUser{ ConnID: connID, Username: sshConn.User(), RemoteAddr: sshConn.RemoteAddr().String(), ConnectTime: time.Now(), sshConn: sshConn, }
 	addOnlineUser(onlineUser)
+	log.Printf("SSH handshake success from %s for user '%s'", sshConn.RemoteAddr(), sshConn.User())
 	defer removeOnlineUser(connID)
+
 	go ssh.DiscardRequests(reqs)
 	for newChan := range chans {
-		if newChan.ChannelType() != "direct-tcpip" { newChan.Reject(ssh.UnknownChannelType, "only direct-tcpip allowed"); continue }
+		if newChan.ChannelType() != "direct-tcpip" { 
+			newChan.Reject(ssh.UnknownChannelType, "only direct-tcpip is allowed")
+			continue 
+		}
 		ch, _, err := newChan.Accept()
-		if err != nil { continue }
+		if err != nil { log.Printf("Failed to accept channel: %v", err); continue }
 		var payload struct { Host string; Port uint32; OriginAddr string; OriginPort uint32 }
-		if err := ssh.Unmarshal(newChan.ExtraData(), &payload); err != nil { ch.Close(); continue }
-		
-		// *** 核心修正: 传递 sshConn.RemoteAddr() ***
-		go handleDirectTCPIP(ch, payload.Host, payload.Port, sshConn.RemoteAddr())
+		if err := ssh.Unmarshal(newChan.ExtraData(), &payload); err != nil { log.Printf("Invalid direct-tcpip payload: %v", err); ch.Close(); continue }
+		go handleDirectTCPIP(ch, payload.Host, payload.Port)
 	}
 }
 
@@ -215,36 +276,60 @@ func apiHandler(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-// --- main (已简化) ---
+// --- main ---
 func main() {
-	log.Println("====== LAUNCHING IN DIAGNOSTIC MODE ======")
+	log.SetFlags(log.LstdFlags | log.Lshortfile) // 增加日志文件名和行号
 	configFile, err := os.ReadFile("config.json"); if err != nil { log.Fatalf("FATAL: 无法读取 config.json: %v", err) }
 	globalConfig = &Config{}; err = json.Unmarshal(configFile, globalConfig); if err != nil { log.Fatalf("FATAL: 解析 config.json 失败: %v", err) }
+	
 	if globalConfig.ListenAddr == "" || len(globalConfig.AdminAccounts) == 0 { log.Fatalf("FATAL: config.json 缺少 listen_addr 或 admin_accounts") }
+	
 	if globalConfig.AdminAddr == "" { globalConfig.AdminAddr = "127.0.0.1:9090" }
-	if globalConfig.HandshakeTimeout <= 0 { globalConfig.HandshakeTimeout = 3 }
+	if globalConfig.HandshakeTimeout <= 0 { globalConfig.HandshakeTimeout = 5 }
 	if globalConfig.ConnectUA == "" { globalConfig.ConnectUA = "26.4.0" }
+	if globalConfig.BufferSizeKB <= 0 { globalConfig.BufferSizeKB = 128 }
+	if globalConfig.IdleTimeoutSeconds <= 0 { globalConfig.IdleTimeoutSeconds = 90 }
+	
+	bufferPool = sync.Pool{New: func() interface{} { b := make([]byte, globalConfig.BufferSizeKB*1024); return &b }}
+	
+	log.Println("====== WSTUNNEL (Direct TCP Forwarding Mode) Starting ======")
+	log.Printf("Config: HandshakeTimeout=%ds, ConnectUA='%s', BufferSize=%dKB, IdleTimeout=%ds", 
+		globalConfig.HandshakeTimeout, globalConfig.ConnectUA, globalConfig.BufferSizeKB, globalConfig.IdleTimeoutSeconds)
 	
 	go func() {
 		mux := http.NewServeMux(); mux.HandleFunc("/login.html", func(w http.ResponseWriter, r *http.Request) { http.ServeFile(w, r, "login.html") }); mux.HandleFunc("/login", loginHandler); mux.HandleFunc("/logout", authMiddleware(logoutHandler)); mux.HandleFunc("/api/", authMiddleware(apiHandler)); adminHandler := func(w http.ResponseWriter, r *http.Request) { http.ServeFile(w, r, "admin.html") }; mux.HandleFunc("/admin.html", authMiddleware(adminHandler)); mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) { if r.URL.Path != "/" { http.NotFound(w, r); return }; if validateSession(r) { http.Redirect(w, r, "/admin.html", http.StatusFound) } else { http.Redirect(w, r, "/login.html", http.StatusFound) } }); log.Printf("Admin panel listening on http://%s", globalConfig.AdminAddr); if err := http.ListenAndServe(globalConfig.AdminAddr, mux); err != nil { log.Fatalf("FATAL: 无法启动Admin panel: %v", err) }
 	}()
 	
 	sshCfg := &ssh.ServerConfig{ PasswordCallback: func(c ssh.ConnMetadata, p []byte) (*ssh.Permissions, error) {
-		globalConfig.lock.RLock(); accountInfo, userExists := globalConfig.Accounts[c.User()]; globalConfig.lock.RUnlock(); if !userExists { return nil, fmt.Errorf("invalid credentials") }; if !accountInfo.Enabled { return nil, fmt.Errorf("user disabled") }; if accountInfo.ExpiryDate != "" { expiry, err := time.Parse("2006-01-02", accountInfo.ExpiryDate); if err != nil || time.Now().After(expiry.Add(24*time.Hour)) { return nil, fmt.Errorf("user expired") } }; if string(p) == accountInfo.Password { return nil, nil }; return nil, fmt.Errorf("invalid credentials")
+		globalConfig.lock.RLock(); accountInfo, userExists := globalConfig.Accounts[c.User()]; globalConfig.lock.RUnlock()
+		if !userExists { return nil, fmt.Errorf("user not found") }
+		if !accountInfo.Enabled { return nil, fmt.Errorf("user disabled") }
+		if accountInfo.ExpiryDate != "" { 
+			expiry, err := time.Parse("2006-01-02", accountInfo.ExpiryDate)
+			if err != nil || time.Now().After(expiry.Add(24*time.Hour)) { return nil, fmt.Errorf("user expired") } 
+		}
+		if string(p) == accountInfo.Password { log.Printf("Auth successful for user: '%s'", c.User()); return nil, nil }
+		log.Printf("Auth failed for user: '%s'", c.User()); return nil, fmt.Errorf("invalid credentials")
 	} }
 	_, priv, err := ed25519.GenerateKey(rand.Reader); if err != nil { log.Fatalf("generate host key fail: %v", err) }
 	privateKey, err := ssh.NewSignerFromKey(priv); if err != nil { log.Fatalf("create signer fail: %v", err) }
 	sshCfg.AddHostKey(privateKey)
 
 	l, err := net.Listen("tcp", globalConfig.ListenAddr); if err != nil { log.Fatalf("listen fail: %v", err) }
-	log.Printf("SSH server listening on %s in DIAGNOSTIC MODE for port 7300", globalConfig.ListenAddr)
+	log.Printf("SSH server listening on %s, forwarding TCP traffic directly", globalConfig.ListenAddr)
 	for {
-		conn, err := l.Accept(); if err != nil { continue }
+		conn, err := l.Accept(); if err != nil { log.Printf("Accept failed: %v", err); continue }
 		if tcpConn, ok := conn.(*net.TCPConn); ok {
 			tcpConn.SetKeepAlive(true)
 			tcpConn.SetKeepAlivePeriod(1 * time.Minute)
 			tcpConn.SetNoDelay(true)
 		}
-		go func(c net.Conn) { defer func() { if r := recover(); r != nil { log.Printf("FATAL: Panic recovered for %s: %v", c.RemoteAddr(), r) }; c.Close() }(); handleSshConnection(c, sshCfg) }(conn)
+		go func(c net.Conn) { 
+			defer func() { 
+				if r := recover(); r != nil { log.Printf("FATAL: Panic recovered for %s: %v", c.RemoteAddr(), r) }
+				c.Close() 
+			}()
+			handleSshConnection(c, sshCfg) 
+		}(conn)
 	}
 }
