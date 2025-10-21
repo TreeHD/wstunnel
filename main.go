@@ -155,18 +155,12 @@ func handleDirectTCPIP(ch ssh.Channel, destHost string, destPort uint32, remoteA
 	atomic.AddInt64(&activeConn, 1)
 	defer atomic.AddInt64(&activeConn, -1)
 
-	// =======================================================
-	// =============== 最终的模式选择开关 ==============
-	// =======================================================
 	if destPort == 7300 {
-		// 端口 7300 专门用于 SOCKS5 UDP 代理
-		log.Printf("Detected SOCKS5 UDP request on port 7300 from %s", remoteAddr)
-		handleCustomUDP(ch, remoteAddr) // 调用新的、正确的 SOCKS5 UDP 处理器
+		log.Printf("Detected UDP request on port 7300 from %s", remoteAddr)
+		handleSocks5UDP(ch, remoteAddr) // 保持函数名不变
 		return
 	}
-	// =======================================================
 
-	// 其他端口继续走TCP直连转发
 	var destAddr string
 	if strings.Contains(destHost, ":") {
 		destAddr = fmt.Sprintf("[%s]:%d", destHost, destPort)
@@ -473,8 +467,7 @@ func main() {
 
 	bufferPool = sync.Pool{New: func() interface{} { b := make([]byte, globalConfig.BufferSizeKB*1024); return &b }}
 
-	// [重要] 不再需要创建TUN设备
-	log.Println("====== WSTUNNEL (TCP Proxy + SOCKS5 UDP Mode) Starting ======")
+	log.Println("====== WSTUNNEL (TCP Proxy + Custom UDP Proxy Mode) Starting ======")
 	log.Printf("Config: HandshakeTimeout=%ds, ConnectUA='%s', BufferSize=%dKB, IdleTimeout=%ds",
 		globalConfig.HandshakeTimeout, globalConfig.ConnectUA, globalConfig.BufferSizeKB, globalConfig.IdleTimeoutSeconds)
 
@@ -535,7 +528,7 @@ func main() {
 	if err != nil {
 		log.Fatalf("listen fail: %v", err)
 	}
-	log.Printf("SSH server listening on %s. SOCKS5 UDP traffic will be handled on port 7300.", globalConfig.ListenAddr)
+	log.Printf("SSH server listening on %s. UDP traffic will be handled on port 7300.", globalConfig.ListenAddr)
 	for {
 		conn, err := l.Accept()
 		if err != nil {
