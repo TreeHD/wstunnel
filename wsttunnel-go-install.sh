@@ -1,17 +1,16 @@
 #!/bin/bash
 
 # =================================================================
-# WSTunnel-Go (TCP + IP Tunnel Mode) 全自动一键安装/更新脚本
+# WSTunnel-Go (TCP + SOCKS5 UDP Proxy Mode) 全自动一键安装/更新脚本
 # 作者: xiaoguidays & Gemini
 # 更新时间: 2025-10-21
-# 版本: 4.0
+# 版本: 5.0 (SOCKS5 UDP Final)
 # 更新内容:
-#   - 适配全新的三文件架构 (main, ip_tunnel, session_manager)。
-#   - 新增 session_manager.go 的下载。
-#   - [BUG修复] 彻底修复权限问题：systemd服务文件现在赋予程序 CAP_NET_ADMIN 和 CAP_NET_RAW 权限，无需以root用户运行即可管理网络。
-#   - 新增 config.json 的自动下载和部署。
-#   - 增加对 'golang.org/x/crypto/ssh' 的依赖处理说明。
-#   - 优化脚本流程和输出信息。
+#   - 适配全新的SOCKS5 UDP代理架构 (main.go, socks5_udp_handler.go)。
+#   - [移除] 不再需要TUN/NAT相关的Go文件 (ip_tunnel, session_manager, nat_setup)。
+#   - [移除] 不再需要系统依赖 iproute2, iptables。
+#   - [简化权限] systemd服务不再需要CAP_NET_ADMIN等高权限。
+#   - 更新所有描述文本以匹配新功能。
 # =================================================================
 
 set -e # 任何命令失败，脚本立即退出
@@ -52,13 +51,13 @@ echo " "
 info "第 2 步: 正在安装必要的系统工具..."
 if command -v apt-get &> /dev/null; then
     apt-get update -y > /dev/null
-    apt-get install -y wget curl tar git iproute2 iptables > /dev/null || error_exit "使用 apt-get 安装必要工具失败！"
+    apt-get install -y wget curl tar git > /dev/null || error_exit "使用 apt-get 安装必要工具失败！"
 elif command -v yum &> /dev/null; then
-    yum install -y wget curl tar git iproute iptables > /dev/null || error_exit "使用 yum 安装必要工具失败！"
+    yum install -y wget curl tar git > /dev/null || error_exit "使用 yum 安装必要工具失败！"
 else
-    error_exit "未知的包管理器。请手动安装 wget, curl, tar, git, iproute2, iptables。"
+    error_exit "未知的包管理器。请手动安装 wget, curl, tar, git。"
 fi
-info "系统工具已准备就_就绪。"
+info "系统工具已准备就绪。"
 echo " "
 
 # 3. 安装 Go 语言环境
@@ -90,8 +89,8 @@ rm -rf "$PROJECT_DIR"
 mkdir -p "$PROJECT_DIR"
 cd "$PROJECT_DIR" || error_exit "进入项目目录 '$PROJECT_DIR' 失败！"
 
-# 定义文件列表 (3个Go文件 + 3个配置文件)
-FILES=("main.go" "ip_tunnel.go" "session_manager.go" "nat_setup.go" "admin.html" "login.html" "config.json")
+# 定义文件列表 (2个Go文件 + 3个网页/配置文件)
+FILES=("main.go" "socks5_udp_handler.go" "admin.html" "login.html" "config.json")
 
 for file in "${FILES[@]}"; do
     info "  -> 正在下载 ${file}..."
@@ -106,7 +105,7 @@ if [ ! -f "go.mod" ]; then
     go mod init wstunnel || error_exit "go mod init 失败！"
 fi
 # 安装依赖
-info "  -> 正在安装 Go 依赖 (water, ssh)..."
+info "  -> 正在整理 Go 依赖..."
 # go mod tidy 会自动处理所有需要的依赖
 go mod tidy || error_exit "go mod tidy 失败！"
 
@@ -137,17 +136,16 @@ fi
 info "文件部署成功。"
 echo " "
 
-# 7. 创建并启用 systemd 服务 (已更新权限)
+# 7. 创建并启用 systemd 服务 (简化版权限)
 SERVICE_FILE="/etc/systemd/system/${SERVICE_NAME}.service"
-info "第 7 步: 正在配置 systemd 服务 (赋予网络管理权限)..."
+info "第 7 步: 正在配置 systemd 服务..."
 cat > "$SERVICE_FILE" <<EOT
 [Unit]
-Description=WSTunnel-Go Service (TCP + IP Tunnel Mode)
+Description=WSTunnel-Go Service (TCP + SOCKS5 UDP Proxy Mode)
 After=network.target
 
 [Service]
 Type=simple
-# 即使赋予了Capabilities，某些系统操作仍可能需要root身份
 User=root
 Group=root
 WorkingDirectory=${DEPLOY_DIR}
@@ -156,11 +154,12 @@ Restart=always
 RestartSec=3
 LimitNOFILE=65536
 
-# --- [关键更新] 赋予程序创建TUN设备和配置网络的权限 ---
-# CAP_NET_ADMIN: 允许执行网络管理任务，如配置接口、路由、iptables。
-# CAP_NET_RAW: 允许创建RAW套接字，某些网络诊断工具可能需要。
-CapabilityBoundingSet=CAP_NET_BIND_SERVICE CAP_NET_ADMIN CAP_NET_RAW
-AmbientCapabilities=CAP_NET_BIND_SERVICE CAP_NET_ADMIN CAP_NET_RAW
+# --- [权限简化] ---
+# TCP/UDP代理模式不再需要网络管理权限 (CAP_NET_ADMIN)
+# User=root 已足以绑定低位端口 (如 80)
+# 如需更高安全性，可改为非root用户并添加 CAP_NET_BIND_SERVICE
+CapabilityBoundingSet=CAP_NET_BIND_SERVICE
+AmbientCapabilities=CAP_NET_BIND_SERVICE
 
 [Install]
 WantedBy=multi-user.target
