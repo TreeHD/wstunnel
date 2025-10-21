@@ -1,4 +1,4 @@
-// socks5_udp_handler.go
+// simple_udp_handler.go
 package main
 
 import (
@@ -10,89 +10,64 @@ import (
 	"sync"
 	"time"
 
-    // [核心修正] 将 golang.orgx 改为 golang.org
-	"golang.org/x/crypto/ssh" 
+	"golang.org/x/crypto/ssh"
 )
 
-// udpSession a udp session (struct name changed for clarity)
-type udpSession struct {
-	sshChan    ssh.Channel
-	remoteAddr net.Addr
-	udpConn    *net.UDPConn
-}
-
-// udpSessions for udp forward (variable name changed to avoid conflict)
-var udpSessions = struct {
+// activeUDPConnections 跟踪每个客户端的UDP连接
+var activeUDPConnections = struct {
 	sync.RWMutex
-	m map[string]*udpSession // key: client remote address
+	conns map[string]net.PacketConn
 }{
-	m: make(map[string]*udpSession),
+	conns: make(map[string]net.PacketConn),
 }
 
-func addUDPSession(s *udpSession) {
-	udpSessions.Lock()
-	defer udpSessions.Unlock()
-	udpSessions.m[s.remoteAddr.String()] = s
+func addUDPConn(clientKey string, conn net.PacketConn) {
+	activeUDPConnections.Lock()
+	defer activeUDPConnections.Unlock()
+	activeUDPConnections.conns[clientKey] = conn
 }
 
-func getUDPSession(clientAddr string) *udpSession {
-	udpSessions.RLock()
-	defer udpSessions.RUnlock()
-	return udpSessions.m[clientAddr]
+func getUDPConn(clientKey string) net.PacketConn {
+	activeUDPConnections.RLock()
+	defer activeUDPConnections.RUnlock()
+	return activeUDPConnections.conns[clientKey]
 }
 
-func delUDPSession(clientAddr string) {
-	udpSessions.Lock()
-	defer udpSessions.Unlock()
-	delete(udpSessions.m, clientAddr)
+func delUDPConn(clientKey string) {
+	activeUDPConnections.Lock()
+	defer activeUDPConnections.Unlock()
+	if conn, ok := activeUDPConnections.conns[clientKey]; ok {
+		conn.Close()
+		delete(activeUDPConnections.conns, clientKey)
+	}
 }
 
-
-// handleSocks5UDP 是新的、健壮的SOCKS5 UDP处理器
-func handleSocks5UDP(ch ssh.Channel, remoteAddr net.Addr) {
+// handleCustomUDP 是最终的、最简化的UDP处理器
+func handleCustomUDP(ch ssh.Channel, remoteAddr net.Addr) {
 	clientKey := remoteAddr.String()
-	log.Printf("SOCKS5 UDP: New session for %s", clientKey)
-	defer log.Printf("SOCKS5 UDP: Session for %s closed", clientKey)
+	log.Printf("Custom UDP Proxy: New session for %s", clientKey)
+	defer log.Printf("Custom UDP Proxy: Session for %s closed", clientKey)
 	defer ch.Close()
 
-	// 1. 创建一个用于和外部通信的UDP套接字
-	s, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.IPv4zero, Port: 0})
+	// 为每个客户端创建一个独立的UDP套接字
+	udpConn, err := net.ListenPacket("udp", ":0")
 	if err != nil {
-		log.Printf("SOCKS5 UDP: failed to listen on UDP port: %v", err)
+		log.Printf("Custom UDP Proxy: Failed to listen on UDP port for %s: %v", clientKey, err)
 		return
 	}
-	defer s.Close()
-	
-	sess := &udpSession{ // Use the new struct name
-		sshChan:    ch,
-		remoteAddr: remoteAddr,
-		udpConn:    s,
-	}
-	addUDPSession(sess)
-	defer delUDPSession(clientKey)
-	
+	defer udpConn.Close()
+	addUDPConn(clientKey, udpConn)
+	defer delUDPConn(clientKey)
+
 	done := make(chan struct{})
 
-	// Goroutine 1: 从SSH通道读取客户端数据，解析并发送到外部
+	// Goroutine 1: 从SSH读取，解析，并发送UDP包
 	go func() {
-		defer close(done)
+		defer func() {
+			close(done) // 关闭done chan通知另一个goroutine退出
+		}()
 		for {
-			// SOCKS5 UDP Request format:
-			// +----+------+------+----------+----------+----------+
-			// |RSV | FRAG | ATYP | DST.ADDR | DST.PORT |   DATA   |
-			// +----+------+------+----------+----------+----------+
-			// | 2  |  1   |  1   | Variable |    2     | Variable |
-			// +----+------+------+----------+----------+----------+
-			
-			header := make([]byte, 3)
-			if _, err := io.ReadFull(ch, header); err != nil {
-				return
-			}
-			if header[2] != 0x00 {
-				log.Printf("SOCKS5 UDP: Unsupported FRAG value: %d", header[2])
-				return
-			}
-
+			// 1. 读取地址类型 (1 byte)
 			addrType := make([]byte, 1)
 			if _, err := io.ReadFull(ch, addrType); err != nil {
 				return
@@ -104,7 +79,7 @@ func handleSocks5UDP(ch ssh.Channel, remoteAddr net.Addr) {
 				addr := make([]byte, 4)
 				if _, err := io.ReadFull(ch, addr); err != nil { return }
 				host = net.IP(addr).String()
-			case 0x03: // Domain
+			case 0x03: // 域名
 				lenByte := make([]byte, 1)
 				if _, err := io.ReadFull(ch, lenByte); err != nil { return }
 				domain := make([]byte, lenByte[0])
@@ -115,70 +90,94 @@ func handleSocks5UDP(ch ssh.Channel, remoteAddr net.Addr) {
 				if _, err := io.ReadFull(ch, addr); err != nil { return }
 				host = net.IP(addr).String()
 			default:
-				log.Printf("SOCKS5 UDP: Unsupported address type: %d", addrType[0])
+				log.Printf("Custom UDP Proxy: Unsupported address type from %s: %d", clientKey, addrType[0])
 				return
 			}
 
+			// 2. 读取端口 (2 bytes)
 			portBytes := make([]byte, 2)
 			if _, err := io.ReadFull(ch, portBytes); err != nil { return }
 			port := binary.BigEndian.Uint16(portBytes)
+			
+			// 3. 读取数据 (最关键的部分)
+			// 假设数据包以一个2字节的长度开头
+			lenBytes := make([]byte, 2)
+			if _, err := io.ReadFull(ch, lenBytes); err != nil {
+				return
+			}
+			dataLen := binary.BigEndian.Uint16(lenBytes)
 
-			payload := make([]byte, 1500) // MTU size
-			n, err := ch.Read(payload)
-			if err != nil { return }
+			if dataLen > 4096 { // 增加一个合理的限制
+				log.Printf("Custom UDP Proxy: Oversized payload (%d) from %s", dataLen, clientKey)
+				return
+			}
 
+			payload := make([]byte, dataLen)
+			if _, err := io.ReadFull(ch, payload); err != nil {
+				return
+			}
+			
 			destAddr, err := net.ResolveUDPAddr("udp", fmt.Sprintf("%s:%d", host, port))
 			if err != nil {
-				log.Printf("SOCKS5 UDP: Failed to resolve %s:%d: %v", host, port, err)
 				continue
 			}
-			_, err = s.WriteTo(payload[:n], destAddr)
+			
+			_, err = udpConn.WriteTo(payload, destAddr)
 			if err != nil {
-				log.Printf("SOCKS5 UDP: Failed to write to %s: %v", destAddr, err)
+				log.Printf("Custom UDP Proxy: Failed to write to %s: %v", destAddr, err)
 			}
 		}
 	}()
 
-	// Goroutine 2: 从公网UDP套接字读取返回数据，封装并发送回客户端
+	// Goroutine 2: 从UDP套接字读取返回数据，封装并发送回客户端
 	go func() {
-		buf := make([]byte, 2048)
+		buf := make([]byte, 4096)
 		for {
-			s.SetReadDeadline(time.Now().Add(120 * time.Second))
-			n, remote, err := s.ReadFromUDP(buf)
-			if err != nil {
-				if netErr, ok := err.(net.Error); !ok || !netErr.Timeout() {
-					close(done)
-				}
-				continue
-			}
-
-			var socks5Header []byte
-			socks5Header = append(socks5Header, []byte{0x00, 0x00, 0x00}...) // RSV + FRAG
-
-			if remote.IP.To4() != nil {
-				socks5Header = append(socks5Header, 0x01) // ATYP IPv4
-				socks5Header = append(socks5Header, remote.IP.To4()...)
-			} else { // IPv6
-				socks5Header = append(socks5Header, 0x04) // ATYP IPv6
-				socks5Header = append(socks5Header, remote.IP.To16()...)
-			}
-			
-			portBytes := make([]byte, 2)
-			binary.BigEndian.PutUint16(portBytes, uint16(remote.Port))
-			socks5Header = append(socks5Header, portBytes...)
-
-			fullFrame := append(socks5Header, buf[:n]...)
-
+			// 检查是否应该退出
 			select {
 			case <-done:
 				return
 			default:
-				if _, err := ch.Write(fullFrame); err != nil {
-					return
+			}
+			
+			udpConn.SetReadDeadline(time.Now().Add(120 * time.Second))
+			n, remote, err := udpConn.ReadFrom(buf)
+			if err != nil {
+				if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
+					continue
 				}
+				return
+			}
+
+			udpRemote := remote.(*net.UDPAddr)
+			
+			// 封装回包
+			var header []byte
+			if ip4 := udpRemote.IP.To4(); ip4 != nil {
+				header = append(header, 0x01)
+				header = append(header, ip4...)
+			} else if ip16 := udpRemote.IP.To16(); ip16 != nil {
+				header = append(header, 0x04)
+				header = append(header, ip16...)
+			} else {
+				continue // 不支持的地址类型
+			}
+
+			portBytes := make([]byte, 2)
+			binary.BigEndian.PutUint16(portBytes, uint16(udpRemote.Port))
+			header = append(header, portBytes...)
+
+			lenBytes := make([]byte, 2)
+			binary.BigEndian.PutUint16(lenBytes, uint16(n))
+			header = append(header, lenBytes...)
+			
+			fullFrame := append(header, buf[:n]...)
+
+			if _, err := ch.Write(fullFrame); err != nil {
+				return
 			}
 		}
 	}()
-
+	
 	<-done
 }
