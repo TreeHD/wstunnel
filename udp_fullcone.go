@@ -21,6 +21,7 @@ type fullConeSession struct {
 	clientChannel ssh.Channel  // 回写给客户端的SSH信道
 	publicConn    net.PacketConn // 服务器对外暴露的UDP "专属外线"
 	lastActive    time.Time
+	remoteAddr    net.Addr     // *** 新增：存储客户端的真实地址用于日志 ***
 }
 
 // sessionManager 管理所有UDP会话
@@ -35,14 +36,14 @@ var sessionManager = struct {
 func init() {
 	go func() {
 		for {
-			time.Sleep(30 * time.Second) // 每30秒检查一次
+			time.Sleep(30 * time.Second)
 			now := time.Now()
 			sessionManager.Lock()
 			for key, session := range sessionManager.sessions {
 				if now.Sub(session.lastActive) > udpSessionTimeout {
 					log.Printf("FullCone NAT: Closing stale UDP session for %s", key)
-					session.clientChannel.Close() // 这会导致 tcpToUDP 结束
-					session.publicConn.Close()    // 这会导致 udpToTCP 结束
+					session.clientChannel.Close()
+					session.publicConn.Close()
 					delete(sessionManager.sessions, key)
 				}
 			}
@@ -66,7 +67,6 @@ func handleUDPProxy(ch ssh.Channel, remoteAddr net.Addr) {
 		ch.Close()
 	}()
 
-	// 为这个客户端创建一个对外暴露的UDP Socket
 	publicConn, err := net.ListenPacket("udp", "0.0.0.0:0")
 	if err != nil {
 		log.Printf("FullCone NAT: Failed to listen on UDP port for %s: %v", clientKey, err)
@@ -78,32 +78,27 @@ func handleUDPProxy(ch ssh.Channel, remoteAddr net.Addr) {
 		clientChannel: ch,
 		publicConn:    publicConn,
 		lastActive:    time.Now(),
+		remoteAddr:    remoteAddr, // *** 新增：保存地址 ***
 	}
 
 	sessionManager.Lock()
 	sessionManager.sessions[clientKey] = session
 	sessionManager.Unlock()
 
-	// 启动goroutine，负责从“外网”接收数据并回传给客户端
 	go udpToTCP(session)
-
-	// 在当前goroutine中，负责从“客户端”接收数据并转发到外网
 	tcpToUDP(session)
 }
 
 // tcpToUDP 从客户端的SSH信道读取SOCKS5 UDP帧，并发送到外网
 func tcpToUDP(s *fullConeSession) {
-	clientKey := s.clientChannel.RemoteAddr().String()
+	clientKey := s.remoteAddr.String() // *** 修正：从session中获取地址 ***
 	for {
-		// SOCKS5 UDP Frame: RSV(2) FRAG(1) ATYP(1) DST.ADDR DST.PORT(2) DATA_LEN(2) DATA
 		header := make([]byte, 4)
 		if _, err := io.ReadFull(s.clientChannel, header); err != nil {
-			// 连接断开或出错，结束goroutine
 			return
 		}
 
 		var host string
-		// ATYP (Address Type)
 		switch header[3] {
 		case 0x01: // IPv4
 			addrBytes := make([]byte, 4); if _, err := io.ReadFull(s.clientChannel, addrBytes); err != nil { return }; host = net.IP(addrBytes).String()
@@ -119,7 +114,7 @@ func tcpToUDP(s *fullConeSession) {
 		port := binary.BigEndian.Uint16(portBytes)
 		
 		destAddrStr := fmt.Sprintf("%s:%d", host, port)
-		if strings.HasPrefix(host, "[") { // Handle IPv6 case where brackets are already added
+		if strings.HasPrefix(host, "[") {
 			destAddrStr = fmt.Sprintf("%s:%d", host, port)
 		}
 
@@ -127,10 +122,8 @@ func tcpToUDP(s *fullConeSession) {
 		if _, err := io.ReadFull(s.clientChannel, dataLenBytes); err != nil { return }
 		dataLen := binary.BigEndian.Uint16(dataLenBytes)
 
-		// 保护措施，防止过大的dataLen耗尽内存
 		if dataLen > 2048 {
-			log.Printf("FullCone NAT: Received oversized UDP packet (%d bytes) from %s", dataLen, clientKey)
-			return
+			log.Printf("FullCone NAT: Received oversized UDP packet (%d bytes) from %s", dataLen, clientKey); return
 		}
 		
 		buf := make([]byte, dataLen)
@@ -144,7 +137,6 @@ func tcpToUDP(s *fullConeSession) {
 		
 		_, err = s.publicConn.WriteTo(buf, udpAddr)
 		if err != nil {
-			// 在连接关闭后继续写入是正常错误，无需打印
 			if !strings.Contains(err.Error(), "use of closed network connection") {
 				log.Printf("FullCone NAT: Error writing UDP packet to %s for %s: %v", destAddrStr, clientKey, err)
 			}
@@ -156,12 +148,11 @@ func tcpToUDP(s *fullConeSession) {
 
 // udpToTCP 从服务器的“专属外线”接收UDP包，打包成SOCKS5 UDP帧并发回客户端
 func udpToTCP(s *fullConeSession) {
-	clientKey := s.clientChannel.RemoteAddr().String()
+	clientKey := s.remoteAddr.String() // *** 修正：从session中获取地址 ***
 	buf := make([]byte, 2048)
 	for {
 		n, remoteAddr, err := s.publicConn.ReadFrom(buf)
 		if err != nil {
-			// publicConn被关闭，说明会话结束
 			return
 		}
 
@@ -169,7 +160,7 @@ func udpToTCP(s *fullConeSession) {
 		if !ok { continue }
 
 		var frame []byte
-		header := []byte{0x00, 0x00, 0x00} // RSV, FRAG
+		header := []byte{0x00, 0x00, 0x00}
 
 		var addrBytes []byte
 		if ip4 := udpRemoteAddr.IP.To4(); ip4 != nil {
@@ -191,7 +182,6 @@ func udpToTCP(s *fullConeSession) {
 		frame = append(frame, buf[:n]...)
 		
 		if _, err := s.clientChannel.Write(frame); err != nil {
-			// 写入失败，说明客户端SSH信道已关闭
 			return
 		}
 
