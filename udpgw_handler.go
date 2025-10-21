@@ -14,7 +14,7 @@ import (
 	"golang.org/x/crypto/ssh"
 )
 
-// clientState 用于存储每个客户端会话的状态
+// clientState 用于存储每个客户端会话的状态.
 type clientState struct {
 	udpConn    net.PacketConn
 	targetAddr *net.UDPAddr
@@ -23,28 +23,20 @@ type clientState struct {
 	key        string
 }
 
-// [核心修正] 定义一个具名的 ClientManager 类型
+// ClientManager 定义
 type ClientManager struct {
 	sync.RWMutex
 	clients map[string]*clientState
 }
 
-// [核心修正] 创建一个具名类型的全局实例
 var clientManager = &ClientManager{
 	clients: make(map[string]*clientState),
 }
 
-// [核心修正] 方法现在附加到 *ClientManager 类型上
 func (cm *ClientManager) Add(key string, state *clientState) {
 	cm.Lock()
 	defer cm.Unlock()
 	cm.clients[key] = state
-}
-
-func (cm *ClientManager) Get(key string) *clientState {
-	cm.RLock()
-	defer cm.RUnlock()
-	return cm.clients[key]
 }
 
 func (cm *ClientManager) Delete(key string) {
@@ -56,7 +48,7 @@ func (cm *ClientManager) Delete(key string) {
 	}
 }
 
-// handleUdpGw 严格复刻 badvpn-udpgw 的协议逻辑
+// handleUdpGw 的最终实现，增加了调试日志和容错
 func handleUdpGw(ch ssh.Channel, remoteAddr net.Addr) {
 	clientKey := remoteAddr.String()
 	log.Printf("UdpGw Proxy: New session for %s", clientKey)
@@ -74,12 +66,12 @@ func handleUdpGw(ch ssh.Channel, remoteAddr net.Addr) {
 		done:    make(chan struct{}),
 		key:     clientKey,
 	}
-	clientManager.Add(clientKey, state) // 现在可以正确调用
+	clientManager.Add(clientKey, state)
 
 	defer func() {
 		log.Printf("UdpGw Proxy: Session for %s closed", clientKey)
-		clientManager.Delete(clientKey) // 现在可以正确调用
-		ch.Close()
+		clientManager.Delete(clientKey)
+		// ch.Close() 由 handleSshConnection 的 defer 保证
 	}()
 
 	// Goroutine 1: 从SSH读取、解析、发送
@@ -88,41 +80,47 @@ func handleUdpGw(ch ssh.Channel, remoteAddr net.Addr) {
 		for {
 			lenBytes := make([]byte, 2)
 			if _, err := io.ReadFull(ch, lenBytes); err != nil {
+				log.Printf("UdpGw Proxy: Error reading length from %s: %v", clientKey, err)
 				return
 			}
 			dataLen := binary.BigEndian.Uint16(lenBytes)
-			if dataLen == 0 || dataLen > 4096 {
+			
+			if dataLen == 0 { continue }
+			if dataLen > 4096 {
+				log.Printf("UdpGw Proxy: Invalid data length %d from %s, closing.", dataLen, clientKey)
 				return
 			}
 			
 			fullData := make([]byte, dataLen)
 			if _, err := io.ReadFull(ch, fullData); err != nil {
+				log.Printf("UdpGw Proxy: Error reading payload from %s: %v", clientKey, err)
 				return
 			}
 			
+			log.Printf("DEBUG: Received frame from %s. Length: %d, Type: %d", clientKey, dataLen, fullData[0])
+
 			packetType := fullData[0]
 			payload := fullData[1:]
 
-			if packetType != 0 {
+			if packetType != 0 { // 控制帧
 				addrStr := string(payload)
 				if !strings.Contains(addrStr, ":") {
 					addrStr = fmt.Sprintf("%s:7300", addrStr)
 				}
 				destAddr, err := net.ResolveUDPAddr("udp", addrStr)
 				if err != nil {
-					log.Printf("UdpGw Proxy: Failed to resolve destination '%s' for %s: %v", addrStr, clientKey, err)
-					return
+					// 控制帧解析失败，只打印日志，不关闭连接，等待下一个正确的控制帧
+					log.Printf("UdpGw Proxy: Failed to resolve destination '%s' for %s: %v. Waiting for next valid control frame.", addrStr, clientKey, err)
+					continue
 				}
 				state.targetAddr = destAddr
 				log.Printf("UdpGw Proxy: Set new UDP destination to %s for %s", destAddr, clientKey)
 
-			} else {
+			} else { // 数据帧
 				if state.targetAddr == nil {
 					continue
 				}
-				if _, err := udpConn.WriteTo(payload, state.targetAddr); err != nil {
-					// Ignore write error
-				}
+				udpConn.WriteTo(payload, state.targetAddr)
 			}
 		}
 	}()
