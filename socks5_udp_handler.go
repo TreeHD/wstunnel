@@ -3,7 +3,6 @@ package main
 
 import (
 	"encoding/binary"
-	"fmt"
 	"io"
 	"log"
 	"net"
@@ -67,12 +66,12 @@ func handleSocks5UDP(ch ssh.Channel, remoteAddr net.Addr) {
 			}
 			totalLen := int(binary.BigEndian.Uint16(lenBytes))
 
+			// 2. 读取剩余的全部数据
 			if totalLen < 6 { // 长度至少要包含 IP(4) + Port(2)
 				log.Printf("Custom UDP Proxy: Invalid packet length %d from %s. Closing session.", totalLen, clientKey)
 				return
 			}
-
-			// 2. 读取剩余的全部数据
+			
 			data := make([]byte, totalLen)
 			if _, err := io.ReadFull(ch, data); err != nil {
 				return
@@ -83,8 +82,12 @@ func handleSocks5UDP(ch ssh.Channel, remoteAddr net.Addr) {
 			destPort := binary.BigEndian.Uint16(data[4:6])
 			payload := data[6:]
 
-			destAddr := &net.UDPAddr{IP: destIP, Port: int(destPort)}
-
+			destAddrStr := net.JoinHostPort(destIP.String(), fmt.Sprintf("%d", destPort))
+			destAddr, err := net.ResolveUDPAddr("udp", destAddrStr)
+			if err != nil {
+				continue
+			}
+			
 			// 4. 发送UDP包
 			if _, err := udpConn.WriteTo(payload, destAddr); err != nil {
 				// 忽略单个包的发送错误，继续处理下一个
@@ -108,7 +111,7 @@ func handleSocks5UDP(ch ssh.Channel, remoteAddr net.Addr) {
 				if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
 					continue
 				}
-				// 真正的错误发生，让Goroutine 1退出
+				// 真正的错误发生，通过关闭SSH通道来通知另一个goroutine退出
 				ch.Close()
 				return
 			}
