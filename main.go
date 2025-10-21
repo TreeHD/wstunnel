@@ -161,7 +161,7 @@ func handleDirectTCPIP(ch ssh.Channel, destHost string, destPort uint32, remoteA
 	if destPort == 7300 {
 		// 端口 7300 专门用于 SOCKS5 UDP 代理
 		log.Printf("Detected SOCKS5 UDP request on port 7300 from %s", remoteAddr)
-		handleSocks5UDP(ch, remoteAddr) // 调用新的、正确的 SOCKS5 UDP 处理器
+		handleCustomUDP(ch, remoteAddr) // 调用新的、正确的 SOCKS5 UDP 处理器
 		return
 	}
 	// =======================================================
