@@ -16,7 +16,7 @@ GITHUB_REPO="xiaoguiday/xiyang110"
 BRANCH="main"
 SERVICE_NAME="wstunnel"
 BINARY_NAME="wstunnel-go"
-DEPLOY_DIR="/etc/wstunnel"
+DEPLOY_DIR="/usr/local/bin"
 
 info() { echo -e "${GREEN}[INFO] $1${NC}"; }
 warn() { echo -e "${YELLOW}[WARN] $1${NC}"; }
