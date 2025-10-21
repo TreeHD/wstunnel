@@ -1,13 +1,15 @@
 #!/bin/bash
 
 # =================================================================
-# WSTunnel-Go (TCP + FullCone UDP) 全自动一键安装/更新脚本
-# 作者: xiaoguidays
+# WSTunnel-Go (TCP + IP Tunnel Mode) 全自动一键安装/更新脚本
+# 作者: xiaoguidays & Gemini
 # 更新时间: 2025-10-21
-# 版本: 2.0
+# 版本: 3.0
 # 更新内容: 
-#   - 适配全新的项目结构，增加对 udp_fullcone.go 的下载和编译。
-#   - 优化了编译流程和部署逻辑。
+#   - 适配全新的IP隧道架构 (main.go, ip_tunnel.go, nat_setup.go)。
+#   - 增加对 'iproute2' 和 'iptables' 的依赖检查。
+#   - 自动安装 'water' 库。
+#   - 更新 systemd 服务文件，赋予程序 NET_ADMIN 权限以创建TUN设备。
 # =================================================================
 
 set -e # 任何命令失败，脚本立即退出
@@ -21,7 +23,7 @@ NC='\033[0m'
 
 # 项目配置
 GO_VERSION="1.22.3"
-PROJECT_DIR="/usr/local/src/go_wstunnel" # 使用一个标准的源代码目录
+PROJECT_DIR="/usr/local/src/go_wstunnel"
 GITHUB_REPO="xiaoguiday/xiyang110" # 您的GitHub仓库
 BRANCH="main" # 您的代码所在的分支
 SERVICE_NAME="wstunnel"
@@ -44,16 +46,17 @@ info "权限检查通过。"
 echo " "
 
 # 2. 安装必要的工具
-info "第 2 步: 正在安装必要的工具 (wget, curl, tar)..."
+info "第 2 步: 正在安装必要的系统工具..."
 if command -v apt-get &> /dev/null; then
     apt-get update -y > /dev/null
-    apt-get install -y wget curl tar > /dev/null || error_exit "使用 apt-get 安装必要工具失败！"
+    # 新增对 iproute2 和 iptables 的安装
+    apt-get install -y wget curl tar iproute2 iptables > /dev/null || error_exit "使用 apt-get 安装必要工具失败！"
 elif command -v yum &> /dev/null; then
-    yum install -y wget curl tar > /dev/null || error_exit "使用 yum 安装必要工具失败！"
+    yum install -y wget curl tar iproute iptables > /dev/null || error_exit "使用 yum 安装必要工具失败！"
 else
-    error_exit "未知的包管理器。请手动安装 wget, curl, 和 tar。"
+    error_exit "未知的包管理器。请手动安装 wget, curl, tar, iproute2, iptables。"
 fi
-info "工具已准备就绪。"
+info "系统工具已准备就绪。"
 echo " "
 
 # 3. 安装 Go 语言环境
@@ -63,18 +66,14 @@ if ! command -v go &> /dev/null || [[ ! $(go version) == *"go${GO_VERSION}"* ]];
     wget -q -O go.tar.gz "https://go.dev/dl/go${GO_VERSION}.linux-amd64.tar.gz" || error_exit "下载 Go 安装包失败！"
     rm -rf /usr/local/go && tar -C /usr/local -xzf go.tar.gz || error_exit "解压 Go 安装包失败！"
     rm go.tar.gz
-
-    # 将Go的路径添加到环境变量
     if ! grep -q "/usr/local/go/bin" /etc/profile; then
         echo 'export PATH=$PATH:/usr/local/go/bin' >> /etc/profile
     fi
-    # 立即生效
     export PATH=$PATH:/usr/local/go/bin
     info "Go ${GO_VERSION} 安装成功！"
 else
     info "Go 环境已存在且版本正确。"
 fi
-# 再次验证
 if ! command -v go &> /dev/null; then
     error_exit "Go 命令在当前会话中不可用。请尝试运行 'source /etc/profile' 然后重新运行脚本。"
 fi
@@ -86,10 +85,9 @@ info "第 4 步: 正在准备项目目录并拉取最新代码..."
 mkdir -p "$PROJECT_DIR"
 cd "$PROJECT_DIR" || error_exit "进入项目目录 '$PROJECT_DIR' 失败！"
 
-# 定义文件列表
-FILES=("main.go" "udp_fullcone.go" "admin.html" "login.html")
+# 定义文件列表 (3个Go文件 + 2个HTML文件)
+FILES=("main.go" "ip_tunnel.go" "nat_setup.go" "admin.html" "login.html")
 
-# 循环下载文件
 for file in "${FILES[@]}"; do
     info "  -> 正在下载 ${file}..."
     wget -q -O "${file}" "https://raw.githubusercontent.com/${GITHUB_REPO}/${BRANCH}/${file}" || error_exit "下载 ${file} 失败！"
@@ -102,34 +100,35 @@ info "第 5 步: 正在编译项目 (位于 ${PROJECT_DIR})..."
 if [ ! -f "go.mod" ]; then
     go mod init wstunnel || error_exit "go mod init 失败！"
 fi
+# 安装依赖
+info "  -> 正在安装 Go 依赖 (github.com/songgao/water)..."
+go get github.com/songgao/water || error_exit "go get 失败！"
 go mod tidy || error_exit "go mod tidy 失败！"
-# go build . 会自动编译目录下所有的 .go 文件
+
+# 编译
+info "  -> 正在编译 Go 程序..."
 go build -o ${BINARY_NAME} . || error_exit "编译失败！请检查 Go 代码和环境。"
 info "项目编译成功，生成可执行文件: ${BINARY_NAME}"
 echo " "
 
 # 6. 部署文件
 info "第 6 步: 正在部署文件到 ${DEPLOY_DIR}/ ..."
-# 停止服务以便更新文件
 if systemctl is-active --quiet ${SERVICE_NAME}; then
     info "  -> 正在停止现有服务..."
     systemctl stop ${SERVICE_NAME}
 fi
-
-# 移动可执行文件和网页文件
 mv ./${BINARY_NAME} ${DEPLOY_DIR}/ || error_exit "移动 ${BINARY_NAME} 失败！"
 mv ./admin.html ${DEPLOY_DIR}/ || error_exit "移动 admin.html 失败！"
 mv ./login.html ${DEPLOY_DIR}/ || error_exit "移动 login.html 失败！"
 info "文件部署成功。"
 echo " "
 
-# 7. 创建并启用 systemd 服务
+# 7. 创建并启用 systemd 服务 (已更新权限)
 SERVICE_FILE="/etc/systemd/system/${SERVICE_NAME}.service"
-info "第 7 步: 正在配置 systemd 服务..."
-# 无论是否存在都覆盖，以确保配置是最新版本
+info "第 7 步: 正在配置 systemd 服务 (赋予网络管理权限)..."
 cat > "$SERVICE_FILE" <<EOT
 [Unit]
-Description=WSTunnel-Go Service (TCP + UDP FullCone NAT)
+Description=WSTunnel-Go Service (TCP + IP Tunnel Mode)
 After=network.target
 
 [Service]
@@ -141,6 +140,10 @@ ExecStart=${DEPLOY_DIR}/${BINARY_NAME}
 Restart=always
 RestartSec=3
 LimitNOFILE=65536
+
+# --- [关键更新] 赋予程序创建TUN设备和配置网络的权限 ---
+CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_RAW
+AmbientCapabilities=CAP_NET_ADMIN CAP_NET_RAW
 
 [Install]
 WantedBy=multi-user.target
@@ -166,6 +169,5 @@ echo " "
 info "配置文件位于: ${DEPLOY_DIR}/config.json (如果不存在，请手动创建)"
 echo " "
 
-# 等待2秒以便服务有时间输出初始日志
 sleep 2
 systemctl status ${SERVICE_NAME}.service --no-pager -n 20
