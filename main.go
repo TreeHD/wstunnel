@@ -50,12 +50,12 @@ var sessionsLock sync.RWMutex
 // --- 辅助函数 (无变化) ---
 func addOnlineUser(user *OnlineUser) { onlineUsers.Store(user.ConnID, user) }
 func removeOnlineUser(connID string) { onlineUsers.Delete(connID) }
-func createSession(username string) *http.Cookie { /* ... */
+func createSession(username string) *http.Cookie {
 	sessionTokenBytes := make([]byte, 32); rand.Read(sessionTokenBytes); sessionToken := hex.EncodeToString(sessionTokenBytes)
 	expiry := time.Now().Add(12 * time.Hour); sessionsLock.Lock(); sessions[sessionToken] = Session{Username: username, Expiry: expiry}; sessionsLock.Unlock()
 	return &http.Cookie{Name: sessionCookieName, Value: sessionToken, Expires: expiry, Path: "/", HttpOnly: true}
 }
-func validateSession(r *http.Request) bool { /* ... */
+func validateSession(r *http.Request) bool {
 	cookie, err := r.Cookie(sessionCookieName); if err != nil { return false }
 	sessionsLock.RLock(); session, ok := sessions[cookie.Value]; sessionsLock.RUnlock()
 	if !ok || time.Now().After(session.Expiry) {
@@ -64,72 +64,63 @@ func validateSession(r *http.Request) bool { /* ... */
 	}
 	return true
 }
-func sendJSON(w http.ResponseWriter, code int, payload interface{}) { /* ... */
+func sendJSON(w http.ResponseWriter, code int, payload interface{}) {
 	response, _ := json.Marshal(payload); w.Header().Set("Content-Type", "application/json"); w.WriteHeader(code); w.Write(response)
 }
 
 
 // ==============================================================================
-// === 诊断模式核心: Hex Dump 数据记录仪 ===
+// === 诊断模式核心: Hex Dump 数据记录仪 (已修正) ===
 // ==============================================================================
 
 // handleDiagnosticMode 接收一个连接，并将其所有输入以Hex Dump格式打印
-func handleDiagnosticMode(ch ssh.Channel, destHost string, destPort uint32) {
-	clientAddr := ch.RemoteAddr().String()
-	log.Printf("====== [DIAGNOSTIC MODE] New connection to %s:%d from %s ======", destHost, destPort, clientAddr)
+func handleDiagnosticMode(ch ssh.Channel, destHost string, destPort uint32, remoteAddr net.Addr) {
+	clientAddrStr := remoteAddr.String()
+	log.Printf("====== [DIAGNOSTIC MODE] New connection to %s:%d from %s ======", destHost, destPort, clientAddrStr)
 	
-	// 使用 defer 确保连接关闭时打印结束信息
 	defer func() {
-		log.Printf("====== [DIAGNOSTIC MODE] Connection closed for %s ======", clientAddr)
+		log.Printf("====== [DIAGNOSTIC MODE] Connection closed for %s ======", clientAddrStr)
 		ch.Close()
 	}()
 
-	// 创建一个缓冲区来读取数据
 	buf := make([]byte, 2048)
 	
 	for {
-		// 从SSH Channel中读取数据
 		n, err := ch.Read(buf)
 		if err != nil {
 			if err != io.EOF {
-				log.Printf("[DIAGNOSTIC MODE] Read error from %s: %v", clientAddr, err)
+				log.Printf("[DIAGNOSTIC MODE] Read error from %s: %v", clientAddrStr, err)
 			}
-			break // 如果读取错误或连接关闭(EOF)，则退出循环
+			break
 		}
 
 		if n > 0 {
-			// 如果读到了数据，将其打印为Hex Dump格式
-			log.Printf("[DIAGNOSTIC MODE] Received %d bytes from %s:", n, clientAddr)
+			log.Printf("[DIAGNOSTIC MODE] Received %d bytes from %s:", n, clientAddrStr)
 			
-			// hex.Dump 会生成非常漂亮的十六进制和ASCII混合输出
-			// 我们需要将输出捕获到字符串中，以便用log打印
-			dumper := hex.Dumper(os.Stdout) // 先用Stdout，因为log不好处理多行
-			fmt.Printf("--- Hex Dump Start ---\n")
-			dumper.Write(buf[:n])
-			dumper.Close()
-			fmt.Printf("--- Hex Dump End ---\n\n")
+			// 直接将 hex.Dump 的输出打印到标准输出
+			fmt.Printf("--- Hex Dump Start (from %s) ---\n", clientAddrStr)
+			fmt.Print(hex.Dump(buf[:n]))
+			fmt.Printf("--- Hex Dump End (from %s) ---\n\n", clientAddrStr)
 		}
 	}
 }
 
 
-// --- handleDirectTCPIP 现在是诊断模式的分发器 ---
-func handleDirectTCPIP(ch ssh.Channel, destHost string, destPort uint32) {
+// --- handleDirectTCPIP 现在是诊断模式的分发器 (已修正) ---
+func handleDirectTCPIP(ch ssh.Channel, destHost string, destPort uint32, remoteAddr net.Addr) {
 	atomic.AddInt64(&activeConn, 1)
 	defer atomic.AddInt64(&activeConn, -1)
 
-	// 我们只对发往7300端口的流量进行诊断
 	if destPort == 7300 {
-		handleDiagnosticMode(ch, destHost, destPort)
+		handleDiagnosticMode(ch, destHost, destPort, remoteAddr)
 	} else {
-		// 对于其他端口，我们可以选择简单关闭或打印一条信息
-		log.Printf("Ignoring non-diagnostic connection to %s:%d", destHost, destPort)
+		log.Printf("Ignoring non-diagnostic connection to %s:%d from %s", destHost, destPort, remoteAddr.String())
 		ch.Close()
 	}
 }
 
 
-// --- httpHandshake, handleSshConnection 等保持不变 ---
+// --- httpHandshake 等保持不变 ---
 type combinedConn struct { net.Conn; reader io.Reader }
 func (c *combinedConn) Read(p []byte) (n int, err error) { return c.reader.Read(p) }
 func httpHandshake(conn net.Conn) (net.Conn, error) {
@@ -147,7 +138,6 @@ func httpHandshake(conn net.Conn) (net.Conn, error) {
 		}
 	}
 }
-// 心跳函数暂时不需要，可以注释掉或保留
 func sendKeepAlives(sshConn ssh.Conn, done <-chan struct{}) {
 	ticker := time.NewTicker(30 * time.Second)
 	defer ticker.Stop()
@@ -161,9 +151,10 @@ func sendKeepAlives(sshConn ssh.Conn, done <-chan struct{}) {
 		}
 	}
 }
+
+// --- handleSshConnection (已修正调用) ---
 func handleSshConnection(c net.Conn, sshCfg *ssh.ServerConfig) {
-	handshakedConn, err := httpHandshake(c)
-	if err != nil { return }
+	handshakedConn, err := httpHandshake(c); if err != nil { return }
 	sshConn, chans, reqs, err := ssh.NewServerConn(handshakedConn, sshCfg)
 	if err != nil { return }
 	defer sshConn.Close()
@@ -179,27 +170,28 @@ func handleSshConnection(c net.Conn, sshCfg *ssh.ServerConfig) {
 		if err != nil { continue }
 		var payload struct { Host string; Port uint32; OriginAddr string; OriginPort uint32 }
 		if err := ssh.Unmarshal(newChan.ExtraData(), &payload); err != nil { ch.Close(); continue }
-		go handleDirectTCPIP(ch, payload.Host, payload.Port)
+		
+		// *** 核心修正: 传递 sshConn.RemoteAddr() ***
+		go handleDirectTCPIP(ch, payload.Host, payload.Port, sshConn.RemoteAddr())
 	}
 }
 
 // --- Web服务器逻辑 (无变化) ---
-// ... (为了简洁，省略这部分代码，您可以直接使用之前版本中的)
-func safeSaveConfig() error { /* ... */
+func safeSaveConfig() error {
 	globalConfig.lock.Lock(); defer globalConfig.lock.Unlock()
 	data, err := json.MarshalIndent(globalConfig, "", "  "); if err != nil { return fmt.Errorf("failed to marshal config: %w", err) }
 	return ioutil.WriteFile("config.json", data, 0644)
 }
-func authMiddleware(next http.HandlerFunc) http.HandlerFunc { /* ... */
+func authMiddleware(next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) { if validateSession(r) { next.ServeHTTP(w, r) } else { if strings.HasPrefix(r.URL.Path, "/api/") { sendJSON(w, http.StatusUnauthorized, map[string]string{"message": "Unauthorized"}) } else { http.Redirect(w, r, "/login.html", http.StatusFound) } } }
 }
-func loginHandler(w http.ResponseWriter, r *http.Request) { /* ... */
+func loginHandler(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost { sendJSON(w, http.StatusMethodNotAllowed, map[string]string{"message": "Method not allowed"}); return }; var creds struct { Username, Password string }; if err := json.NewDecoder(r.Body).Decode(&creds); err != nil { sendJSON(w, http.StatusBadRequest, map[string]string{"message": "无效请求"}); return }; globalConfig.lock.RLock(); storedPass, ok := globalConfig.AdminAccounts[creds.Username]; globalConfig.lock.RUnlock(); if !ok || creds.Password != storedPass { sendJSON(w, http.StatusUnauthorized, map[string]string{"message": "用户名或密码错误"}); return }; cookie := createSession(creds.Username); http.SetCookie(w, cookie); sendJSON(w, http.StatusOK, map[string]string{"message": "Login successful"})
 }
-func logoutHandler(w http.ResponseWriter, r *http.Request) { /* ... */
+func logoutHandler(w http.ResponseWriter, r *http.Request) {
 	cookie, err := r.Cookie(sessionCookieName); if err == nil { sessionsLock.Lock(); delete(sessions, cookie.Value); sessionsLock.Unlock() }; http.SetCookie(w, &http.Cookie{Name: sessionCookieName, Value: "", Path: "/", MaxAge: -1}); http.Redirect(w, r, "/login.html", http.StatusFound)
 }
-func apiHandler(w http.ResponseWriter, r *http.Request) { /* ... */
+func apiHandler(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 	switch {
 	case r.URL.Path == "/api/online-users" && r.Method == "GET":
