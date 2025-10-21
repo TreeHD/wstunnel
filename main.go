@@ -151,17 +151,11 @@ func timedCopy(dst io.Writer, src io.Reader, timeout time.Duration) (written int
 	return written, err
 }
 
-// [最终修改] handleDirectTCPIP 现在只处理 TCP
 func handleDirectTCPIP(ch ssh.Channel, destHost string, destPort uint32, remoteAddr net.Addr) {
 	atomic.AddInt64(&activeConn, 1)
 	defer atomic.AddInt64(&activeConn, -1)
 
-	// =======================================================
-	// =============== UDP处理逻辑已完全移除 ==============
-	// =======================================================
 	// 所有端口的请求都将走下面的TCP直连转发逻辑
-	// =======================================================
-
 	var destAddr string
 	if strings.Contains(destHost, ":") {
 		destAddr = fmt.Sprintf("[%s]:%d", destHost, destPort)
@@ -311,8 +305,138 @@ func handleSshConnection(c net.Conn, sshCfg *ssh.ServerConfig) {
 	}
 }
 
-// --- Web服务器逻辑 (请从您之前的版本完整复制过来) ---
-// ... (safeSaveConfig, authMiddleware, loginHandler, logoutHandler, apiHandler)
+// --- Web服务器逻辑 ---
+func safeSaveConfig() error {
+	globalConfig.lock.Lock()
+	defer globalConfig.lock.Unlock()
+	data, err := json.MarshalIndent(globalConfig, "", "  ")
+	if err != nil {
+		return fmt.Errorf("failed to marshal config: %w", err)
+	}
+	return ioutil.WriteFile("config.json", data, 0644)
+}
+
+func authMiddleware(next http.HandlerFunc) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if validateSession(r) {
+			next.ServeHTTP(w, r)
+		} else {
+			if strings.HasPrefix(r.URL.Path, "/api/") {
+				sendJSON(w, http.StatusUnauthorized, map[string]string{"message": "Unauthorized"})
+			} else {
+				http.Redirect(w, r, "/login.html", http.StatusFound)
+			}
+		}
+	}
+}
+
+func loginHandler(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		sendJSON(w, http.StatusMethodNotAllowed, map[string]string{"message": "Method not allowed"})
+		return
+	}
+	var creds struct {
+		Username, Password string
+	}
+	if err := json.NewDecoder(r.Body).Decode(&creds); err != nil {
+		sendJSON(w, http.StatusBadRequest, map[string]string{"message": "无效请求"})
+		return
+	}
+	globalConfig.lock.RLock()
+	storedPass, ok := globalConfig.AdminAccounts[creds.Username]
+	globalConfig.lock.RUnlock()
+	if !ok || creds.Password != storedPass {
+		sendJSON(w, http.StatusUnauthorized, map[string]string{"message": "用户名或密码错误"})
+		return
+	}
+	cookie := createSession(creds.Username)
+	http.SetCookie(w, cookie)
+	sendJSON(w, http.StatusOK, map[string]string{"message": "Login successful"})
+}
+
+func logoutHandler(w http.ResponseWriter, r *http.Request) {
+	cookie, err := r.Cookie(sessionCookieName)
+	if err == nil {
+		sessionsLock.Lock()
+		delete(sessions, cookie.Value)
+		sessionsLock.Unlock()
+	}
+	http.SetCookie(w, &http.Cookie{Name: sessionCookieName, Value: "", Path: "/", MaxAge: -1})
+	http.Redirect(w, r, "/login.html", http.StatusFound)
+}
+
+func apiHandler(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+	switch {
+	case r.URL.Path == "/api/online-users" && r.Method == "GET":
+		var users []*OnlineUser
+		onlineUsers.Range(func(key, value interface{}) bool {
+			users = append(users, value.(*OnlineUser))
+			return true
+		})
+		json.NewEncoder(w).Encode(users)
+	case r.URL.Path == "/api/accounts" && r.Method == "GET":
+		globalConfig.lock.RLock()
+		defer globalConfig.lock.RUnlock()
+		json.NewEncoder(w).Encode(globalConfig.Accounts)
+	case strings.HasPrefix(r.URL.Path, "/api/accounts/") && r.Method == "POST":
+		username := strings.TrimPrefix(r.URL.Path, "/api/accounts/")
+		var accInfo AccountInfo
+		if err := json.NewDecoder(r.Body).Decode(&accInfo); err != nil {
+			http.Error(w, `{"message":"无效请求体"}`, http.StatusBadRequest)
+			return
+		}
+		globalConfig.lock.Lock()
+		globalConfig.Accounts[username] = accInfo
+		globalConfig.lock.Unlock()
+		if err := safeSaveConfig(); err != nil {
+			http.Error(w, `{"message":"保存配置失败"}`, http.StatusInternalServerError)
+			return
+		}
+		sendJSON(w, http.StatusOK, map[string]string{"message": fmt.Sprintf("账户 %s 添加成功", username)})
+	case strings.HasPrefix(r.URL.Path, "/api/accounts/") && r.Method == "DELETE":
+		username := strings.TrimPrefix(r.URL.Path, "/api/accounts/")
+		globalConfig.lock.Lock()
+		delete(globalConfig.Accounts, username)
+		globalConfig.lock.Unlock()
+		if err := safeSaveConfig(); err != nil {
+			http.Error(w, `{"message":"保存配置失败"}`, http.StatusInternalServerError)
+			return
+		}
+		sendJSON(w, http.StatusOK, map[string]string{"message": fmt.Sprintf("账户 %s 删除成功", username)})
+	case strings.HasSuffix(r.URL.Path, "/status") && r.Method == "PUT":
+		pathParts := strings.Split(r.URL.Path, "/")
+		username := pathParts[3]
+		var payload struct{ Enabled bool }
+		if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
+			http.Error(w, `{"message":"无效请求体"}`, http.StatusBadRequest)
+			return
+		}
+		globalConfig.lock.Lock()
+		if acc, ok := globalConfig.Accounts[username]; ok {
+			acc.Enabled = payload.Enabled
+			globalConfig.Accounts[username] = acc
+		}
+		globalConfig.lock.Unlock()
+		if err := safeSaveConfig(); err != nil {
+			http.Error(w, `{"message":"保存配置失败"}`, http.StatusInternalServerError)
+			return
+		}
+		sendJSON(w, http.StatusOK, map[string]string{"message": fmt.Sprintf("账户 %s 状态更新成功", username)})
+	case strings.HasPrefix(r.URL.Path, "/api/connections/") && r.Method == "DELETE":
+		connID := strings.TrimPrefix(r.URL.Path, "/api/connections/")
+		if user, ok := onlineUsers.Load(connID); ok {
+			user.(*OnlineUser).sshConn.Close()
+			removeOnlineUser(connID)
+			sendJSON(w, http.StatusOK, map[string]string{"message": "连接已断开"})
+		} else {
+			sendJSON(w, http.StatusNotFound, map[string]string{"message": "连接未找到"})
+		}
+	default:
+		http.NotFound(w, r)
+	}
+}
+
 
 // --- main ---
 func main() {
