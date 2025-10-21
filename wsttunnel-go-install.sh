@@ -1,11 +1,13 @@
 #!/bin/bash
 
 # =================================================================
-# WSTunnel-Go 全自动一键安装/更新脚本 (健壮版)
-# 作者: xiaoguidays
-# 更新时间: 2025-10-14
-# 版本: 1.2
-# 更新内容: 增加对 login.html 的下载和部署
+# WSTunnel-Go (TCP + FullCone UDP) 全自动一键安装/更新脚本
+# 作者: xiaoguidays & Gemini
+# 更新时间: 2025-10-21
+# 版本: 2.0
+# 更新内容: 
+#   - 适配全新的项目结构，增加对 udp_fullcone.go 的下载和编译。
+#   - 优化了编译流程和部署逻辑。
 # =================================================================
 
 set -e # 任何命令失败，脚本立即退出
@@ -20,7 +22,8 @@ NC='\033[0m'
 # 项目配置
 GO_VERSION="1.22.3"
 PROJECT_DIR="/usr/local/src/go_wstunnel" # 使用一个标准的源代码目录
-GITHUB_REPO="xiaoguiday/xiyang110"
+GITHUB_REPO="xiaoguiday/xiyang110" # 您的GitHub仓库
+BRANCH="main" # 您的代码所在的分支
 SERVICE_NAME="wstunnel"
 BINARY_NAME="wstunnel-go"
 DEPLOY_DIR="/usr/local/bin"
@@ -41,9 +44,15 @@ info "权限检查通过。"
 echo " "
 
 # 2. 安装必要的工具
-info "第 2 步: 正在安装必要的工具 (wget, curl, tar, git)..."
-apt-get update -y > /dev/null
-apt-get install -y wget curl tar git > /dev/null || error_exit "安装必要工具失败！"
+info "第 2 步: 正在安装必要的工具 (wget, curl, tar)..."
+if command -v apt-get &> /dev/null; then
+    apt-get update -y > /dev/null
+    apt-get install -y wget curl tar > /dev/null || error_exit "使用 apt-get 安装必要工具失败！"
+elif command -v yum &> /dev/null; then
+    yum install -y wget curl tar > /dev/null || error_exit "使用 yum 安装必要工具失败！"
+else
+    error_exit "未知的包管理器。请手动安装 wget, curl, 和 tar。"
+fi
 info "工具已准备就绪。"
 echo " "
 
@@ -55,6 +64,7 @@ if ! command -v go &> /dev/null || [[ ! $(go version) == *"go${GO_VERSION}"* ]];
     rm -rf /usr/local/go && tar -C /usr/local -xzf go.tar.gz || error_exit "解压 Go 安装包失败！"
     rm go.tar.gz
 
+    # 将Go的路径添加到环境变量
     if ! grep -q "/usr/local/go/bin" /etc/profile; then
         echo 'export PATH=$PATH:/usr/local/go/bin' >> /etc/profile
     fi
@@ -71,17 +81,20 @@ fi
 go version
 echo " "
 
-# 4. 创建项目目录并拉取文件
+# 4. 创建项目目录并拉取所有必需文件
 info "第 4 步: 正在准备项目目录并拉取最新代码..."
 mkdir -p "$PROJECT_DIR"
 cd "$PROJECT_DIR" || error_exit "进入项目目录 '$PROJECT_DIR' 失败！"
 
-# 同时下载三个必需的文件
-wget -q -O main.go "https://raw.githubusercontent.com/${GITHUB_REPO}/main/main.go" || error_exit "下载 main.go 失败！"
-wget -q -O admin.html "https://raw.githubusercontent.com/${GITHUB_REPO}/main/admin.html" || error_exit "下载 admin.html 失败！"
-# --- [新増] 下载 login.html ---
-wget -q -O login.html "https://raw.githubusercontent.com/${GITHUB_REPO}/main/login.html" || error_exit "下载 login.html 失败！"
-info "最新代码拉取成功。"
+# 定义文件列表
+FILES=("main.go" "udp_fullcone.go" "admin.html" "login.html")
+
+# 循环下载文件
+for file in "${FILES[@]}"; do
+    info "  -> 正在下载 ${file}..."
+    wget -q -O "${file}" "https://raw.githubusercontent.com/${GITHUB_REPO}/${BRANCH}/${file}" || error_exit "下载 ${file} 失败！"
+done
+info "所有必需文件已成功拉取。"
 echo " "
 
 # 5. 编译项目
@@ -90,17 +103,22 @@ if [ ! -f "go.mod" ]; then
     go mod init wstunnel || error_exit "go mod init 失败！"
 fi
 go mod tidy || error_exit "go mod tidy 失败！"
-go build -o ${BINARY_NAME} || error_exit "编译失败！"
-info "项目编译成功。"
+# go build . 会自动编译目录下所有的 .go 文件
+go build -o ${BINARY_NAME} . || error_exit "编译失败！请检查 Go 代码和环境。"
+info "项目编译成功，生成可执行文件: ${BINARY_NAME}"
 echo " "
 
 # 6. 部署文件
 info "第 6 步: 正在部署文件到 ${DEPLOY_DIR}/ ..."
-# 移动可执行文件
+# 停止服务以便更新文件
+if systemctl is-active --quiet ${SERVICE_NAME}; then
+    info "  -> 正在停止现有服务..."
+    systemctl stop ${SERVICE_NAME}
+fi
+
+# 移动可执行文件和网页文件
 mv ./${BINARY_NAME} ${DEPLOY_DIR}/ || error_exit "移动 ${BINARY_NAME} 失败！"
-# 移动网页文件
 mv ./admin.html ${DEPLOY_DIR}/ || error_exit "移动 admin.html 失败！"
-# --- [新増] 移动 login.html ---
 mv ./login.html ${DEPLOY_DIR}/ || error_exit "移动 login.html 失败！"
 info "文件部署成功。"
 echo " "
@@ -111,7 +129,7 @@ info "第 7 步: 正在配置 systemd 服务..."
 # 无论是否存在都覆盖，以确保配置是最新版本
 cat > "$SERVICE_FILE" <<EOT
 [Unit]
-Description=WSTunnel-Go Service
+Description=WSTunnel-Go Service (TCP + UDP FullCone NAT)
 After=network.target
 
 [Service]
@@ -134,14 +152,20 @@ info "服务配置完成并已启用。"
 echo " "
 
 # 8. 启动/重启服务并检查状态
-info "第 8 步: 正在启动/重启服务..."
-systemctl restart ${SERVICE_NAME}.service || error_exit "服务启动/重启失败！"
+info "第 8 步: 正在启动服务..."
+systemctl start ${SERVICE_NAME}.service || error_exit "服务启动失败！"
 info "操作成功。"
 echo " "
 
 # 最终确认
 info "🎉 全部成功！WSTunnel-Go 已安装/更新并正在运行。"
 echo " "
-info "正在检查最终服务状态 (等待2秒)..."
+info "您可以通过以下命令检查服务状态:"
+info "  systemctl status ${SERVICE_NAME}.service"
+echo " "
+info "配置文件位于: ${DEPLOY_DIR}/config.json (如果不存在，请手动创建)"
+echo " "
+
+# 等待2秒以便服务有时间输出初始日志
 sleep 2
-systemctl status ${SERVICE_NAME}.service
+systemctl status ${SERVICE_NAME}.service --no-pager -n 20
