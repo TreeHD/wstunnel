@@ -3,21 +3,21 @@ package main
 
 import (
 	"encoding/binary"
-	"fmt"
+	"fmt" // <-- 注意：fmt 在这里是需要的
 	"io"
 	"log"
 	"net"
-	"strings"
+	"sync"
 
 	"github.com/songgao/water"
 	"golang.org/x/crypto/ssh"
 )
 
 var tunInterface *water.Interface
+var tunMutex sync.Mutex // 保护TUN接口的并发读写
 
 // createTunDevice 创建并配置一个TUN虚拟网卡
 func createTunDevice() error {
-	// 您可以自定义TUN设备的名称和IP
 	const (
 		ifaceName = "tun0"
 		ifaceAddr = "10.0.0.1/24"
@@ -33,7 +33,6 @@ func createTunDevice() error {
 		return fmt.Errorf("failed to create TUN device: %w", err)
 	}
 
-	// 使用 ip 命令为虚拟网卡配置IP地址并启动
 	if err := runIPCommand("link", "set", "dev", ifce.Name(), "up"); err != nil {
 		return fmt.Errorf("failed to set TUN device up: %w", err)
 	}
@@ -41,20 +40,25 @@ func createTunDevice() error {
 		return fmt.Errorf("failed to set TUN device IP: %w", err)
 	}
 	
-	// 开启IP转发
 	if err := enableIPForwarding(); err != nil {
 		log.Printf("WARN: Failed to enable IP forwarding: %v. NAT might not work.", err)
 	}
 
-	// 设置NAT规则 (将从tun0出去的流量进行源地址伪装)
-	// 这需要服务器上有 iptables
-	if err := setupNAT(ifce.Name()); err != nil {
-		log.Printf("WARN: Failed to set up iptables NAT rule: %v. Outgoing traffic might not work. %v", ifce.Name(), err)
+	defaultIface, err := getDefaultInterface()
+	if err != nil {
+		log.Printf("WARN: Could not detect default network interface: %v. You may need to set the iptables rule manually.", err)
+	} else {
+		if err := setupNAT(defaultIface); err != nil {
+			log.Printf("WARN: Failed to set up iptables NAT rule for interface %s: %v.", defaultIface, err)
+		}
 	}
-
 
 	log.Printf("TUN device %s created and configured at %s", ifce.Name(), ifaceAddr)
 	tunInterface = ifce
+	
+	// 这个函数的实现有待完善，暂时只做最简单的转发
+	// go readFromTunAndDistribute()
+
 	return nil
 }
 
@@ -69,50 +73,65 @@ func handleIPTunnel(ch ssh.Channel, remoteAddr net.Addr) {
 
 	// Goroutine 1: 从SSH信道读取数据，写入TUN设备
 	go func() {
-		defer func() {
-			close(done)
-		}()
+		defer close(done) // 任何一端断开，都关闭另一端
 		for {
-			// 读取2字节长度头
 			lenBytes := make([]byte, 2)
 			if _, err := io.ReadFull(ch, lenBytes); err != nil {
 				return
 			}
 			dataLen := binary.BigEndian.Uint16(lenBytes)
 
-			// 读取IP包
+			if dataLen > 4096 {
+				log.Printf("IP Tunnel: Received oversized IP packet (%d bytes) from %s, closing session.", dataLen, clientKey)
+				return
+			}
+
 			ipPacket := make([]byte, dataLen)
 			if _, err := io.ReadFull(ch, ipPacket); err != nil {
 				return
 			}
 			
-			// 写入TUN设备
-			tunInterface.Write(ipPacket)
+			tunMutex.Lock()
+			_, err := tunInterface.Write(ipPacket)
+			tunMutex.Unlock()
+			if err != nil {
+				log.Printf("IP Tunnel: Error writing to TUN device: %v", err)
+				return
+			}
 		}
 	}()
 
 	// Goroutine 2: 从TUN设备读取数据，写入SSH信道
-	// 这个goroutine在整个程序生命周期中只需要一个
-	// 但为了简化会话管理，我们为每个连接都启动一个
-	packet := make([]byte, 2048) // MTU
+	packet := make([]byte, 4096)
 	for {
-		select {
-		case <-done:
+		tunMutex.Lock()
+		n, err := tunInterface.Read(packet)
+		tunMutex.Unlock()
+		
+		if err != nil {
+			log.Printf("IP Tunnel: Error reading from TUN device: %v", err)
 			return
-		default:
-			n, err := tunInterface.Read(packet)
-			if err != nil {
+		}
+
+		if n > 0 {
+			lenBytes := make([]byte, 2)
+			binary.BigEndian.PutUint16(lenBytes, uint16(n))
+			
+			if _, err := ch.Write(lenBytes); err != nil {
 				return
 			}
-			if n > 0 {
-				// 在IP包前加上2字节长度头
-				lenBytes := make([]byte, 2)
-				binary.BigEndian.PutUint16(lenBytes, uint16(n))
-				
-				// 先写长度，再写数据
-				ch.Write(lenBytes)
-				ch.Write(packet[:n])
+			if _, err := ch.Write(packet[:n]); err != nil {
+				return
 			}
 		}
 	}
+}
+
+// readFromTunAndDistribute 的复杂性在于需要将包路由回正确的 ssh.Channel
+// 暂时不使用全局 reader，而是为每个会话创建一个 reader
+func readFromTunAndDistribute() {
+	// This function can be used for a more advanced implementation
+	// where a single goroutine reads from TUN and dispatches packets
+	// to the correct client channels based on a session map.
+	// For now, we use a simpler model in handleIPTunnel.
 }
