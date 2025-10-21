@@ -1,0 +1,34 @@
+{
+  "listen_addr": "0.0.0.0:80",
+  "socks_addrs": [
+    "127.0.0.1:1081"
+  ],
+  "udp_socks_addr": "127.0.0.1:1085",
+  "admin_addr": "0.0.0.0:9090",
+  "handshake_timeout": 1,
+  "connect_ua": "26.4.0",
+  "buffer_size_kb": 128,
+  "idle_timeout_seconds": 3600,
+  "health_check_interval": 20,
+  "connection_pool_size": 10,
+  "admin_accounts": {
+    "admin": "@@123123@@"
+  },
+  "accounts": {
+    "a555": {
+      "password": "a444",
+      "enabled": true,
+      "expiry_date": "2025-12-31"
+    },
+    "a666": {
+      "password": "a555",
+      "enabled": true,
+      "expiry_date": "2026-01-01"
+    },
+    "a777": {
+      "password": "a666",
+      "enabled": true,
+      "expiry_date": "2025-12-30"
+    }
+  }
+}
