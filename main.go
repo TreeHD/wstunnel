@@ -10,7 +10,6 @@ import (
 	"io"
 	"io/ioutil"
 	"log"
-	"math"
 	"net"
 	"net/http"
 	"os"
@@ -22,134 +21,41 @@ import (
 	"golang.org/x/crypto/ssh"
 )
 
-// --- 结构体及全局变量 ---
+// --- 结构体及全局变量 (仅保留必要部分) ---
 type AccountInfo struct {
 	Password   string `json:"password"`
 	Enabled    bool   `json:"enabled"`
 	ExpiryDate string `json:"expiry_date"`
 }
 
-// Config 结构体增加了连接池、健康检查和超时的配置
 type Config struct {
-	ListenAddr          string                 `json:"listen_addr"`
-	SocksAddrs          []string               `json:"socks_addrs"`
-	AdminAddr           string                 `json:"admin_addr"`
-	AdminAccounts       map[string]string      `json:"admin_accounts"`
-	Accounts            map[string]AccountInfo `json:"accounts"`
-	HandshakeTimeout    int                    `json:"handshake_timeout,omitempty"`
-	ConnectUA           string                 `json:"connect_ua,omitempty"`
-	BufferSizeKB        int                    `json:"buffer_size_kb,omitempty"`
-	IdleTimeoutSeconds  int                    `json:"idle_timeout_seconds,omitempty"` // 新增: I/O空闲超时
-	HealthCheckInterval int                    `json:"health_check_interval,omitempty"` // 新增: 健康检查间隔
-	ConnectionPoolSize  int                    `json:"connection_pool_size,omitempty"` // 新增: 每个SOCKS5的连接池大小
-	lock                sync.RWMutex
+	ListenAddr       string                 `json:"listen_addr"`
+	AdminAddr        string                 `json:"admin_addr"`
+	AdminAccounts    map[string]string      `json:"admin_accounts"`
+	Accounts         map[string]AccountInfo `json:"accounts"`
+	HandshakeTimeout int                    `json:"handshake_timeout,omitempty"`
+	ConnectUA        string                 `json:"connect_ua,omitempty"`
+	lock             sync.RWMutex
 }
 
 var globalConfig *Config
 var activeConn int64
-
-type OnlineUser struct {
-	ConnID      string    `json:"conn_id"`
-	Username    string    `json:"username"`
-	RemoteAddr  string    `json:"remote_addr"`
-	ConnectTime time.Time `json:"connect_time"`
-	sshConn     ssh.Conn
-}
-
+type OnlineUser struct { ConnID, Username, RemoteAddr string; ConnectTime time.Time; sshConn ssh.Conn }
 var onlineUsers sync.Map
 const sessionCookieName = "wstunnel_admin_session"
 type Session struct { Username string; Expiry time.Time }
 var sessions = make(map[string]Session)
 var sessionsLock sync.RWMutex
 
-// ==============================================================================
-// === 带健康检查和连接池的代理管理 ===
-// ==============================================================================
-const (
-	StatusUp int32 = iota
-	StatusDown
-)
-
-type pooledProxy struct {
-	addr        string
-	activeConns int64
-	status      int32 // 0 for UP, 1 for DOWN
-	pool        chan net.Conn
-	lock        sync.Mutex
-}
-
-func NewPooledProxy(addr string, poolSize int) *pooledProxy {
-	return &pooledProxy{
-		addr:   addr,
-		status: StatusUp, // 默认启动时是健康的
-		pool:   make(chan net.Conn, poolSize),
-	}
-}
-func (p *pooledProxy) getConn() (net.Conn, error) {
-	select {
-	case conn := <-p.pool:
-		if conn == nil { // 池中可能存有 nil
-			return socks5Connect(p.addr, "", 0, true)
-		}
-		return conn, nil
-	default: // 池为空，创建新连接
-		return socks5Connect(p.addr, "", 0, true) // dialOnly=true, 只建连不做SOCKS5请求
-	}
-}
-func (p *pooledProxy) putConn(conn net.Conn) {
-	if conn == nil { return }
-	select {
-	case p.pool <- conn:
-	default:
-		conn.Close()
-	}
-}
-func (p *pooledProxy) checkHealth() {
-	conn, err := net.DialTimeout("tcp", p.addr, 2*time.Second)
-	if err != nil {
-		if atomic.CompareAndSwapInt32(&p.status, StatusUp, StatusDown) {
-			log.Printf("Health Check: SOCKS5 proxy %s is DOWN", p.addr)
-		}
-		return
-	}
-	conn.Close()
-	if atomic.CompareAndSwapInt32(&p.status, StatusDown, StatusUp) {
-		log.Printf("Health Check: SOCKS5 proxy %s is UP again", p.addr)
-	}
-}
-func (p *pooledProxy) isHealthy() bool { return atomic.LoadInt32(&p.status) == StatusUp }
-func (p *pooledProxy) incrConnections() { atomic.AddInt64(&p.activeConns, 1) }
-func (p *pooledProxy) decrConnections() { atomic.AddInt64(&p.activeConns, -1) }
-func (p *pooledProxy) getActiveConns() int64 { return atomic.LoadInt64(&p.activeConns) }
-
-var proxyPool []*pooledProxy
-var poolLock sync.RWMutex
-
-func startHealthChecks(interval time.Duration) {
-	log.Printf("Starting health checks for SOCKS5 proxies every %s", interval)
-	ticker := time.NewTicker(interval)
-	go func() {
-		for range ticker.C {
-			poolLock.RLock()
-			// 立即执行一次检查
-			for _, p := range proxyPool {
-				go p.checkHealth()
-			}
-			poolLock.RUnlock()
-		}
-	}()
-}
-
-
-// --- 辅助函数 ---
+// --- 辅助函数 (无变化) ---
 func addOnlineUser(user *OnlineUser) { onlineUsers.Store(user.ConnID, user) }
 func removeOnlineUser(connID string) { onlineUsers.Delete(connID) }
-func createSession(username string) *http.Cookie {
+func createSession(username string) *http.Cookie { /* ... */
 	sessionTokenBytes := make([]byte, 32); rand.Read(sessionTokenBytes); sessionToken := hex.EncodeToString(sessionTokenBytes)
 	expiry := time.Now().Add(12 * time.Hour); sessionsLock.Lock(); sessions[sessionToken] = Session{Username: username, Expiry: expiry}; sessionsLock.Unlock()
 	return &http.Cookie{Name: sessionCookieName, Value: sessionToken, Expires: expiry, Path: "/", HttpOnly: true}
 }
-func validateSession(r *http.Request) bool {
+func validateSession(r *http.Request) bool { /* ... */
 	cookie, err := r.Cookie(sessionCookieName); if err != nil { return false }
 	sessionsLock.RLock(); session, ok := sessions[cookie.Value]; sessionsLock.RUnlock()
 	if !ok || time.Now().After(session.Expiry) {
@@ -158,97 +64,72 @@ func validateSession(r *http.Request) bool {
 	}
 	return true
 }
-func sendJSON(w http.ResponseWriter, code int, payload interface{}) {
+func sendJSON(w http.ResponseWriter, code int, payload interface{}) { /* ... */
 	response, _ := json.Marshal(payload); w.Header().Set("Content-Type", "application/json"); w.WriteHeader(code); w.Write(response)
 }
 
-// --- socks5Connect ---
-func socks5Connect(socksAddr, destHost string, destPort uint16, dialOnly bool) (net.Conn, error) {
-	c, err := net.Dial("tcp", socksAddr); if err != nil { return nil, err }
-	if tcpConn, ok := c.(*net.TCPConn); ok { tcpConn.SetNoDelay(true) }
-	if dialOnly { return c, nil }
-	_, err = c.Write([]byte{0x05, 0x01, 0x00}); if err != nil { c.Close(); return nil, err }
-	buf := make([]byte, 2); if _, err := io.ReadFull(c, buf); err != nil { c.Close(); return nil, err }
-	if buf[1] != 0x00 { c.Close(); return nil, fmt.Errorf("socks5 auth failed") }
-	req := []byte{0x05, 0x01, 0x00, 0x03, byte(len(destHost))}; req = append(req, []byte(destHost)...); req = append(req, byte(destPort>>8), byte(destPort&0xff))
-	if _, err = c.Write(req); err != nil { c.Close(); return nil, err }
-	rep := make([]byte, 4); if _, err := io.ReadFull(c, rep); err != nil { c.Close(); return nil, err }
-	if rep[1] != 0x00 { c.Close(); return nil, fmt.Errorf("socks5 connect failed") }
-	switch rep[3] {
-	case 0x01: io.CopyN(io.Discard, c, 4+2); case 0x03: alen := make([]byte, 1); io.ReadFull(c, alen); io.CopyN(io.Discard, c, int64(alen[0])+2); case 0x04: io.CopyN(io.Discard, c, 16+2)
-	}
-	return c, nil
-}
 
 // ==============================================================================
-// === 为I/O操作设置超时 (已修正) ===
+// === 诊断模式核心: Hex Dump 数据记录仪 ===
 // ==============================================================================
-var bufferPool = sync.Pool{New: func() interface{} {
-	b := make([]byte, 64*1024) // 默认64KB
-	return &b
-}}
 
-func timedCopy(dst io.Writer, src io.Reader, timeout time.Duration) (written int64, err error) {
-	bufPtr := bufferPool.Get().(*[]byte)
-	defer bufferPool.Put(bufPtr)
-	buf := *bufPtr
-	for {
-		if conn, ok := src.(net.Conn); ok {
-			conn.SetReadDeadline(time.Now().Add(timeout))
-		}
-		nr, er := src.Read(buf)
-		if nr > 0 {
-			// *** BUG FIX HERE ***
-			// 修正: 直接断言 dst 是否为 net.Conn
-			if nconn, ok := dst.(net.Conn); ok {
-				nconn.SetWriteDeadline(time.Now().Add(timeout))
-			}
-			nw, ew := dst.Write(buf[0:nr])
-			if nw < 0 || nr < nw { nw = 0; if ew == nil { ew = io.ErrShortWrite } }
-			written += int64(nw)
-			if ew != nil { err = ew; break }
-			if nr != nw { err = io.ErrShortWrite; break }
-		}
-		if er != nil {
-			if er != io.EOF { err = er }; break
-		}
-	}
-	return written, err
-}
-
-// --- handleDirectTCPIP ---
-func handleDirectTCPIP(ch ssh.Channel, destHost string, destPort uint32) {
-	atomic.AddInt64(&activeConn, 1); defer atomic.AddInt64(&activeConn, -1)
+// handleDiagnosticMode 接收一个连接，并将其所有输入以Hex Dump格式打印
+func handleDiagnosticMode(ch ssh.Channel, destHost string, destPort uint32) {
+	clientAddr := ch.RemoteAddr().String()
+	log.Printf("====== [DIAGNOSTIC MODE] New connection to %s:%d from %s ======", destHost, destPort, clientAddr)
 	
-	var bestProxy *pooledProxy; minConns := int64(math.MaxInt64)
-	poolLock.RLock()
-	healthyProxies := []*pooledProxy{}
-	for _, p := range proxyPool { if p.isHealthy() { healthyProxies = append(healthyProxies, p) } }
-	if len(healthyProxies) == 0 { poolLock.RUnlock(); log.Printf("error: no healthy SOCKS5 proxies available"); ch.Close(); return }
-	for _, p := range healthyProxies { conns := p.getActiveConns(); if conns < minConns { minConns = conns; bestProxy = p } }
-	poolLock.RUnlock()
-	
-	if bestProxy == nil { log.Printf("error: could not select a best proxy"); ch.Close(); return }
-	
-	bestProxy.incrConnections(); defer bestProxy.decrConnections()
-	
-	socksConn, err := socks5Connect(bestProxy.addr, destHost, uint16(destPort), false)
-	if err != nil { log.Printf("connect to SOCKS5 proxy %s fail: %v", bestProxy.addr, err); ch.Close(); return }
-	defer socksConn.Close()
-	
-	done := make(chan struct{})
-	idleTimeout := time.Duration(globalConfig.IdleTimeoutSeconds) * time.Second
-
-	go func() {
-		defer func() { if tcpConn, ok := socksConn.(*net.TCPConn); ok { tcpConn.CloseWrite() }; close(done) }()
-		timedCopy(socksConn, ch, idleTimeout)
+	// 使用 defer 确保连接关闭时打印结束信息
+	defer func() {
+		log.Printf("====== [DIAGNOSTIC MODE] Connection closed for %s ======", clientAddr)
+		ch.Close()
 	}()
 
-	timedCopy(ch, socksConn, idleTimeout)
-	<-done
+	// 创建一个缓冲区来读取数据
+	buf := make([]byte, 2048)
+	
+	for {
+		// 从SSH Channel中读取数据
+		n, err := ch.Read(buf)
+		if err != nil {
+			if err != io.EOF {
+				log.Printf("[DIAGNOSTIC MODE] Read error from %s: %v", clientAddr, err)
+			}
+			break // 如果读取错误或连接关闭(EOF)，则退出循环
+		}
+
+		if n > 0 {
+			// 如果读到了数据，将其打印为Hex Dump格式
+			log.Printf("[DIAGNOSTIC MODE] Received %d bytes from %s:", n, clientAddr)
+			
+			// hex.Dump 会生成非常漂亮的十六进制和ASCII混合输出
+			// 我们需要将输出捕获到字符串中，以便用log打印
+			dumper := hex.Dumper(os.Stdout) // 先用Stdout，因为log不好处理多行
+			fmt.Printf("--- Hex Dump Start ---\n")
+			dumper.Write(buf[:n])
+			dumper.Close()
+			fmt.Printf("--- Hex Dump End ---\n\n")
+		}
+	}
 }
 
-// --- httpHandshake, sendKeepAlives, handleSshConnection (无变化) ---
+
+// --- handleDirectTCPIP 现在是诊断模式的分发器 ---
+func handleDirectTCPIP(ch ssh.Channel, destHost string, destPort uint32) {
+	atomic.AddInt64(&activeConn, 1)
+	defer atomic.AddInt64(&activeConn, -1)
+
+	// 我们只对发往7300端口的流量进行诊断
+	if destPort == 7300 {
+		handleDiagnosticMode(ch, destHost, destPort)
+	} else {
+		// 对于其他端口，我们可以选择简单关闭或打印一条信息
+		log.Printf("Ignoring non-diagnostic connection to %s:%d", destHost, destPort)
+		ch.Close()
+	}
+}
+
+
+// --- httpHandshake, handleSshConnection 等保持不变 ---
 type combinedConn struct { net.Conn; reader io.Reader }
 func (c *combinedConn) Read(p []byte) (n int, err error) { return c.reader.Read(p) }
 func httpHandshake(conn net.Conn) (net.Conn, error) {
@@ -266,6 +147,7 @@ func httpHandshake(conn net.Conn) (net.Conn, error) {
 		}
 	}
 }
+// 心跳函数暂时不需要，可以注释掉或保留
 func sendKeepAlives(sshConn ssh.Conn, done <-chan struct{}) {
 	ticker := time.NewTicker(30 * time.Second)
 	defer ticker.Stop()
@@ -273,55 +155,51 @@ func sendKeepAlives(sshConn ssh.Conn, done <-chan struct{}) {
 		select {
 		case <-ticker.C:
 			_, _, err := sshConn.SendRequest("keepalive@openssh.com", true, nil)
-			if err != nil {
-				log.Printf("Keepalive to %s failed: %v. Connection closed.", sshConn.RemoteAddr(), err)
-				return
-			}
+			if err != nil { return }
 		case <-done:
-			log.Printf("Keepalive for %s stopped, connection closed.", sshConn.RemoteAddr())
 			return
 		}
 	}
 }
 func handleSshConnection(c net.Conn, sshCfg *ssh.ServerConfig) {
 	handshakedConn, err := httpHandshake(c)
-	if err != nil { log.Printf("http handshake failed for %s: %v", c.RemoteAddr(), err); return }
+	if err != nil { return }
 	sshConn, chans, reqs, err := ssh.NewServerConn(handshakedConn, sshCfg)
-	if err != nil { log.Printf("ssh handshake failed for %s: %v", c.RemoteAddr(), err); return }
+	if err != nil { return }
 	defer sshConn.Close()
 	done := make(chan struct{}); defer close(done); go sendKeepAlives(sshConn, done)
 	connID := sshConn.RemoteAddr().String() + "-" + hex.EncodeToString(sshConn.SessionID())
 	onlineUser := &OnlineUser{ ConnID: connID, Username: sshConn.User(), RemoteAddr: sshConn.RemoteAddr().String(), ConnectTime: time.Now(), sshConn: sshConn, }
 	addOnlineUser(onlineUser)
-	log.Printf("SSH handshake success from %s for user '%s'", sshConn.RemoteAddr(), sshConn.User())
 	defer removeOnlineUser(connID)
 	go ssh.DiscardRequests(reqs)
 	for newChan := range chans {
 		if newChan.ChannelType() != "direct-tcpip" { newChan.Reject(ssh.UnknownChannelType, "only direct-tcpip allowed"); continue }
 		ch, _, err := newChan.Accept()
-		if err != nil { log.Printf("accept channel fail: %v", err); continue }
+		if err != nil { continue }
 		var payload struct { Host string; Port uint32; OriginAddr string; OriginPort uint32 }
-		if err := ssh.Unmarshal(newChan.ExtraData(), &payload); err != nil { log.Printf("bad payload: %v", err); ch.Close(); continue }
+		if err := ssh.Unmarshal(newChan.ExtraData(), &payload); err != nil { ch.Close(); continue }
 		go handleDirectTCPIP(ch, payload.Host, payload.Port)
 	}
 }
 
 // --- Web服务器逻辑 (无变化) ---
-func safeSaveConfig() error {
+// ... (为了简洁，省略这部分代码，您可以直接使用之前版本中的)
+func safeSaveConfig() error { /* ... */
 	globalConfig.lock.Lock(); defer globalConfig.lock.Unlock()
 	data, err := json.MarshalIndent(globalConfig, "", "  "); if err != nil { return fmt.Errorf("failed to marshal config: %w", err) }
 	return ioutil.WriteFile("config.json", data, 0644)
 }
-func authMiddleware(next http.HandlerFunc) http.HandlerFunc {
+func authMiddleware(next http.HandlerFunc) http.HandlerFunc { /* ... */
 	return func(w http.ResponseWriter, r *http.Request) { if validateSession(r) { next.ServeHTTP(w, r) } else { if strings.HasPrefix(r.URL.Path, "/api/") { sendJSON(w, http.StatusUnauthorized, map[string]string{"message": "Unauthorized"}) } else { http.Redirect(w, r, "/login.html", http.StatusFound) } } }
 }
-func loginHandler(w http.ResponseWriter, r *http.Request) {
+func loginHandler(w http.ResponseWriter, r *http.Request) { /* ... */
 	if r.Method != http.MethodPost { sendJSON(w, http.StatusMethodNotAllowed, map[string]string{"message": "Method not allowed"}); return }; var creds struct { Username, Password string }; if err := json.NewDecoder(r.Body).Decode(&creds); err != nil { sendJSON(w, http.StatusBadRequest, map[string]string{"message": "无效请求"}); return }; globalConfig.lock.RLock(); storedPass, ok := globalConfig.AdminAccounts[creds.Username]; globalConfig.lock.RUnlock(); if !ok || creds.Password != storedPass { sendJSON(w, http.StatusUnauthorized, map[string]string{"message": "用户名或密码错误"}); return }; cookie := createSession(creds.Username); http.SetCookie(w, cookie); sendJSON(w, http.StatusOK, map[string]string{"message": "Login successful"})
 }
-func logoutHandler(w http.ResponseWriter, r *http.Request) {
+func logoutHandler(w http.ResponseWriter, r *http.Request) { /* ... */
 	cookie, err := r.Cookie(sessionCookieName); if err == nil { sessionsLock.Lock(); delete(sessions, cookie.Value); sessionsLock.Unlock() }; http.SetCookie(w, &http.Cookie{Name: sessionCookieName, Value: "", Path: "/", MaxAge: -1}); http.Redirect(w, r, "/login.html", http.StatusFound)
 }
-func apiHandler(w http.ResponseWriter, r *http.Request) {
+func apiHandler(w http.ResponseWriter, r *http.Request) { /* ... */
 	w.Header().Set("Content-Type", "application/json")
 	switch {
 	case r.URL.Path == "/api/online-users" && r.Method == "GET":
@@ -345,45 +223,31 @@ func apiHandler(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-// --- main ---
+// --- main (已简化) ---
 func main() {
+	log.Println("====== LAUNCHING IN DIAGNOSTIC MODE ======")
 	configFile, err := os.ReadFile("config.json"); if err != nil { log.Fatalf("FATAL: 无法读取 config.json: %v", err) }
 	globalConfig = &Config{}; err = json.Unmarshal(configFile, globalConfig); if err != nil { log.Fatalf("FATAL: 解析 config.json 失败: %v", err) }
-	if globalConfig.ListenAddr == "" || len(globalConfig.SocksAddrs) == 0 || len(globalConfig.AdminAccounts) == 0 { log.Fatalf("FATAL: config.json 缺少 listen_addr, socks_addrs 或 admin_accounts") }
-	
+	if globalConfig.ListenAddr == "" || len(globalConfig.AdminAccounts) == 0 { log.Fatalf("FATAL: config.json 缺少 listen_addr 或 admin_accounts") }
 	if globalConfig.AdminAddr == "" { globalConfig.AdminAddr = "127.0.0.1:9090" }
 	if globalConfig.HandshakeTimeout <= 0 { globalConfig.HandshakeTimeout = 3 }
 	if globalConfig.ConnectUA == "" { globalConfig.ConnectUA = "26.4.0" }
-	if globalConfig.BufferSizeKB <= 0 { globalConfig.BufferSizeKB = 64 }
-	if globalConfig.IdleTimeoutSeconds <= 0 { globalConfig.IdleTimeoutSeconds = 60 }
-	if globalConfig.HealthCheckInterval <= 0 { globalConfig.HealthCheckInterval = 15 }
-	if globalConfig.ConnectionPoolSize <= 0 { globalConfig.ConnectionPoolSize = 10 }
-	bufferPool = sync.Pool{New: func() interface{} { b := make([]byte, globalConfig.BufferSizeKB*1024); return &b }}
-	
-	poolLock.Lock()
-	for _, addr := range globalConfig.SocksAddrs { proxyPool = append(proxyPool, NewPooledProxy(addr, globalConfig.ConnectionPoolSize)) }
-	poolLock.Unlock()
-	startHealthChecks(time.Duration(globalConfig.HealthCheckInterval) * time.Second)
-	
-	log.Printf("Loaded %d SOCKS5 proxies for 'Least Connections' load balancing.", len(proxyPool))
-	log.Printf("Handshake: timeout=%ds, UA='%s'. Forwarding buffer: %d KB. Idle Timeout: %ds", 
-		globalConfig.HandshakeTimeout, globalConfig.ConnectUA, globalConfig.BufferSizeKB, globalConfig.IdleTimeoutSeconds)
 	
 	go func() {
 		mux := http.NewServeMux(); mux.HandleFunc("/login.html", func(w http.ResponseWriter, r *http.Request) { http.ServeFile(w, r, "login.html") }); mux.HandleFunc("/login", loginHandler); mux.HandleFunc("/logout", authMiddleware(logoutHandler)); mux.HandleFunc("/api/", authMiddleware(apiHandler)); adminHandler := func(w http.ResponseWriter, r *http.Request) { http.ServeFile(w, r, "admin.html") }; mux.HandleFunc("/admin.html", authMiddleware(adminHandler)); mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) { if r.URL.Path != "/" { http.NotFound(w, r); return }; if validateSession(r) { http.Redirect(w, r, "/admin.html", http.StatusFound) } else { http.Redirect(w, r, "/login.html", http.StatusFound) } }); log.Printf("Admin panel listening on http://%s", globalConfig.AdminAddr); if err := http.ListenAndServe(globalConfig.AdminAddr, mux); err != nil { log.Fatalf("FATAL: 无法启动Admin panel: %v", err) }
 	}()
 	
 	sshCfg := &ssh.ServerConfig{ PasswordCallback: func(c ssh.ConnMetadata, p []byte) (*ssh.Permissions, error) {
-		globalConfig.lock.RLock(); accountInfo, userExists := globalConfig.Accounts[c.User()]; globalConfig.lock.RUnlock(); if !userExists { return nil, fmt.Errorf("invalid credentials") }; if !accountInfo.Enabled { return nil, fmt.Errorf("user disabled") }; if accountInfo.ExpiryDate != "" { expiry, err := time.Parse("2006-01-02", accountInfo.ExpiryDate); if err != nil || time.Now().After(expiry.Add(24*time.Hour)) { return nil, fmt.Errorf("user expired") } }; if string(p) == accountInfo.Password { log.Printf("Auth successful for user: '%s'", c.User()); return nil, nil }; log.Printf("Auth failed for user '%s'", c.User()); return nil, fmt.Errorf("invalid credentials")
+		globalConfig.lock.RLock(); accountInfo, userExists := globalConfig.Accounts[c.User()]; globalConfig.lock.RUnlock(); if !userExists { return nil, fmt.Errorf("invalid credentials") }; if !accountInfo.Enabled { return nil, fmt.Errorf("user disabled") }; if accountInfo.ExpiryDate != "" { expiry, err := time.Parse("2006-01-02", accountInfo.ExpiryDate); if err != nil || time.Now().After(expiry.Add(24*time.Hour)) { return nil, fmt.Errorf("user expired") } }; if string(p) == accountInfo.Password { return nil, nil }; return nil, fmt.Errorf("invalid credentials")
 	} }
 	_, priv, err := ed25519.GenerateKey(rand.Reader); if err != nil { log.Fatalf("generate host key fail: %v", err) }
 	privateKey, err := ssh.NewSignerFromKey(priv); if err != nil { log.Fatalf("create signer fail: %v", err) }
 	sshCfg.AddHostKey(privateKey)
 
 	l, err := net.Listen("tcp", globalConfig.ListenAddr); if err != nil { log.Fatalf("listen fail: %v", err) }
-	log.Printf("SSH server listening on %s, forwarding to SOCKS5 pool", globalConfig.ListenAddr)
+	log.Printf("SSH server listening on %s in DIAGNOSTIC MODE for port 7300", globalConfig.ListenAddr)
 	for {
-		conn, err := l.Accept(); if err != nil { log.Printf("accept fail: %v", err); continue }
+		conn, err := l.Accept(); if err != nil { continue }
 		if tcpConn, ok := conn.(*net.TCPConn); ok {
 			tcpConn.SetKeepAlive(true)
 			tcpConn.SetKeepAlivePeriod(1 * time.Minute)
