@@ -59,6 +59,17 @@ type Session struct {
 var sessions = make(map[string]Session)
 var sessionsLock sync.RWMutex
 
+// --- 修正：将 handshakeConn 类型和方法定义移到顶层 ---
+type handshakeConn struct {
+	net.Conn
+	r io.Reader
+}
+
+func (hc *handshakeConn) Read(p []byte) (n int, err error) {
+	return hc.r.Read(p)
+}
+// --- 修正结束 ---
+
 // --- 辅助函数 (无变动) ---
 func addOnlineUser(user *OnlineUser) { onlineUsers.Store(user.ConnID, user) }
 func removeOnlineUser(connID string) { onlineUsers.Delete(connID) }
@@ -95,8 +106,7 @@ func sendJSON(w http.ResponseWriter, code int, payload interface{}) {
 	w.Write(response)
 }
 
-
-// --- 核心数据转发逻辑 (使用您提供的 io.Copy 版本) ---
+// --- 核心数据转发逻辑 (使用 io.Copy 版本) ---
 func handleDirectTCPIP(ch ssh.Channel, destHost string, destPort uint32, remoteAddr net.Addr) {
 	atomic.AddInt64(&activeConn, 1)
 	defer atomic.AddInt64(&activeConn, -1)
@@ -144,10 +154,7 @@ func handleDirectTCPIP(ch ssh.Channel, destHost string, destPort uint32, remoteA
 }
 
 
-// --- SSH & HTTP 握手与连接管理 (重大修改) ---
-
-// 移除了有问题的 httpHandshake 和 combinedConn
-
+// --- SSH & HTTP 握手与连接管理 ---
 func sendKeepAlives(sshConn ssh.Conn, done <-chan struct{}) {
 	ticker := time.NewTicker(30 * time.Second)
 	defer ticker.Stop()
@@ -162,7 +169,7 @@ func sendKeepAlives(sshConn ssh.Conn, done <-chan struct{}) {
 	}
 }
 
-// handleSshConnection 现在集成了稳定可靠的HTTP握手逻辑
+// handleSshConnection 使用了融合后的稳定握手逻辑
 func handleSshConnection(c net.Conn, sshCfg *ssh.ServerConfig) {
 	defer c.Close()
 	
@@ -203,25 +210,14 @@ func handleSshConnection(c net.Conn, sshCfg *ssh.ServerConfig) {
 				log.Printf("Write fake 200 OK response fail for %s: %v", c.RemoteAddr(), err)
 				return // 如果写入失败，则关闭连接
 			}
-			continue // <<< 关键修正：确保在回复后继续循环等待
+			continue // 继续循环等待下一个请求
 		}
 	}
 
-	// 2. HTTP握手成功，准备进行SSH握手
-	// 为了将`bufio.Reader`安全地传递给SSH库，我们使用一个包装器
-	type handshakeConn struct {
-		net.Conn
-		r io.Reader
-	}
-	
-	// 这个Read方法会确保所有读取都通过我们唯一的bufio.Reader
-	func (hc *handshakeConn) Read(p []byte) (n int, err error) {
-		return hc.r.Read(p)
-	}
-	
+	// 2. HTTP握手成功后，进行SSH握手
 	connForSSH := &handshakeConn{Conn: c, r: reader}
 	
-	sshHandshakeTimeout := 15 * time.Second // 这是一个合理的SSH握手超时
+	sshHandshakeTimeout := 15 * time.Second
 	if err := connForSSH.SetDeadline(time.Now().Add(sshHandshakeTimeout)); err != nil {
 		log.Printf("Failed to set SSH handshake deadline for %s: %v", c.RemoteAddr(), err)
 		return
@@ -328,7 +324,7 @@ func main() {
 	if globalConfig.ConnectUA == "" { globalConfig.ConnectUA = "26.4.0" }
 	if globalConfig.BufferSizeKB <= 0 { globalConfig.BufferSizeKB = 128 }
 	if globalConfig.IdleTimeoutSeconds <= 0 { globalConfig.IdleTimeoutSeconds = 90 }
-	// bufferPool is no longer needed
+	
 	log.Println("====== WSTUNNEL (Pure TCP Proxy Mode) Starting ======"); log.Printf("Config: HandshakeTimeout=%ds, ConnectUA='%s', BufferSize=%dKB, IdleTimeout=%ds", globalConfig.HandshakeTimeout, globalConfig.ConnectUA, globalConfig.BufferSizeKB, globalConfig.IdleTimeoutSeconds)
 	go func() {
 		mux := http.NewServeMux(); mux.HandleFunc("/login.html", func(w http.ResponseWriter, r *http.Request) { http.ServeFile(w, r, "login.html") }); mux.HandleFunc("/login", loginHandler); mux.HandleFunc("/logout", authMiddleware(logoutHandler)); mux.HandleFunc("/api/", authMiddleware(apiHandler)); adminHandler := func(w http.ResponseWriter, r *http.Request) { http.ServeFile(w, r, "admin.html") }; mux.HandleFunc("/admin.html", authMiddleware(adminHandler)); mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) { if r.URL.Path != "/" { http.NotFound(w, r); return }; if validateSession(r) { http.Redirect(w, r, "/admin.html", http.StatusFound) } else { http.Redirect(w, r, "/login.html", http.StatusFound) } }); log.Printf("Admin panel listening on http://%s", globalConfig.AdminAddr); if err := http.ListenAndServe(globalConfig.AdminAddr, mux); err != nil { log.Fatalf("FATAL: 无法启动Admin panel: %v", err) }
