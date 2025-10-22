@@ -19,7 +19,7 @@ import (
 	"sync/atomic"
 	"time"
 
-	"golang.org/x/crypto/ssh"
+	"golang.orgorg/x/crypto/ssh"
 )
 
 // --- 结构体及全局变量 (无变动) ---
@@ -37,7 +37,7 @@ type Config struct {
 	HandshakeTimeout   int                    `json:"handshake_timeout,omitempty"`
 	ConnectUA          string                 `json:"connect_ua,omitempty"`
 	BufferSizeKB       int                    `json:"buffer_size_kb,omitempty"`
-	IdleTimeoutSeconds int                    `json:"idle_timeout_seconds,omitempty"` // 注意：此版本代码将不再使用此配置
+	IdleTimeoutSeconds int                    `json:"idle_timeout_seconds,omitempty"` 
 	lock               sync.RWMutex
 }
 
@@ -95,9 +95,7 @@ func sendJSON(w http.ResponseWriter, code int, payload interface{}) {
 	w.Write(response)
 }
 
-
-// --- 核心数据转发逻辑 (重大修改) ---
-// 移除了 timedCopy 和 bufferPool，因为 io.Copy 内置了优化的缓冲
+// --- 核心数据转发逻辑 (使用您最新提供的io.Copy版本) ---
 func handleDirectTCPIP(ch ssh.Channel, destHost string, destPort uint32, remoteAddr net.Addr) {
 	atomic.AddInt64(&activeConn, 1)
 	defer atomic.AddInt64(&activeConn, -1)
@@ -146,7 +144,7 @@ func handleDirectTCPIP(ch ssh.Channel, destHost string, destPort uint32, remoteA
 }
 
 
-// --- SSH & HTTP 握手与连接管理 (使用上一版的SSH握手超时) ---
+// --- SSH & HTTP 握手与连接管理 (核心修改处) ---
 type combinedConn struct {
 	net.Conn
 	reader io.Reader
@@ -167,7 +165,13 @@ func httpHandshake(conn net.Conn) (net.Conn, error) {
 		if strings.Contains(req.UserAgent(), expectedUA) {
 			_, err := conn.Write([]byte("HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\r\n"))
 			if err != nil { return nil, fmt.Errorf("write http response fail: %v", err) }
-			conn.SetReadDeadline(time.Time{}); return &combinedConn{Conn: conn, reader: io.MultiReader(reader, conn)}, nil
+			
+			// --- 核心修正 ---
+			// 移除导致数据竞争的 io.MultiReader。
+			// bufio.Reader `reader` 现在是唯一的读取源，它会在需要时自己从 `conn` 读取数据。
+			conn.SetReadDeadline(time.Time{}); return &combinedConn{Conn: conn, reader: reader}, nil
+			// --- 修正结束 ---
+
 		} else {
 			log.Printf("Incorrect handshake payload from %s (UA: %s). Waiting.", conn.RemoteAddr(), req.UserAgent())
 			_, err := conn.Write([]byte("HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: keep-alive\r\n\r\n"))
@@ -192,15 +196,20 @@ func handleSshConnection(c net.Conn, sshCfg *ssh.ServerConfig) {
 	defer c.Close()
 	handshakedConn, err := httpHandshake(c)
 	if err != nil { log.Printf("HTTP handshake failed for %s: %v", c.RemoteAddr(), err); return }
+	
+	// 您代码中已有的SSH握手超时，这是个好习惯，我们保留它
 	sshHandshakeTimeout := 15 * time.Second
 	if err := handshakedConn.SetDeadline(time.Now().Add(sshHandshakeTimeout)); err != nil {
 		log.Printf("Failed to set SSH handshake deadline for %s: %v", c.RemoteAddr(), err); return
 	}
 	sshConn, chans, reqs, err := ssh.NewServerConn(handshakedConn, sshCfg)
 	if err != nil { log.Printf("SSH handshake failed for %s: %v", c.RemoteAddr(), err); return }
+	
+	// 清除超时，非常重要
 	if err := handshakedConn.SetDeadline(time.Time{}); err != nil {
 		log.Printf("Failed to clear SSH handshake deadline for %s: %v", c.RemoteAddr(), err); sshConn.Close(); return
 	}
+
 	defer sshConn.Close()
 	done := make(chan struct{}); defer close(done); go sendKeepAlives(sshConn, done)
 	connID := sshConn.RemoteAddr().String() + "-" + hex.EncodeToString(sshConn.SessionID())
