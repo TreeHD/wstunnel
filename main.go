@@ -23,7 +23,7 @@ import (
 	"golang.org/x/crypto/ssh"
 )
 
-// --- 结构体及全局变量 ---
+// --- 结构体及全局变量 ---======
 type AccountInfo struct {
 	Password   string `json:"password"`
 	Enabled    bool   `json:"enabled"`
@@ -62,11 +62,12 @@ type Session struct {
 var sessions = make(map[string]Session)
 var sessionsLock sync.RWMutex
 
-// --- handshakeConn 定义 ---
+// handshakeConn 是一个包装器，用于安全地将 bufio.Reader 传递给 ssh.NewServerConn
 type handshakeConn struct {
 	net.Conn
 	r io.Reader
 }
+
 func (hc *handshakeConn) Read(p []byte) (n int, err error) {
 	return hc.r.Read(p)
 }
@@ -88,9 +89,7 @@ func createSession(username string) *http.Cookie {
 
 func validateSession(r *http.Request) bool {
 	cookie, err := r.Cookie(sessionCookieName)
-	if err != nil {
-		return false
-	}
+	if err != nil { return false }
 	sessionsLock.RLock()
 	session, ok := sessions[cookie.Value]
 	sessionsLock.RUnlock()
@@ -175,6 +174,7 @@ func sendKeepAlives(sshConn ssh.Conn, done <-chan struct{}) {
 	}
 }
 
+// handleSshConnection - 融合了稳定握手逻辑的最终版本
 func handleSshConnection(c net.Conn, sshCfg *ssh.ServerConfig) {
 	defer c.Close()
 	
@@ -182,77 +182,48 @@ func handleSshConnection(c net.Conn, sshCfg *ssh.ServerConfig) {
 	expectedUA := globalConfig.ConnectUA
 	reader := bufio.NewReader(c)
 
-	// 1. 手动解析HTTP请求，以获得对数据流的完全控制
+	// 1. 循环处理HTTP请求，以兼容探针和管道式请求
 	for {
 		if err := c.SetReadDeadline(time.Now().Add(timeoutDuration)); err != nil {
 			log.Printf("Failed to set read deadline for %s: %v", c.RemoteAddr(), err)
 			return
 		}
 
-		var requestLine string
-		var err error
-
-		// 读取请求行，容忍前面的空行
-		for {
-			peekBytes, err := reader.Peek(1)
-			if err != nil {
-				if err != io.EOF { log.Printf("Peek error from %s: %v", c.RemoteAddr(), err) }
-				return
-			}
-			if peekBytes[0] == '\r' || peekBytes[0] == '\n' {
-				reader.ReadByte()
-				continue
-			}
-			break
-		}
-
-		requestLine, err = reader.ReadString('\n')
+		// 手动读取并解析HTTP请求
+		req, err := http.ReadRequest(reader)
 		if err != nil {
-			log.Printf("Failed to read request line from %s: %v", c.RemoteAddr(), err)
+			if err != io.EOF { // EOF是正常关闭，不必报错
+				log.Printf("Handshake read error from %s: %v", c.RemoteAddr(), err)
+			}
 			return
 		}
+		io.Copy(ioutil.Discard, req.Body)
+		req.Body.Close()
 
-		// 循环读取Header，直到找到User-Agent或遇到空行
-		uaFound := false
-		for {
-			line, err := reader.ReadString('\n')
-			if err != nil {
-				log.Printf("Failed to read header line from %s: %v", c.RemoteAddr(), err)
-				return
-			}
-			
-			// HTTP Header结束标志是 `\r\n`
-			if strings.TrimSpace(line) == "" {
-				break
-			}
-			
-			if strings.HasPrefix(strings.ToLower(line), "user-agent:") {
-				if strings.Contains(line, expectedUA) {
-					uaFound = true
-				}
-			}
-		}
-		
-		if uaFound {
+		// 检查User-Agent
+		if strings.Contains(req.UserAgent(), expectedUA) {
+			// 匹配成功，回复101并跳出循环
 			_, err := c.Write([]byte("HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\r\n"))
 			if err != nil {
 				log.Printf("Write 101 response fail for %s: %v", c.RemoteAddr(), err)
 				return
 			}
-			break
+			break // 成功，退出循环
 		} else {
-			log.Printf("Incorrect UA in handshake from %s. Waiting.", c.RemoteAddr())
+			// UA不匹配，回复200 OK并继续等待
+			log.Printf("Incorrect handshake payload from %s (UA: %s). Waiting.", c.RemoteAddr(), req.UserAgent())
 			_, err := c.Write([]byte("HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: keep-alive\r\n\r\n"))
 			if err != nil {
 				log.Printf("Write fake 200 OK response fail for %s: %v", c.RemoteAddr(), err)
-				return
+				return 
 			}
-			continue
+			continue // 继续循环等待下一个请求
 		}
 	}
 
 	// 2. HTTP握手成功，进行SSH握手
-	// 此时，`reader`中包含了所有未被我们手动解析消费的、属于SSH的数据
+	// 关键：我们不再需要“净化”缓冲区，因为我们从始至终都使用同一个`reader`。
+	// `ssh.NewServerConn`将无缝地从`reader`中读取可能已缓冲的SSH数据。
 	connForSSH := &handshakeConn{Conn: c, r: reader}
 	
 	sshHandshakeTimeout := 15 * time.Second
@@ -425,6 +396,7 @@ func apiHandler(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
+
 // --- main ---
 func main() {
 	log.SetFlags(log.LstdFlags | log.Lshortfile)
@@ -529,4 +501,4 @@ func main() {
 			handleSshConnection(c, sshCfg)
 		}(conn)
 	}
-}```
+}
