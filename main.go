@@ -3,7 +3,6 @@ package main
 
 import (
 	"bufio"
-	// "bytes" // <--- 删除了这一行
 	"crypto/ed25519"
 	"crypto/rand"
 	"encoding/hex"
@@ -44,6 +43,7 @@ type Config struct {
 
 var globalConfig *Config
 var activeConn int64
+
 type OnlineUser struct {
 	ConnID      string    `json:"conn_id"`
 	Username    string    `json:"username"`
@@ -51,6 +51,7 @@ type OnlineUser struct {
 	ConnectTime time.Time `json:"connect_time"`
 	sshConn     ssh.Conn
 }
+
 var onlineUsers sync.Map
 const sessionCookieName = "wstunnel_admin_session"
 type Session struct {
@@ -172,6 +173,7 @@ func sendKeepAlives(sshConn ssh.Conn, done <-chan struct{}) {
 	}
 }
 
+// handleSshConnection - 融合了稳定握手逻辑的最终版本
 func handleSshConnection(c net.Conn, sshCfg *ssh.ServerConfig) {
 	defer c.Close()
 	
@@ -179,72 +181,48 @@ func handleSshConnection(c net.Conn, sshCfg *ssh.ServerConfig) {
 	expectedUA := globalConfig.ConnectUA
 	reader := bufio.NewReader(c)
 
-	// 1. 手动解析HTTP请求，以获得对数据流的完全控制
+	// 1. 循环处理HTTP请求，以兼容探针和管道式请求
 	for {
 		if err := c.SetReadDeadline(time.Now().Add(timeoutDuration)); err != nil {
 			log.Printf("Failed to set read deadline for %s: %v", c.RemoteAddr(), err)
 			return
 		}
 
-		// 容忍客户端在HTTP请求前发送空行
-		for {
-			peekBytes, err := reader.Peek(1)
-			if err != nil {
-				if err != io.EOF { log.Printf("Peek error from %s: %v", c.RemoteAddr(), err) }
-				return
-			}
-			if peekBytes[0] == '\r' || peekBytes[0] == '\n' {
-				reader.ReadByte()
-				continue
-			}
-			break
-		}
-
-		requestLine, err := reader.ReadString('\n')
+		// 手动读取并解析HTTP请求
+		req, err := http.ReadRequest(reader)
 		if err != nil {
-			log.Printf("Failed to read request line from %s: %v", c.RemoteAddr(), err)
+			if err != io.EOF { // EOF是正常关闭，不必报错
+				log.Printf("Handshake read error from %s: %v", c.RemoteAddr(), err)
+			}
 			return
 		}
+		io.Copy(ioutil.Discard, req.Body)
+		req.Body.Close()
 
-		// 循环读取Header，直到找到User-Agent或遇到空行
-		uaFound := false
-		for {
-			line, err := reader.ReadString('\n')
-			if err != nil {
-				log.Printf("Failed to read header line from %s: %v", c.RemoteAddr(), err)
-				return
-			}
-			
-			if strings.TrimSpace(line) == "" { // HTTP Header结束标志
-				break
-			}
-			
-			if strings.HasPrefix(strings.ToLower(line), "user-agent:") {
-				if strings.Contains(line, expectedUA) {
-					uaFound = true
-				}
-			}
-		}
-		
-		if uaFound {
+		// 检查User-Agent
+		if strings.Contains(req.UserAgent(), expectedUA) {
+			// 匹配成功，回复101并跳出循环
 			_, err := c.Write([]byte("HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\r\n"))
 			if err != nil {
 				log.Printf("Write 101 response fail for %s: %v", c.RemoteAddr(), err)
 				return
 			}
-			break
+			break // 成功，退出循环
 		} else {
-			log.Printf("Incorrect UA in handshake from %s. Waiting.", c.RemoteAddr())
+			// UA不匹配，回复200 OK并继续等待
+			log.Printf("Incorrect handshake payload from %s (UA: %s). Waiting.", c.RemoteAddr(), req.UserAgent())
 			_, err := c.Write([]byte("HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: keep-alive\r\n\r\n"))
 			if err != nil {
 				log.Printf("Write fake 200 OK response fail for %s: %v", c.RemoteAddr(), err)
-				return
+				return 
 			}
-			continue
+			continue // 继续循环等待下一个请求
 		}
 	}
 
 	// 2. HTTP握手成功，进行SSH握手
+	// 关键：我们不再需要“净化”缓冲区，因为我们从始至终都使用同一个`reader`。
+	// `ssh.NewServerConn`将无缝地从`reader`中读取可能已缓冲的SSH数据。
 	connForSSH := &handshakeConn{Conn: c, r: reader}
 	
 	sshHandshakeTimeout := 15 * time.Second
@@ -416,6 +394,7 @@ func apiHandler(w http.ResponseWriter, r *http.Request) {
 		http.NotFound(w, r)
 	}
 }
+
 
 // --- main ---
 func main() {
