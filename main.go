@@ -3,7 +3,6 @@ package main
 
 import (
 	"bufio"
-	"bytes" // 引入 bytes 包
 	"crypto/ed25519"
 	"crypto/rand"
 	"encoding/hex"
@@ -24,6 +23,7 @@ import (
 )
 
 // --- 结构体及全局变量 (无变动) ---
+// ... (与您之前的代码相同，此处省略以保持简洁)
 type AccountInfo struct {
 	Password   string `json:"password"`
 	Enabled    bool   `json:"enabled"`
@@ -60,7 +60,17 @@ type Session struct {
 var sessions = make(map[string]Session)
 var sessionsLock sync.RWMutex
 
+// --- handshakeConn 定义 ---
+type handshakeConn struct {
+	net.Conn
+	r io.Reader
+}
+func (hc *handshakeConn) Read(p []byte) (n int, err error) {
+	return hc.r.Read(p)
+}
+
 // --- 辅助函数 (无变动) ---
+// ... (与您之前的代码相同，此处省略以保持简洁)
 func addOnlineUser(user *OnlineUser) { onlineUsers.Store(user.ConnID, user) }
 func removeOnlineUser(connID string) { onlineUsers.Delete(connID) }
 func createSession(username string) *http.Cookie {
@@ -96,8 +106,8 @@ func sendJSON(w http.ResponseWriter, code int, payload interface{}) {
 	w.Write(response)
 }
 
-
-// --- 核心数据转发逻辑 (使用 io.Copy 版本) ---
+// --- 核心数据转发逻辑 (无变动) ---
+// ... (与您之前的代码相同，此处省略以保持简洁)
 func handleDirectTCPIP(ch ssh.Channel, destHost string, destPort uint32, remoteAddr net.Addr) {
 	atomic.AddInt64(&activeConn, 1)
 	defer atomic.AddInt64(&activeConn, -1)
@@ -141,15 +151,7 @@ func handleDirectTCPIP(ch ssh.Channel, destHost string, destPort uint32, remoteA
 	wg.Wait()
 }
 
-
 // --- SSH & HTTP 握手与连接管理 (重大修改) ---
-type handshakeConn struct {
-	net.Conn
-	r io.Reader
-}
-func (hc *handshakeConn) Read(p []byte) (n int, err error) {
-	return hc.r.Read(p)
-}
 func sendKeepAlives(sshConn ssh.Conn, done <-chan struct{}) {
 	ticker := time.NewTicker(30 * time.Second)
 	defer ticker.Stop()
@@ -163,6 +165,7 @@ func sendKeepAlives(sshConn ssh.Conn, done <-chan struct{}) {
 		}
 	}
 }
+
 func handleSshConnection(c net.Conn, sshCfg *ssh.ServerConfig) {
 	defer c.Close()
 	
@@ -170,45 +173,65 @@ func handleSshConnection(c net.Conn, sshCfg *ssh.ServerConfig) {
 	expectedUA := globalConfig.ConnectUA
 	reader := bufio.NewReader(c)
 
+	// 1. 手动解析HTTP请求，以获得对数据流的完全控制
 	for {
 		if err := c.SetReadDeadline(time.Now().Add(timeoutDuration)); err != nil {
 			log.Printf("Failed to set read deadline for %s: %v", c.RemoteAddr(), err)
 			return
 		}
-		
+
+		var requestLine string
+		var err error
+
+		// 读取请求行，容忍前面的空行
 		for {
-			peekBytes, err := reader.Peek(1)
+			requestLine, err = reader.ReadString('\n')
 			if err != nil {
-				if err != io.EOF {
-					log.Printf("Peek error from %s: %v", c.RemoteAddr(), err)
-				}
+				log.Printf("Failed to read request line from %s: %v", c.RemoteAddr(), err)
 				return
 			}
-			if peekBytes[0] == '\r' || peekBytes[0] == '\n' {
-				reader.ReadByte()
-				continue
+			requestLine = strings.TrimSpace(requestLine)
+			if requestLine != "" {
+				break
 			}
-			break
 		}
-		
-		req, err := http.ReadRequest(reader)
-		if err != nil {
-			if err != io.EOF {
-				log.Printf("Handshake read error from %s: %v", c.RemoteAddr(), err)
-			}
+
+		if !strings.HasPrefix(requestLine, "GET ") {
+			log.Printf("Invalid method from %s: %s", c.RemoteAddr(), requestLine)
 			return
 		}
-		io.Copy(ioutil.Discard, req.Body); req.Body.Close()
 
-		if strings.Contains(req.UserAgent(), expectedUA) {
+		// 循环读取Header，直到找到User-Agent或遇到空行（Header结束）
+		uaFound := false
+		for {
+			line, err := reader.ReadString('\n')
+			if err != nil {
+				log.Printf("Failed to read header line from %s: %v", c.RemoteAddr(), err)
+				return
+			}
+			line = strings.TrimSpace(line)
+			if line == "" { // 遇到空行，表示Header部分结束
+				break
+			}
+			if strings.HasPrefix(strings.ToLower(line), "user-agent:") {
+				if strings.Contains(line, expectedUA) {
+					uaFound = true
+				}
+			}
+		}
+		
+		// 根据UA是否匹配来决定行为
+		if uaFound {
+			// 匹配成功，回复101并跳出循环
 			_, err := c.Write([]byte("HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\r\n"))
 			if err != nil {
 				log.Printf("Write 101 response fail for %s: %v", c.RemoteAddr(), err)
 				return
 			}
-			break
+			break // 成功，退出循环
 		} else {
-			log.Printf("Incorrect handshake payload from %s (UA: %s). Waiting.", c.RemoteAddr(), req.UserAgent())
+			// UA不匹配，回复200 OK并继续等待
+			log.Printf("Incorrect UA in handshake from %s. Waiting.", c.RemoteAddr())
 			_, err := c.Write([]byte("HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: keep-alive\r\n\r\n"))
 			if err != nil {
 				log.Printf("Write fake 200 OK response fail for %s: %v", c.RemoteAddr(), err)
@@ -218,34 +241,30 @@ func handleSshConnection(c net.Conn, sshCfg *ssh.ServerConfig) {
 		}
 	}
 
-	// --- 关键修正：净化缓冲区 ---
-	var preReadData []byte
-	if reader.Buffered() > 0 {
-		// 读取所有已缓冲的数据
-		preReadData = make([]byte, reader.Buffered())
-		n, _ := reader.Read(preReadData)
-		preReadData = preReadData[:n]
-		log.Printf("Drained %d bytes of pre-read data from %s", n, c.RemoteAddr())
-	}
+	// 2. HTTP握手成功，进行SSH握手
+	// 此时，`reader`中包含了所有未被我们手动解析消费的、属于SSH的数据
+	connForSSH := &handshakeConn{Conn: c, r: reader}
 	
-	// 创建一个新的复合读取器，它会先读取我们净化出来的数据，然后再继续从原始读取器读取
-	finalReader := io.MultiReader(bytes.NewReader(preReadData), reader)
-	connForSSH := &handshakeConn{Conn: c, r: finalReader}
-	// --- 修正结束 ---
-
 	sshHandshakeTimeout := 15 * time.Second
 	if err := connForSSH.SetDeadline(time.Now().Add(sshHandshakeTimeout)); err != nil {
-		log.Printf("Failed to set SSH handshake deadline for %s: %v", c.RemoteAddr(), err); return
+		log.Printf("Failed to set SSH handshake deadline for %s: %v", c.RemoteAddr(), err)
+		return
 	}
+
 	sshConn, chans, reqs, err := ssh.NewServerConn(connForSSH, sshCfg)
-	if err != nil { log.Printf("SSH handshake failed for %s: %v", c.RemoteAddr(), err); return }
+	if err != nil {
+		log.Printf("SSH handshake failed for %s: %v", c.RemoteAddr(), err)
+		return
+	}
 
 	if err := connForSSH.SetDeadline(time.Time{}); err != nil {
-		log.Printf("Failed to clear SSH handshake deadline for %s: %v", c.RemoteAddr(), err); sshConn.Close(); return
+		log.Printf("Failed to clear SSH handshake deadline for %s: %v", c.RemoteAddr(), err)
+		sshConn.Close()
+		return
 	}
-	
 	defer sshConn.Close()
 	
+	// 3. 后续逻辑不变
 	done := make(chan struct{}); defer close(done); go sendKeepAlives(sshConn, done)
 	connID := sshConn.RemoteAddr().String() + "-" + hex.EncodeToString(sshConn.SessionID())
 	onlineUser := &OnlineUser{ConnID: connID, Username: sshConn.User(), RemoteAddr: sshConn.RemoteAddr().String(), ConnectTime: time.Now(), sshConn: sshConn}
@@ -263,6 +282,7 @@ func handleSshConnection(c net.Conn, sshCfg *ssh.ServerConfig) {
 }
 
 // --- Web服务器逻辑 (无变动) ---
+// ... (与您之前的代码相同，此处省略以保持简洁)
 func safeSaveConfig() error {
 	globalConfig.lock.Lock(); defer globalConfig.lock.Unlock()
 	data, err := json.MarshalIndent(globalConfig, "", "  "); if err != nil { return fmt.Errorf("failed to marshal config: %w", err) }
