@@ -23,7 +23,7 @@ import (
 	"golang.org/x/crypto/ssh"
 )
 
-// --- 结构体及全局变量 (无变动) ---
+// --- 结构体及全局变量 ---
 type AccountInfo struct {
 	Password   string `json:"password"`
 	Enabled    bool   `json:"enabled"`
@@ -44,6 +44,7 @@ type Config struct {
 
 var globalConfig *Config
 var activeConn int64
+
 type OnlineUser struct {
 	ConnID      string    `json:"conn_id"`
 	Username    string    `json:"username"`
@@ -51,12 +52,16 @@ type OnlineUser struct {
 	ConnectTime time.Time `json:"connect_time"`
 	sshConn     ssh.Conn
 }
+
 var onlineUsers sync.Map
+
 const sessionCookieName = "wstunnel_admin_session"
+
 type Session struct {
 	Username string
 	Expiry   time.Time
 }
+
 var sessions = make(map[string]Session)
 var sessionsLock sync.RWMutex
 
@@ -65,11 +70,12 @@ type handshakeConn struct {
 	net.Conn
 	r io.Reader
 }
+
 func (hc *handshakeConn) Read(p []byte) (n int, err error) {
 	return hc.r.Read(p)
 }
 
-// --- 辅助函数 (无变动) ---
+// --- 辅助函数 ---
 func addOnlineUser(user *OnlineUser) { onlineUsers.Store(user.ConnID, user) }
 func removeOnlineUser(connID string) { onlineUsers.Delete(connID) }
 func createSession(username string) *http.Cookie {
@@ -84,7 +90,9 @@ func createSession(username string) *http.Cookie {
 }
 func validateSession(r *http.Request) bool {
 	cookie, err := r.Cookie(sessionCookieName)
-	if err != nil { return false }
+	if err != nil {
+		return false
+	}
 	sessionsLock.RLock()
 	session, ok := sessions[cookie.Value]
 	sessionsLock.RUnlock()
@@ -105,7 +113,58 @@ func sendJSON(w http.ResponseWriter, code int, payload interface{}) {
 	w.Write(response)
 }
 
-// --- 核心数据转发逻辑 ---
+// --- 核心数据转发逻辑 (已修改为容错模式) ---
+
+// tolerantCopy 是一个带有重试逻辑的io.Copy替代品，用于应对网络波动。
+func tolerantCopy(dst io.Writer, src io.Reader, direction string, remoteAddr net.Addr) {
+	bufferSize := globalConfig.BufferSizeKB * 1024
+	if bufferSize <= 0 {
+		bufferSize = 128 * 1024 // 默认值
+	}
+	buf := make([]byte, bufferSize)
+
+	const maxConsecutiveTempErrors = 100
+	consecutiveTempErrors := 0
+	const retryDelay = 500 * time.Millisecond
+
+	for {
+		nr, rErr := src.Read(buf)
+		if nr > 0 {
+			nw, wErr := dst.Write(buf[0:nr])
+			if wErr != nil {
+				log.Printf("TCP Proxy (%s): Permanent write error for %s, closing connection: %v", direction, remoteAddr, wErr)
+				break
+			}
+			if nr != nw {
+				log.Printf("TCP Proxy (%s): Short write for %s, closing connection", direction, remoteAddr)
+				break
+			}
+			consecutiveTempErrors = 0
+		}
+
+		if rErr != nil {
+			if rErr == io.EOF {
+				log.Printf("TCP Proxy (%s): Connection closed by source for %s (EOF).", direction, remoteAddr)
+				break
+			}
+
+			if netErr, ok := rErr.(net.Error); ok && (netErr.Timeout() || netErr.Temporary()) {
+				consecutiveTempErrors++
+				if consecutiveTempErrors > maxConsecutiveTempErrors {
+					log.Printf("TCP Proxy (%s): Too many consecutive temporary errors for %s, giving up. Last error: %v", direction, remoteAddr, rErr)
+					break
+				}
+				log.Printf("TCP Proxy (%s): Temporary network error for %s: %v. Retrying in %v... (Attempt %d/%d)", direction, remoteAddr, rErr, retryDelay, consecutiveTempErrors, maxConsecutiveTempErrors)
+				time.Sleep(retryDelay)
+				continue
+			}
+
+			log.Printf("TCP Proxy (%s): Unrecoverable read error for %s, closing connection: %v", direction, remoteAddr, rErr)
+			break
+		}
+	}
+}
+
 func handleDirectTCPIP(ch ssh.Channel, destHost string, destPort uint32, remoteAddr net.Addr) {
 	atomic.AddInt64(&activeConn, 1)
 	defer atomic.AddInt64(&activeConn, -1)
@@ -116,7 +175,7 @@ func handleDirectTCPIP(ch ssh.Channel, destHost string, destPort uint32, remoteA
 	} else {
 		destAddr = fmt.Sprintf("%s:%d", destHost, destPort)
 	}
-	
+
 	destConn, err := net.DialTimeout("tcp", destAddr, 10*time.Second)
 	if err != nil {
 		log.Printf("TCP Proxy: Failed to connect to %s: %v", destAddr, err)
@@ -124,26 +183,28 @@ func handleDirectTCPIP(ch ssh.Channel, destHost string, destPort uint32, remoteA
 		return
 	}
 	defer destConn.Close()
-	
+
 	if tcpConn, ok := destConn.(*net.TCPConn); ok {
 		tcpConn.SetNoDelay(true)
 		tcpConn.SetKeepAlive(true)
 		tcpConn.SetKeepAlivePeriod(1 * time.Minute)
 	}
-	
+
 	var wg sync.WaitGroup
 	wg.Add(2)
 
 	go func() {
 		defer wg.Done()
-		defer ch.Close()
-		io.Copy(destConn, ch)
+		defer ch.CloseWrite()
+		defer destConn.Close()
+		tolerantCopy(destConn, ch, "Client->Target", remoteAddr)
 	}()
-	
+
 	go func() {
 		defer wg.Done()
-		defer destConn.Close()
-		io.Copy(ch, destConn)
+		defer ch.Close()
+		defer destConn.CloseRead()
+		tolerantCopy(ch, destConn, "Target->Client", remoteAddr)
 	}()
 
 	wg.Wait()
@@ -169,7 +230,7 @@ func sendKeepAlives(sshConn ssh.Conn, done <-chan struct{}) {
 
 func handleSshConnection(c net.Conn, sshCfg *ssh.ServerConfig) {
 	defer c.Close()
-	
+
 	timeoutDuration := time.Duration(globalConfig.HandshakeTimeout) * time.Second
 	expectedUA := globalConfig.ConnectUA
 	reader := bufio.NewReader(c)
@@ -183,7 +244,9 @@ func handleSshConnection(c net.Conn, sshCfg *ssh.ServerConfig) {
 		for {
 			peekBytes, err := reader.Peek(1)
 			if err != nil {
-				if err != io.EOF { log.Printf("Peek error from %s: %v", c.RemoteAddr(), err) }
+				if err != io.EOF {
+					log.Printf("Peek error from %s: %v", c.RemoteAddr(), err)
+				}
 				return
 			}
 			if peekBytes[0] == '\r' || peekBytes[0] == '\n' {
@@ -209,7 +272,7 @@ func handleSshConnection(c net.Conn, sshCfg *ssh.ServerConfig) {
 				log.Printf("Write 101 response fail for %s: %v", c.RemoteAddr(), err)
 				return
 			}
-			break 
+			break
 		} else {
 			log.Printf("Incorrect handshake payload from %s (UA: %s). Waiting.", c.RemoteAddr(), req.UserAgent())
 			_, err := c.Write([]byte("HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: keep-alive\r\n\r\n"))
@@ -221,10 +284,8 @@ func handleSshConnection(c net.Conn, sshCfg *ssh.ServerConfig) {
 		}
 	}
 
-	// --- 关键修正：在此处加入延迟 ---
 	log.Printf("HTTP handshake successful for %s. Delaying for 500ms before starting SSH.", c.RemoteAddr())
 	time.Sleep(500 * time.Millisecond)
-	// --- 修正结束 ---
 
 	var preReadData []byte
 	if reader.Buffered() > 0 {
@@ -233,10 +294,10 @@ func handleSshConnection(c net.Conn, sshCfg *ssh.ServerConfig) {
 		preReadData = preReadData[:n]
 		log.Printf("Drained %d bytes of pre-read data from %s", n, c.RemoteAddr())
 	}
-	
+
 	finalReader := io.MultiReader(bytes.NewReader(preReadData), reader)
 	connForSSH := &handshakeConn{Conn: c, r: finalReader}
-	
+
 	sshHandshakeTimeout := 15 * time.Second
 	if err := connForSSH.SetDeadline(time.Now().Add(sshHandshakeTimeout)); err != nil {
 		log.Printf("Failed to set SSH handshake deadline for %s: %v", c.RemoteAddr(), err)
@@ -249,27 +310,73 @@ func handleSshConnection(c net.Conn, sshCfg *ssh.ServerConfig) {
 		return
 	}
 
-	if err := connForSSH.SetDeadline(time.Time{}); err != nil {
-		log.Printf("Failed to clear SSH handshake deadline for %s: %v", c.RemoteAddr(), err)
-		sshConn.Close()
-		return
+	idleTimeout := time.Duration(globalConfig.IdleTimeoutSeconds) * time.Second
+	if idleTimeout > 0 {
+		if err := connForSSH.SetDeadline(time.Time{}); err != nil {
+			log.Printf("Failed to clear SSH handshake deadline for %s: %v", c.RemoteAddr(), err)
+			sshConn.Close()
+			return
+		}
+		
+		doneDeadline := make(chan struct{})
+		defer close(doneDeadline)
+		go func() {
+			ticker := time.NewTicker(idleTimeout / 2)
+			defer ticker.Stop()
+			for {
+				select {
+				case <-ticker.C:
+					err := c.SetReadDeadline(time.Now().Add(idleTimeout))
+					if err != nil {
+						log.Printf("Failed to set idle timeout for %s, stopping deadline updates: %v", c.RemoteAddr(), err)
+						return
+					}
+				case <-doneDeadline:
+					return
+				}
+			}
+		}()
+	} else {
+		if err := connForSSH.SetDeadline(time.Time{}); err != nil {
+			log.Printf("Failed to clear SSH handshake deadline for %s: %v", c.RemoteAddr(), err)
+			sshConn.Close()
+			return
+		}
 	}
+
 	defer sshConn.Close()
-	
-	done := make(chan struct{}); defer close(done); go sendKeepAlives(sshConn, done)
+
+	done := make(chan struct{})
+	defer close(done)
+	go sendKeepAlives(sshConn, done)
 	connID := sshConn.RemoteAddr().String() + "-" + hex.EncodeToString(sshConn.SessionID())
 	onlineUser := &OnlineUser{ConnID: connID, Username: sshConn.User(), RemoteAddr: sshConn.RemoteAddr().String(), ConnectTime: time.Now(), sshConn: sshConn}
-	addOnlineUser(onlineUser); log.Printf("SSH handshake success from %s for user '%s'", sshConn.RemoteAddr(), sshConn.User()); defer removeOnlineUser(connID)
+	addOnlineUser(onlineUser)
+	log.Printf("SSH handshake success from %s for user '%s'", sshConn.RemoteAddr(), sshConn.User())
+	defer removeOnlineUser(connID)
 	go ssh.DiscardRequests(reqs)
-	
+
 	for newChan := range chans {
 		if newChan.ChannelType() != "direct-tcpip" {
-			newChan.Reject(ssh.UnknownChannelType, "only direct-tcpip is allowed"); continue
+			newChan.Reject(ssh.UnknownChannelType, "only direct-tcpip is allowed")
+			continue
 		}
 		ch, _, err := newChan.Accept()
-		if err != nil { log.Printf("Failed to accept channel: %v", err); continue }
-		var payload struct { Host string; Port uint32; OriginAddr string; OriginPort uint32 }
-		if err := ssh.Unmarshal(newChan.ExtraData(), &payload); err != nil { log.Printf("Invalid direct-tcpip payload: %v", err); ch.Close(); continue }
+		if err != nil {
+			log.Printf("Failed to accept channel: %v", err)
+			continue
+		}
+		var payload struct {
+			Host       string
+			Port       uint32
+			OriginAddr string
+			OriginPort uint32
+		}
+		if err := ssh.Unmarshal(newChan.ExtraData(), &payload); err != nil {
+			log.Printf("Invalid direct-tcpip payload: %v", err)
+			ch.Close()
+			continue
+		}
 		go handleDirectTCPIP(ch, payload.Host, payload.Port, sshConn.RemoteAddr())
 	}
 }
@@ -340,7 +447,14 @@ func apiHandler(w http.ResponseWriter, r *http.Request) {
 	case r.URL.Path == "/api/online-users" && r.Method == "GET":
 		var users []*OnlineUser
 		onlineUsers.Range(func(key, value interface{}) bool {
-			users = append(users, value.(*OnlineUser))
+			// Do not expose sshConn object
+			u := value.(*OnlineUser)
+			users = append(users, &OnlineUser{
+				ConnID:      u.ConnID,
+				Username:    u.Username,
+				RemoteAddr:  u.RemoteAddr,
+				ConnectTime: u.ConnectTime,
+			})
 			return true
 		})
 		json.NewEncoder(w).Encode(users)
@@ -406,7 +520,6 @@ func apiHandler(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-
 // --- main ---
 func main() {
 	log.SetFlags(log.LstdFlags | log.Lshortfile)
@@ -423,11 +536,22 @@ func main() {
 		log.Fatalf("FATAL: config.json 缺少 listen_addr 或 admin_accounts")
 	}
 
-	if globalConfig.AdminAddr == "" { globalConfig.AdminAddr = "127.0.0.1:9090" }
-	if globalConfig.HandshakeTimeout <= 0 { globalConfig.HandshakeTimeout = 5 }
-	if globalConfig.ConnectUA == "" { globalConfig.ConnectUA = "26.4.0" }
-	if globalConfig.BufferSizeKB <= 0 { globalConfig.BufferSizeKB = 128 }
-	if globalConfig.IdleTimeoutSeconds <= 0 { globalConfig.IdleTimeoutSeconds = 90 }
+	if globalConfig.AdminAddr == "" {
+		globalConfig.AdminAddr = "127.0.0.1:9090"
+	}
+	if globalConfig.HandshakeTimeout <= 0 {
+		globalConfig.HandshakeTimeout = 5
+	}
+	if globalConfig.ConnectUA == "" {
+		globalConfig.ConnectUA = "26.4.0"
+	}
+	if globalConfig.BufferSizeKB <= 0 {
+		globalConfig.BufferSizeKB = 128
+	}
+	// IdleTimeoutSeconds 默认值为0 (禁用)，除非在config.json中配置
+	// if globalConfig.IdleTimeoutSeconds <= 0 {
+	// 	globalConfig.IdleTimeoutSeconds = 90
+	// }
 
 	log.Println("====== WSTUNNEL (Pure TCP Proxy Mode) Starting ======")
 	log.Printf("Config: HandshakeTimeout=%ds, ConnectUA='%s', BufferSize=%dKB, IdleTimeout=%ds",
@@ -442,8 +566,15 @@ func main() {
 		adminHandler := func(w http.ResponseWriter, r *http.Request) { http.ServeFile(w, r, "admin.html") }
 		mux.HandleFunc("/admin.html", authMiddleware(adminHandler))
 		mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
-			if r.URL.Path != "/" { http.NotFound(w, r); return }
-			if validateSession(r) { http.Redirect(w, r, "/admin.html", http.StatusFound) } else { http.Redirect(w, r, "/login.html", http.StatusFound) }
+			if r.URL.Path != "/" {
+				http.NotFound(w, r)
+				return
+			}
+			if validateSession(r) {
+				http.Redirect(w, r, "/admin.html", http.StatusFound)
+			} else {
+				http.Redirect(w, r, "/login.html", http.StatusFound)
+			}
 		})
 		log.Printf("Admin panel listening on http://%s", globalConfig.AdminAddr)
 		if err := http.ListenAndServe(globalConfig.AdminAddr, mux); err != nil {
