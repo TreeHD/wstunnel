@@ -113,7 +113,7 @@ func sendJSON(w http.ResponseWriter, code int, payload interface{}) {
 	w.Write(response)
 }
 
-// --- 核心数据转发逻辑 (已修改) ---
+// --- 核心数据转发逻辑 (最终优化版) ---
 func tolerantCopy(dst io.Writer, src io.Reader, direction string, remoteAddr net.Addr) {
 	// [核心优化 2/3] 从池中获取缓冲区，并在函数结束时归还
 	bufPtr := bufferPool.Get().(*[]byte)
@@ -129,9 +129,11 @@ func tolerantCopy(dst io.Writer, src io.Reader, direction string, remoteAddr net
 		if nr > 0 {
 			nw, wErr := dst.Write(buf[0:nr])
 			if wErr != nil {
-				if wErr != io.EOF {
-					log.Printf("TCP Proxy (%s): Permanent write error for %s, closing connection: %v", direction, remoteAddr, wErr)
+				// [健壮性优化] 如果写入时遇到EOF，说明对端关闭了写，是正常情况，直接退出
+				if wErr == io.EOF {
+					break
 				}
+				log.Printf("TCP Proxy (%s): Permanent write error for %s, closing connection: %v", direction, remoteAddr, wErr)
 				break
 			}
 			if nr != nw {
@@ -465,7 +467,7 @@ func main() {
 	if globalConfig.TolerantCopyRetryDelayMs <= 0 { globalConfig.TolerantCopyRetryDelayMs = 500 }
 	if globalConfig.TargetConnectTimeoutSeconds <= 0 { globalConfig.TargetConnectTimeoutSeconds = 10 }
 	
-	// [核心优化] 在 main 函数中，根据配置文件的大小初始化 bufferPool
+	// [核心优化 3/3] 在 main 函数中，根据配置文件的大小初始化 bufferPool
 	bufferPool = sync.Pool{
 		New: func() interface{} {
 			buf := make([]byte, globalConfig.BufferSizeKB*1024)
@@ -496,7 +498,7 @@ func main() {
 	}()
 	
 	sshCfg := &ssh.ServerConfig{
-		ServerVersion: "SSH-2.0-WSTunnel_v3.0_by_xiaoguiday",
+		ServerVersion: "SSH-2.0-WSTunnel_v3.1_by_xiaoguiday", // Minor version bump
 		PasswordCallback: func(c ssh.ConnMetadata, p []byte) (*ssh.Permissions, error) {
 			globalConfig.lock.RLock()
 			accountInfo, userExists := globalConfig.Accounts[c.User()]
@@ -516,7 +518,7 @@ func main() {
 	sshCfg.AddHostKey(privateKey)
 
 	l, err := net.Listen("tcp", globalConfig.ListenAddr); if err != nil { log.Fatalf("listen fail: %v", err) }
-	log.Printf("SSH server listening on %s. All traffic will be forwarded via TCP.", globalConfig.ListenAddr)
+	log.Printf("SSH server listening on %s. All traffic will be forwarded via TCP.", global.ListenAddr)
 	for {
 		conn, err := l.Accept()
 		if err != nil { log.Printf("Accept failed: %v", err); continue }
