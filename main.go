@@ -518,7 +518,7 @@ func main() {
 	sshCfg.AddHostKey(privateKey)
 
 	l, err := net.Listen("tcp", globalConfig.ListenAddr); if err != nil { log.Fatalf("listen fail: %v", err) }
-	log.Printf("SSH server listening on %s. All traffic will be forwarded via TCP.", global.ListenAddr)
+	log.Printf("SSH server listening on %s. All traffic will be forwarded via TCP.", globalConfig.ListenAddr)
 	for {
 		conn, err := l.Accept()
 		if err != nil { log.Printf("Accept failed: %v", err); continue }
