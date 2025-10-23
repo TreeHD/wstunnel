@@ -122,7 +122,6 @@ func tolerantCopy(dst io.Writer, src io.Reader, direction string, remoteAddr net
 	buf := *bufPtr
 
 	maxRetries := globalConfig.TolerantCopyMaxRetries
-	retryDelay := time.Duration(globalConfig.TolerantCopyRetryDelayMs) * time.Millisecond
 	consecutiveTempErrors := 0
 
 	for {
