@@ -23,22 +23,25 @@ import (
 	"golang.org/x/crypto/ssh"
 )
 
-// --- 结构体及全局变量 (无变动) ---
+// --- 结构体及全局变量 (已修改) ---
 type AccountInfo struct {
 	Password   string `json:"password"`
 	Enabled    bool   `json:"enabled"`
 	ExpiryDate string `json:"expiry_date"`
 }
 type Config struct {
-	ListenAddr         string                 `json:"listen_addr"`
-	AdminAddr          string                 `json:"admin_addr"`
-	AdminAccounts      map[string]string      `json:"admin_accounts"`
-	Accounts           map[string]AccountInfo `json:"accounts"`
-	HandshakeTimeout   int                    `json:"handshake_timeout,omitempty"`
-	ConnectUA          string                 `json:"connect_ua,omitempty"`
-	BufferSizeKB       int                    `json:"buffer_size_kb,omitempty"`
-	IdleTimeoutSeconds int                    `json:"idle_timeout_seconds,omitempty"`
-	lock               sync.RWMutex
+	ListenAddr                  string                 `json:"listen_addr"`
+	AdminAddr                   string                 `json:"admin_addr"`
+	AdminAccounts               map[string]string      `json:"admin_accounts"`
+	Accounts                    map[string]AccountInfo `json:"accounts"`
+	HandshakeTimeout            int                    `json:"handshake_timeout,omitempty"`
+	ConnectUA                   string                 `json:"connect_ua,omitempty"`
+	BufferSizeKB                int                    `json:"buffer_size_kb,omitempty"`
+	IdleTimeoutSeconds          int                    `json:"idle_timeout_seconds,omitempty"`
+	TolerantCopyMaxRetries      int                    `json:"tolerant_copy_max_retries,omitempty"`
+	TolerantCopyRetryDelayMs    int                    `json:"tolerant_copy_retry_delay_ms,omitempty"`
+	TargetConnectTimeoutSeconds int                    `json:"target_connect_timeout_seconds,omitempty"`
+	lock                        sync.RWMutex
 }
 var globalConfig *Config
 var activeConn int64
@@ -99,8 +102,7 @@ func sendJSON(w http.ResponseWriter, code int, payload interface{}) {
 	w.Write(response)
 }
 
-// --- 核心数据转发逻辑 (最终优化版) ---
-
+// --- 核心数据转发逻辑 (已修改) ---
 func tolerantCopy(dst io.Writer, src io.Reader, direction string, remoteAddr net.Addr) {
 	bufferSize := globalConfig.BufferSizeKB * 1024
 	if bufferSize <= 0 {
@@ -108,16 +110,15 @@ func tolerantCopy(dst io.Writer, src io.Reader, direction string, remoteAddr net
 	}
 	buf := make([]byte, bufferSize)
 
-	const maxConsecutiveTempErrors = 100
+	maxRetries := globalConfig.TolerantCopyMaxRetries
+	retryDelay := time.Duration(globalConfig.TolerantCopyRetryDelayMs) * time.Millisecond
 	consecutiveTempErrors := 0
-	const retryDelay = 500 * time.Millisecond
 
 	for {
 		nr, rErr := src.Read(buf)
 		if nr > 0 {
 			nw, wErr := dst.Write(buf[0:nr])
 			if wErr != nil {
-				// 增加对写入EOF的判断，这也是正常关闭的信号
 				if wErr == io.EOF {
 					break
 				}
@@ -133,27 +134,23 @@ func tolerantCopy(dst io.Writer, src io.Reader, direction string, remoteAddr net
 
 		if rErr != nil {
 			if rErr == io.EOF {
-				// 对端正常关闭连接（读方向），静默退出
 				break
 			}
-
 			if netErr, ok := rErr.(net.Error); ok && (netErr.Timeout() || netErr.Temporary()) {
 				consecutiveTempErrors++
-				if consecutiveTempErrors > maxConsecutiveTempErrors {
+				if consecutiveTempErrors > maxRetries {
 					log.Printf("TCP Proxy (%s): Too many consecutive temporary errors for %s, giving up. Last error: %v", direction, remoteAddr, rErr)
 					break
 				}
-				log.Printf("TCP Proxy (%s): Temporary network error for %s: %v. Retrying in %v... (Attempt %d/%d)", direction, remoteAddr, rErr, retryDelay, consecutiveTempErrors, maxConsecutiveTempErrors)
+				log.Printf("TCP Proxy (%s): Temporary network error for %s: %v. Retrying in %v... (Attempt %d/%d)", direction, remoteAddr, retryDelay, consecutiveTempErrors, maxRetries)
 				time.Sleep(retryDelay)
 				continue
 			}
-
 			log.Printf("TCP Proxy (%s): Unrecoverable read error for %s, closing connection: %v", direction, remoteAddr, rErr)
 			break
 		}
 	}
 }
-
 func handleDirectTCPIP(ch ssh.Channel, destHost string, destPort uint32, remoteAddr net.Addr) {
 	atomic.AddInt64(&activeConn, 1)
 	defer atomic.AddInt64(&activeConn, -1)
@@ -163,7 +160,8 @@ func handleDirectTCPIP(ch ssh.Channel, destHost string, destPort uint32, remoteA
 	} else {
 		destAddr = fmt.Sprintf("%s:%d", destHost, destPort)
 	}
-	destConn, err := net.DialTimeout("tcp", destAddr, 10*time.Second)
+	connectTimeout := time.Duration(globalConfig.TargetConnectTimeoutSeconds) * time.Second
+	destConn, err := net.DialTimeout("tcp", destAddr, connectTimeout)
 	if err != nil {
 		log.Printf("TCP Proxy: Failed to connect to %s: %v", destAddr, err)
 		ch.Close()
@@ -434,7 +432,7 @@ func apiHandler(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-// --- main (无变动) ---
+// --- main (已修改) ---
 func main() {
 	log.SetFlags(log.LstdFlags | log.Lshortfile)
 	configFile, err := os.ReadFile("config.json")
@@ -449,9 +447,16 @@ func main() {
 	if globalConfig.HandshakeTimeout <= 0 { globalConfig.HandshakeTimeout = 5 }
 	if globalConfig.ConnectUA == "" { globalConfig.ConnectUA = "26.4.0" }
 	if globalConfig.BufferSizeKB <= 0 { globalConfig.BufferSizeKB = 128 }
+	if globalConfig.TolerantCopyMaxRetries <= 0 { globalConfig.TolerantCopyMaxRetries = 100 }
+	if globalConfig.TolerantCopyRetryDelayMs <= 0 { globalConfig.TolerantCopyRetryDelayMs = 500 }
+	if globalConfig.TargetConnectTimeoutSeconds <= 0 { globalConfig.TargetConnectTimeoutSeconds = 10 }
+
 	log.Println("====== WSTUNNEL (Pure TCP Proxy Mode) Starting ======")
 	log.Printf("Config: HandshakeTimeout=%ds, ConnectUA='%s', BufferSize=%dKB, IdleTimeout=%ds",
 		globalConfig.HandshakeTimeout, globalConfig.ConnectUA, globalConfig.BufferSizeKB, globalConfig.IdleTimeoutSeconds)
+	log.Printf("Config: TolerantCopy(MaxRetries=%d, RetryDelay=%dms), TargetConnectTimeout=%ds",
+		globalConfig.TolerantCopyMaxRetries, globalConfig.TolerantCopyRetryDelayMs, globalConfig.TargetConnectTimeoutSeconds)
+
 	go func() {
 		mux := http.NewServeMux()
 		mux.HandleFunc("/login.html", func(w http.ResponseWriter, r *http.Request) { http.ServeFile(w, r, "login.html") })
