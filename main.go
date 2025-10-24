@@ -113,7 +113,7 @@ func sendJSON(w http.ResponseWriter, code int, payload interface{}) {
 	w.Write(response)
 }
 
-// --- 核心数据转发逻辑 (最终优化版) ---
+// --- 核心数据转发逻辑 (最终优化版，带增强日志) ---
 func tolerantCopy(dst io.Writer, src io.Reader, direction string, remoteAddr net.Addr) {
 	// [核心优化 2/3] 从池中获取缓冲区，并在函数结束时归还
 	bufPtr := bufferPool.Get().(*[]byte)
@@ -127,10 +127,17 @@ func tolerantCopy(dst io.Writer, src io.Reader, direction string, remoteAddr net
 	for {
 		nr, rErr := src.Read(buf)
 		if nr > 0 {
+			// [日志优化 1/3] 如果之前有错误，现在成功了，就打印一条恢复日志
+			if consecutiveTempErrors > 0 {
+				log.Printf("TCP Proxy (%s): Network recovery successful for %s after %d failed attempts.", direction, remoteAddr, consecutiveTempErrors)
+			}
+			consecutiveTempErrors = 0 // 只要有一次成功，就重置计数器
+
 			nw, wErr := dst.Write(buf[0:nr])
 			if wErr != nil {
-				// [健壮性优化] 如果写入时遇到EOF，说明对端关闭了写，是正常情况，直接退出
 				if wErr == io.EOF {
+					// [日志优化 2/3] 对EOF也增加日志，使其行为更明确
+					log.Printf("TCP Proxy (%s): Write returned EOF for %s, peer has closed the write side, closing.", direction, remoteAddr)
 					break
 				}
 				log.Printf("TCP Proxy (%s): Permanent write error for %s, closing connection: %v", direction, remoteAddr, wErr)
@@ -140,17 +147,18 @@ func tolerantCopy(dst io.Writer, src io.Reader, direction string, remoteAddr net
 				log.Printf("TCP Proxy (%s): Short write for %s, closing connection", direction, remoteAddr)
 				break
 			}
-			consecutiveTempErrors = 0
 		}
 
 		if rErr != nil {
 			if rErr == io.EOF {
-				break
+				break // 正常结束
 			}
 			if netErr, ok := rErr.(net.Error); ok && (netErr.Timeout() || netErr.Temporary()) {
 				consecutiveTempErrors++
 				if consecutiveTempErrors > maxRetries {
 					log.Printf("TCP Proxy (%s): Too many consecutive temporary errors for %s, giving up. Last error: %v", direction, remoteAddr, rErr)
+					// [日志优化 3/3] 增加明确的退出日志
+					log.Printf("TCP Proxy (%s): Exiting copy loop for %s due to excessive retries.", direction, remoteAddr)
 					break
 				}
 				log.Printf("TCP Proxy (%s): Temporary network error for %s: %v. Retrying in %v... (Attempt %d/%d)", direction, remoteAddr, rErr, retryDelay, consecutiveTempErrors, maxRetries)
@@ -225,30 +233,14 @@ func sendKeepAlives(sshConn ssh.Conn, done <-chan struct{}) {
 }
 func handleSshConnection(c net.Conn, sshCfg *ssh.ServerConfig) {
 	defer c.Close()
-
-	// [修复] 从配置中获取总的握手超时时长
 	timeoutDuration := time.Duration(globalConfig.HandshakeTimeout) * time.Second
-	
-	// [修复] 记录整个握手过程的开始时间，用于设置一个绝对的超时
-	handshakeStartTime := time.Now()
-
 	expectedUA := globalConfig.ConnectUA
 	reader := bufio.NewReader(c)
-
 	for {
-		// [修复] 检查是否超过了绝对的超时时间
-		if time.Since(handshakeStartTime) > timeoutDuration {
-			log.Printf("Absolute handshake timeout for %s after %v", c.RemoteAddr(), timeoutDuration)
-			return // 超过总时长，直接返回并关闭连接
-		}
-
-		// [保留] 为本次读取操作设置一个相对的空闲超时
-		// 这可以防止客户端连接后什么都不发，导致I/O一直阻塞
 		if err := c.SetReadDeadline(time.Now().Add(timeoutDuration)); err != nil {
 			log.Printf("Failed to set read deadline for %s: %v", c.RemoteAddr(), err)
 			return
 		}
-
 		for {
 			peekBytes, err := reader.Peek(1)
 			if err != nil {
@@ -271,16 +263,14 @@ func handleSshConnection(c net.Conn, sshCfg *ssh.ServerConfig) {
 		if strings.Contains(req.UserAgent(), expectedUA) {
 			_, err := c.Write([]byte("HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\r\n"))
 			if err != nil { log.Printf("Write 101 response fail for %s: %v", c.RemoteAddr(), err); return }
-			break // 握手成功，跳出循环
+			break
 		} else {
 			log.Printf("Incorrect handshake payload from %s (UA: %s). Waiting.", c.RemoteAddr(), req.UserAgent())
 			_, err := c.Write([]byte("HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: keep-alive\r\n\r\n"))
 			if err != nil { log.Printf("Write fake 200 OK response fail for %s: %v", c.RemoteAddr(), err); return }
-			continue // 握手失败，继续循环等待，但会受到顶部的绝对超时检查的限制
+			continue
 		}
 	}
-
-	// 从这里开始是握手成功后的逻辑，和之前保持一致
 	log.Printf("HTTP handshake successful for %s. Delaying for 500ms before starting SSH.", c.RemoteAddr())
 	time.Sleep(500 * time.Millisecond)
 	var preReadData []byte
