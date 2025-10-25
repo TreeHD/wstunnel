@@ -159,16 +159,40 @@ type handshakeConn struct {
 }
 
 func (hc *handshakeConn) Read(p []byte) (n int, err error) { return hc.r.Read(p) }
+// 请用这个函数，完整替换掉您 main.go 文件中的 tolerantCopy 函数
 func tolerantCopy(dst io.Writer, src io.Reader, direction string, remoteAddr net.Addr, username string) {
+	// [优化保留] 从池中获取缓冲区
 	bufPtr := bufferPool.Get().(*[]byte)
 	defer bufferPool.Put(bufPtr)
 	buf := *bufPtr
+
+	// [原始逻辑恢复] 获取重试参数
+	maxRetries := globalConfig.TolerantCopyMaxRetries
+	if maxRetries <= 0 { // 提供一个默认值，防止配置错误
+		maxRetries = 100
+	}
+	retryDelay := time.Duration(globalConfig.TolerantCopyRetryDelayMs) * time.Millisecond
+	if retryDelay <= 0 {
+		retryDelay = 500 * time.Millisecond
+	}
+	consecutiveTempErrors := 0
+
+	// [优化保留] 获取用户的流量统计器
 	val, _ := globalTraffic.LoadOrStore(username, &TrafficInfo{})
 	traffic := val.(*TrafficInfo)
+
 	for {
 		nr, rErr := src.Read(buf)
 		if nr > 0 {
+			// [原始逻辑恢复] 如果之前有错误，现在成功了，就打印一条恢复日志
+			if consecutiveTempErrors > 0 {
+				globalLog.Write([]byte(fmt.Sprintf("TCP Proxy (%s): Network recovery for %s after %d failed attempts.\n", direction, remoteAddr, consecutiveTempErrors)))
+			}
+			consecutiveTempErrors = 0 // 只要有一次成功，就重置计数器
+
 			nw, wErr := dst.Write(buf[0:nr])
+			
+			// [优化保留] 在成功写入后，统计流量
 			if nw > 0 {
 				if direction == "Client->Target" {
 					atomic.AddUint64(&traffic.Sent, uint64(nw))
@@ -176,21 +200,37 @@ func tolerantCopy(dst io.Writer, src io.Reader, direction string, remoteAddr net
 					atomic.AddUint64(&traffic.Received, uint64(nw))
 				}
 			}
+
 			if wErr != nil {
 				if wErr != io.EOF {
-					globalLog.Write([]byte(fmt.Sprintf("Write error %s: %v\n", direction, wErr)))
+					globalLog.Write([]byte(fmt.Sprintf("TCP Proxy (%s): Permanent write error for %s: %v\n", direction, remoteAddr, wErr)))
 				}
 				break
 			}
 			if nr != nw {
-				globalLog.Write([]byte(fmt.Sprintf("Short write %s\n", direction)))
+				globalLog.Write([]byte(fmt.Sprintf("TCP Proxy (%s): Short write for %s, closing\n", direction, remoteAddr)))
 				break
 			}
 		}
+
 		if rErr != nil {
-			if rErr != io.EOF {
-				globalLog.Write([]byte(fmt.Sprintf("Read error %s: %v\n", direction, rErr)))
+			if rErr == io.EOF {
+				break // 正常结束
 			}
+			
+			// [原始逻辑恢复] 完整的临时错误处理和重试机制
+			if netErr, ok := rErr.(net.Error); ok && (netErr.Timeout() || netErr.Temporary()) {
+				consecutiveTempErrors++
+				if consecutiveTempErrors > maxRetries {
+					globalLog.Write([]byte(fmt.Sprintf("TCP Proxy (%s): Too many errors for %s, giving up. Last error: %v\n", direction, remoteAddr, rErr)))
+					break
+				}
+				globalLog.Write([]byte(fmt.Sprintf("TCP Proxy (%s): Temporary error for %s: %v. Retrying in %v... (Attempt %d/%d)\n", direction, remoteAddr, rErr, retryDelay, consecutiveTempErrors, maxRetries)))
+				time.Sleep(retryDelay)
+				continue
+			}
+			
+			globalLog.Write([]byte(fmt.Sprintf("TCP Proxy (%s): Unrecoverable read error for %s: %v\n", direction, remoteAddr, rErr)))
 			break
 		}
 	}
