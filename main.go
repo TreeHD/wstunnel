@@ -1,4 +1,4 @@
-// main.go (最终修复版b2.0)
+// main.go (最终修复版 - 包含所有修复)
 package main
 
 import (
@@ -454,7 +454,7 @@ func apiHandler(w http.ResponseWriter, r *http.Request) {
 			}
 			t_val, _ := globalTraffic.LoadOrStore(u.Username, &TrafficInfo{})
 			t := t_val.(*TrafficInfo)
-			
+
 			sentBytes := atomic.LoadUint64(&t.Sent)
 			receivedBytes := atomic.LoadUint64(&t.Received)
 			usedBytes := sentBytes + receivedBytes
@@ -485,36 +485,8 @@ func apiHandler(w http.ResponseWriter, r *http.Request) {
 		globalConfig.lock.RLock()
 		defer globalConfig.lock.RUnlock()
 		sendJSON(w, http.StatusOK, globalConfig.Accounts)
-	case strings.HasPrefix(r.URL.Path, "/api/accounts/") && r.Method == "POST":
-		username := strings.TrimPrefix(r.URL.Path, "/api/accounts/")
-		if username == "" {
-			sendJSON(w, http.StatusBadRequest, map[string]string{"message": "错误：用户名不能为空"})
-			return
-		}
-		var accInfo AccountInfo
-		json.NewDecoder(r.Body).Decode(&accInfo)
-		globalConfig.lock.Lock()
-		globalConfig.Accounts[username] = accInfo
-		globalConfig.lock.Unlock()
-		safeSaveConfig()
-		sendJSON(w, http.StatusOK, map[string]string{"message": "账户 " + username + " 更新成功"})
-	case strings.HasPrefix(r.URL.Path, "/api/accounts/") && r.Method == "DELETE":
-		username := strings.TrimPrefix(r.URL.Path, "/api/accounts/")
-		if username == "" {
-			sendJSON(w, http.StatusBadRequest, map[string]string{"message": "错误：不能删除空用户名的账户"})
-			return
-		}
-		globalConfig.lock.Lock()
-		delete(globalConfig.Accounts, username)
-		globalConfig.lock.Unlock()
-		safeSaveConfig()
-		sendJSON(w, http.StatusOK, map[string]string{"message": "账户 " + username + " 删除成功"})
-	case strings.HasPrefix(r.URL.Path, "/api/connections/") && r.Method == "DELETE":
-		connID := strings.TrimPrefix(r.URL.Path, "/api/connections/")
-		if user, ok := onlineUsers.Load(connID); ok {
-			user.(*OnlineUser).sshConn.Close()
-			sendJSON(w, http.StatusOK, map[string]string{"message": "连接已断开"})
-		}
+
+	// [关键修复] 调整此 case 的顺序，必须在 HasPrefix 之前，以确保被优先匹配
 	case r.URL.Path == "/api/accounts/set_status" && r.Method == "POST":
 		var payload struct {
 			Username string `json:"username"`
@@ -564,7 +536,7 @@ func apiHandler(w http.ResponseWriter, r *http.Request) {
 
 		safeSaveConfig()
 		log.Printf("Successfully updated status for user '%s' to Enabled=%t\n", payload.Username, payload.Enabled)
-		
+
 		var actionStr string
 		if payload.Enabled {
 			actionStr = "解封"
@@ -574,6 +546,36 @@ func apiHandler(w http.ResponseWriter, r *http.Request) {
 		successMessage := fmt.Sprintf("账号 %s 已成功%s", payload.Username, actionStr)
 		sendJSON(w, http.StatusOK, map[string]string{"message": successMessage})
 
+	case strings.HasPrefix(r.URL.Path, "/api/accounts/") && r.Method == "POST":
+		username := strings.TrimPrefix(r.URL.Path, "/api/accounts/")
+		if username == "" {
+			sendJSON(w, http.StatusBadRequest, map[string]string{"message": "错误：用户名不能为空"})
+			return
+		}
+		var accInfo AccountInfo
+		json.NewDecoder(r.Body).Decode(&accInfo)
+		globalConfig.lock.Lock()
+		globalConfig.Accounts[username] = accInfo
+		globalConfig.lock.Unlock()
+		safeSaveConfig()
+		sendJSON(w, http.StatusOK, map[string]string{"message": "账户 " + username + " 更新成功"})
+	case strings.HasPrefix(r.URL.Path, "/api/accounts/") && r.Method == "DELETE":
+		username := strings.TrimPrefix(r.URL.Path, "/api/accounts/")
+		if username == "" {
+			sendJSON(w, http.StatusBadRequest, map[string]string{"message": "错误：不能删除空用户名的账户"})
+			return
+		}
+		globalConfig.lock.Lock()
+		delete(globalConfig.Accounts, username)
+		globalConfig.lock.Unlock()
+		safeSaveConfig()
+		sendJSON(w, http.StatusOK, map[string]string{"message": "账户 " + username + " 删除成功"})
+	case strings.HasPrefix(r.URL.Path, "/api/connections/") && r.Method == "DELETE":
+		connID := strings.TrimPrefix(r.URL.Path, "/api/connections/")
+		if user, ok := onlineUsers.Load(connID); ok {
+			user.(*OnlineUser).sshConn.Close()
+			sendJSON(w, http.StatusOK, map[string]string{"message": "连接已断开"})
+		}
 	case r.URL.Path == "/api/admin/update_password" && r.Method == "POST":
 		var payload struct {
 			OldPassword string `json:"oldPassword"`
