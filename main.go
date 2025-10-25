@@ -1,4 +1,4 @@
-// main.go
+// main.go (最终修复版)
 package main
 
 import (
@@ -20,7 +20,7 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/shirou/gopsutil/v3/cpu"
+	"github.comcom/shirou/gopsutil/v3/cpu"
 	"github.com/shirou/gopsutil/v3/mem"
 	"golang.org/x/crypto/ssh"
 )
@@ -67,7 +67,6 @@ type OnlineUser struct {
 var onlineUsers sync.Map
 var userConnectionCount sync.Map
 
-// [BUG 1 已修复] 添加了 json 标签，以便前端能正确解析
 type TrafficInfo struct {
 	Sent     uint64 `json:"sent"`
 	Received uint64 `json:"received"`
@@ -81,7 +80,6 @@ type LogCollector struct {
 	maxCap int
 }
 
-// [BUG 3 已修复] 修正 Write 方法的返回值，确保 log 包能持续工作
 func (lc *LogCollector) Write(p []byte) (n int, err error) {
 	lc.mu.Lock()
 	defer lc.mu.Unlock()
@@ -90,9 +88,7 @@ func (lc *LogCollector) Write(p []byte) (n int, err error) {
 	if len(lc.logs) > lc.maxCap {
 		lc.logs = lc.logs[len(lc.logs)-lc.maxCap:]
 	}
-	// 仍然在控制台打印日志，以便调试
 	fmt.Fprint(os.Stderr, logLine)
-	// 关键修复：向 log 包返回原始消息的长度和 nil 错误
 	return len(p), nil
 }
 func (lc *LogCollector) GetLogs() []string {
@@ -186,7 +182,7 @@ func tolerantCopy(dst io.Writer, src io.Reader, direction string, remoteAddr net
 		nr, rErr := src.Read(buf)
 		if nr > 0 {
 			if consecutiveTempErrors > 0 {
-				globalLog.Write([]byte(fmt.Sprintf("TCP Proxy (%s): Network recovery for %s after %d failed attempts.\n", direction, remoteAddr, consecutiveTempErrors)))
+				log.Printf("TCP Proxy (%s): Network recovery for %s after %d failed attempts.\n", direction, remoteAddr, consecutiveTempErrors)
 			}
 			consecutiveTempErrors = 0
 			nw, wErr := dst.Write(buf[0:nr])
@@ -199,12 +195,12 @@ func tolerantCopy(dst io.Writer, src io.Reader, direction string, remoteAddr net
 			}
 			if wErr != nil {
 				if wErr != io.EOF {
-					globalLog.Write([]byte(fmt.Sprintf("TCP Proxy (%s): Permanent write error for %s: %v\n", direction, remoteAddr, wErr)))
+					log.Printf("TCP Proxy (%s): Permanent write error for %s: %v\n", direction, remoteAddr, wErr)
 				}
 				break
 			}
 			if nr != nw {
-				globalLog.Write([]byte(fmt.Sprintf("TCP Proxy (%s): Short write for %s, closing\n", direction, remoteAddr)))
+				log.Printf("TCP Proxy (%s): Short write for %s, closing\n", direction, remoteAddr)
 				break
 			}
 		}
@@ -215,30 +211,28 @@ func tolerantCopy(dst io.Writer, src io.Reader, direction string, remoteAddr net
 			if netErr, ok := rErr.(net.Error); ok && (netErr.Timeout() || netErr.Temporary()) {
 				consecutiveTempErrors++
 				if consecutiveTempErrors > maxRetries {
-					globalLog.Write([]byte(fmt.Sprintf("TCP Proxy (%s): Too many errors for %s, giving up. Last error: %v\n", direction, remoteAddr, rErr)))
+					log.Printf("TCP Proxy (%s): Too many errors for %s, giving up. Last error: %v\n", direction, remoteAddr, rErr)
 					break
 				}
-				globalLog.Write([]byte(fmt.Sprintf("TCP Proxy (%s): Temporary error for %s: %v. Retrying in %v... (Attempt %d/%d)\n", direction, remoteAddr, rErr, retryDelay, consecutiveTempErrors, maxRetries)))
+				log.Printf("TCP Proxy (%s): Temporary error for %s: %v. Retrying in %v... (Attempt %d/%d)\n", direction, remoteAddr, rErr, retryDelay, consecutiveTempErrors, maxRetries)
 				time.Sleep(retryDelay)
 				continue
 			}
-			globalLog.Write([]byte(fmt.Sprintf("TCP Proxy (%s): Unrecoverable read error for %s: %v\n", direction, remoteAddr, rErr)))
+			log.Printf("TCP Proxy (%s): Unrecoverable read error for %s: %v\n", direction, remoteAddr, rErr)
 			break
 		}
 	}
 }
 
-// [硬编码已修复] 使用配置文件中的超时设置
 func handleDirectTCPIP(ch ssh.Channel, destHost string, destPort uint32, remoteAddr net.Addr, username string) {
 	destAddr := fmt.Sprintf("%s:%d", destHost, destPort)
-	// 从全局配置中读取超时时间
 	timeout := time.Duration(globalConfig.TargetConnectTimeoutSeconds) * time.Second
 	if timeout <= 0 {
-		// 如果配置值无效，提供一个安全的默认值
 		timeout = 10 * time.Second
 	}
 	destConn, err := net.DialTimeout("tcp", destAddr, timeout)
 	if err != nil {
+		log.Printf("Failed to dial target %s for user %s: %v\n", destAddr, username, err)
 		ch.Close()
 		return
 	}
@@ -324,7 +318,7 @@ func handleSshConnection(c net.Conn, sshCfg *ssh.ServerConfig) {
 	c.SetReadDeadline(time.Now().Add(15 * time.Second))
 	sshConn, chans, reqs, err := ssh.NewServerConn(connForSSH, sshCfg)
 	if err != nil {
-		globalLog.Write([]byte(fmt.Sprintf("SSH handshake failed for %s: %v\n", c.RemoteAddr(), err)))
+		log.Printf("SSH handshake failed for %s: %v\n", c.RemoteAddr(), err)
 		return
 	}
 	idleTimeout := time.Duration(globalConfig.IdleTimeoutSeconds) * time.Second
@@ -360,7 +354,7 @@ func handleSshConnection(c net.Conn, sshCfg *ssh.ServerConfig) {
 	connID := sshConn.RemoteAddr().String() + "-" + hex.EncodeToString(sshConn.SessionID())
 	onlineUser := &OnlineUser{ConnID: connID, Username: username, RemoteAddr: sshConn.RemoteAddr().String(), ConnectTime: time.Now(), sshConn: sshConn}
 	onlineUsers.Store(onlineUser.ConnID, onlineUser)
-	globalLog.Write([]byte(fmt.Sprintf("Auth success for user '%s' from %s\n", username, sshConn.RemoteAddr())))
+	log.Printf("Auth success for user '%s' from %s\n", username, sshConn.RemoteAddr())
 	defer onlineUsers.Delete(onlineUser.ConnID)
 	go ssh.DiscardRequests(reqs)
 	for newChan := range chans {
@@ -478,6 +472,11 @@ func apiHandler(w http.ResponseWriter, r *http.Request) {
 		sendJSON(w, http.StatusOK, globalConfig.Accounts)
 	case strings.HasPrefix(r.URL.Path, "/api/accounts/") && r.Method == "POST":
 		username := strings.TrimPrefix(r.URL.Path, "/api/accounts/")
+		// --- [最终修复] 后端增加严格验证，禁止空用户名 ---
+		if username == "" {
+			sendJSON(w, http.StatusBadRequest, map[string]string{"message": "错误：用户名不能为空"})
+			return
+		}
 		var accInfo AccountInfo
 		json.NewDecoder(r.Body).Decode(&accInfo)
 		globalConfig.lock.Lock()
@@ -487,6 +486,10 @@ func apiHandler(w http.ResponseWriter, r *http.Request) {
 		sendJSON(w, http.StatusOK, map[string]string{"message": "账户 " + username + " 更新成功"})
 	case strings.HasPrefix(r.URL.Path, "/api/accounts/") && r.Method == "DELETE":
 		username := strings.TrimPrefix(r.URL.Path, "/api/accounts/")
+		if username == "" {
+			sendJSON(w, http.StatusBadRequest, map[string]string{"message": "错误：不能删除空用户名的账户"})
+			return
+		}
 		globalConfig.lock.Lock()
 		delete(globalConfig.Accounts, username)
 		globalConfig.lock.Unlock()
@@ -498,7 +501,6 @@ func apiHandler(w http.ResponseWriter, r *http.Request) {
 			user.(*OnlineUser).sshConn.Close()
 			sendJSON(w, http.StatusOK, map[string]string{"message": "连接已断开"})
 		}
-	// [BUG 2 已修复] 替换为更健壮、更正确的逻辑
 	case r.URL.Path == "/api/accounts/set_status" && r.Method == "POST":
 		var payload struct {
 			Username string `json:"username"`
@@ -509,25 +511,28 @@ func apiHandler(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 
-		var connsToClose []ssh.Conn
-
-		globalConfig.lock.Lock()
-		// 1. 从 map 中获取账户信息的副本
-		acc, ok := globalConfig.Accounts[payload.Username]
-		if !ok {
-			// 作为代码健壮性保障，处理用户不存在的情况
-			globalConfig.lock.Unlock()
-			sendJSON(w, http.StatusNotFound, map[string]string{"message": "错误：尝试操作一个不存在的用户"})
+		// --- [最终修复] 后端增加严格验证，禁止操作空用户 ---
+		if payload.Username == "" {
+			log.Printf("[ERROR] Received set_status request with EMPTY username.")
+			sendJSON(w, http.StatusBadRequest, map[string]string{"message": "错误：用户名不能为空"})
 			return
 		}
 
-		// 2. 修改副本的状态
-		acc.Enabled = payload.Enabled
+		log.Printf("[DIAGNOSTIC] Received set_status request: User='%s', Set Enabled to '%t'\n", payload.Username, payload.Enabled)
+		var connsToClose []ssh.Conn
 
-		// 3. [核心修复] 将修改后的完整副本重新存回 map，覆盖旧的数据
+		globalConfig.lock.Lock()
+		acc, ok := globalConfig.Accounts[payload.Username]
+		if !ok {
+			globalConfig.lock.Unlock()
+			log.Printf("[ERROR] Attempted to set status for non-existent user: '%s'\n", payload.Username)
+			sendJSON(w, http.StatusNotFound, map[string]string{"message": "错误：用户不存在"})
+			return
+		}
+
+		acc.Enabled = payload.Enabled
 		globalConfig.Accounts[payload.Username] = acc
 
-		// 如果是禁用账户，则收集该用户的所有在线连接，准备断开
 		if !payload.Enabled {
 			onlineUsers.Range(func(_, v interface{}) bool {
 				u := v.(*OnlineUser)
@@ -537,19 +542,15 @@ func apiHandler(w http.ResponseWriter, r *http.Request) {
 				return true
 			})
 		}
-		globalConfig.lock.Unlock() // 尽快释放锁
+		globalConfig.lock.Unlock()
 
-		// 4. 在锁外部执行网络操作和文件操作
 		for _, conn := range connsToClose {
+			log.Printf("Disconnecting user '%s' due to account status change.\n", payload.Username)
 			conn.Close()
 		}
 
-		if err := safeSaveConfig(); err != nil {
-			log.Printf("ERROR: Failed to save config after updating user status: %v", err)
-			sendJSON(w, http.StatusOK, map[string]string{"message": "状态更新成功（但保存到文件失败）"})
-			return
-		}
-
+		safeSaveConfig()
+		log.Printf("Successfully updated status for user '%s' to Enabled=%t\n", payload.Username, payload.Enabled)
 		sendJSON(w, http.StatusOK, map[string]string{"message": "状态更新成功"})
 	case r.URL.Path == "/api/admin/update_password" && r.Method == "POST":
 		var payload struct {
@@ -639,8 +640,8 @@ func main() {
 		log.Fatalf("FATAL: Cannot read config.json: %v\n", err)
 	}
 	globalConfig = &Config{}
-	if json.Unmarshal(configFile, globalConfig) != nil {
-		log.Fatalf("FATAL: Cannot parse config.json\n")
+	if err := json.Unmarshal(configFile, globalConfig); err != nil {
+		log.Fatalf("FATAL: Cannot parse config.json: %v\n", err)
 	}
 	if globalConfig.AdminAddr == "" {
 		globalConfig.AdminAddr = "127.0.0.1:9090"
@@ -660,7 +661,7 @@ func main() {
 	if globalConfig.IdleTimeoutSeconds <= 0 {
 		globalConfig.IdleTimeoutSeconds = 120
 	}
-	if globalConfig.TargetConnectTimeoutSeconds <= 0 { // 添加对新配置的默认值检查
+	if globalConfig.TargetConnectTimeoutSeconds <= 0 {
 		globalConfig.TargetConnectTimeoutSeconds = 10
 	}
 	bufferPool = sync.Pool{New: func() interface{} {
@@ -743,7 +744,7 @@ func main() {
 		go func(c net.Conn) {
 			defer func() {
 				if r := recover(); r != nil {
-					globalLog.Write([]byte(fmt.Sprintf("FATAL: Panic recovered for %s: %v\n", c.RemoteAddr(), r)))
+					log.Printf("FATAL: Panic recovered for %s: %v\n", c.RemoteAddr(), r)
 				}
 			}()
 			handleSshConnection(c, sshCfg)
