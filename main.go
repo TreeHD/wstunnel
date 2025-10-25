@@ -21,7 +21,7 @@ import (
 	"time"
 
 	"github.com/shirou/gopsutil/v3/cpu"
-	"github.comcom/shirou/gopsutil/v3/mem"
+	"github.com/shirou/gopsutil/v3/mem"
 	"golang.org/x/crypto/ssh"
 )
 
