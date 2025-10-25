@@ -1,4 +1,4 @@
-// main.go (最终修复版 - 包含所有修复)
+// main.go (终极融合版 - 包含所有修复和优化)
 package main
 
 import (
@@ -182,7 +182,7 @@ func tolerantCopy(dst io.Writer, src io.Reader, direction string, remoteAddr net
 		nr, rErr := src.Read(buf)
 		if nr > 0 {
 			if consecutiveTempErrors > 0 {
-				log.Printf("TCP Proxy (%s): Network recovery for %s after %d failed attempts.\n", direction, remoteAddr, consecutiveTempErrors)
+				log.Printf("TCP Proxy (%s): Network recovery for %s after %d failed attempts.", direction, remoteAddr, consecutiveTempErrors)
 			}
 			consecutiveTempErrors = 0
 			nw, wErr := dst.Write(buf[0:nr])
@@ -195,12 +195,12 @@ func tolerantCopy(dst io.Writer, src io.Reader, direction string, remoteAddr net
 			}
 			if wErr != nil {
 				if wErr != io.EOF {
-					log.Printf("TCP Proxy (%s): Permanent write error for %s: %v\n", direction, remoteAddr, wErr)
+					log.Printf("TCP Proxy (%s): Permanent write error for %s: %v", direction, remoteAddr, wErr)
 				}
 				break
 			}
 			if nr != nw {
-				log.Printf("TCP Proxy (%s): Short write for %s, closing\n", direction, remoteAddr)
+				log.Printf("TCP Proxy (%s): Short write for %s, closing", direction, remoteAddr)
 				break
 			}
 		}
@@ -211,46 +211,70 @@ func tolerantCopy(dst io.Writer, src io.Reader, direction string, remoteAddr net
 			if netErr, ok := rErr.(net.Error); ok && (netErr.Timeout() || netErr.Temporary()) {
 				consecutiveTempErrors++
 				if consecutiveTempErrors > maxRetries {
-					log.Printf("TCP Proxy (%s): Too many errors for %s, giving up. Last error: %v\n", direction, remoteAddr, rErr)
+					log.Printf("TCP Proxy (%s): Too many errors for %s, giving up. Last error: %v", direction, remoteAddr, rErr)
 					break
 				}
-				log.Printf("TCP Proxy (%s): Temporary error for %s: %v. Retrying in %v... (Attempt %d/%d)\n", direction, remoteAddr, rErr, retryDelay, consecutiveTempErrors, maxRetries)
+				log.Printf("TCP Proxy (%s): Temporary error for %s: %v. Retrying in %v... (Attempt %d/%d)", direction, remoteAddr, rErr, retryDelay, consecutiveTempErrors, maxRetries)
 				time.Sleep(retryDelay)
 				continue
 			}
-			log.Printf("TCP Proxy (%s): Unrecoverable read error for %s: %v\n", direction, remoteAddr, rErr)
+			log.Printf("TCP Proxy (%s): Unrecoverable read error for %s: %v", direction, remoteAddr, rErr)
 			break
 		}
 	}
 }
 
+// [最终修复] 恢复使用基础版中更健壮、性能更好的 handleDirectTCPIP 函数
 func handleDirectTCPIP(ch ssh.Channel, destHost string, destPort uint32, remoteAddr net.Addr, username string) {
-	destAddr := fmt.Sprintf("%s:%d", destHost, destPort)
-	timeout := time.Duration(globalConfig.TargetConnectTimeoutSeconds) * time.Second
-	if timeout <= 0 {
-		timeout = 10 * time.Second
+	var destAddr string
+	// 恢复对IPv6地址的正确处理
+	if strings.Contains(destHost, ":") {
+		destAddr = fmt.Sprintf("[%s]:%d", destHost, destPort)
+	} else {
+		destAddr = fmt.Sprintf("%s:%d", destHost, destPort)
 	}
-	destConn, err := net.DialTimeout("tcp", destAddr, timeout)
+	
+	connectTimeout := time.Duration(globalConfig.TargetConnectTimeoutSeconds) * time.Second
+	if connectTimeout <= 0 {
+		connectTimeout = 10 * time.Second
+	}
+
+	destConn, err := net.DialTimeout("tcp", destAddr, connectTimeout)
 	if err != nil {
-		log.Printf("Failed to dial target %s for user %s: %v\n", destAddr, username, err)
+		log.Printf("TCP Proxy: Failed to connect to %s for user %s: %v", destAddr, username, err)
 		ch.Close()
 		return
 	}
 	defer destConn.Close()
+
+	// 恢复对TCP连接的性能优化
+	if tcpConn, ok := destConn.(*net.TCPConn); ok {
+		tcpConn.SetNoDelay(true)
+		tcpConn.SetKeepAlive(true)
+		tcpConn.SetKeepAlivePeriod(1 * time.Minute)
+	}
+
 	var wg sync.WaitGroup
 	wg.Add(2)
 	go func() {
 		defer wg.Done()
-		defer ch.CloseWrite()
+		// 恢复使用优雅的 "半关闭"
+		if tcpConn, ok := destConn.(*net.TCPConn); ok {
+			defer tcpConn.CloseWrite()
+		} else {
+			defer destConn.Close()
+		}
 		tolerantCopy(destConn, ch, "Client->Target", remoteAddr, username)
 	}()
 	go func() {
 		defer wg.Done()
-		defer destConn.Close()
+		// 恢复使用优雅的 "半关闭"
+		defer ch.CloseWrite()
 		tolerantCopy(ch, destConn, "Target->Client", remoteAddr, username)
 	}()
 	wg.Wait()
 }
+
 
 // --- SSH & HTTP 握手与连接管理 ---
 func sendKeepAlives(sshConn ssh.Conn, done <-chan struct{}) {
@@ -318,7 +342,7 @@ func handleSshConnection(c net.Conn, sshCfg *ssh.ServerConfig) {
 	c.SetReadDeadline(time.Now().Add(15 * time.Second))
 	sshConn, chans, reqs, err := ssh.NewServerConn(connForSSH, sshCfg)
 	if err != nil {
-		log.Printf("SSH handshake failed for %s: %v\n", c.RemoteAddr(), err)
+		log.Printf("SSH handshake failed for %s: %v", c.RemoteAddr(), err)
 		return
 	}
 	idleTimeout := time.Duration(globalConfig.IdleTimeoutSeconds) * time.Second
@@ -354,7 +378,7 @@ func handleSshConnection(c net.Conn, sshCfg *ssh.ServerConfig) {
 	connID := sshConn.RemoteAddr().String() + "-" + hex.EncodeToString(sshConn.SessionID())
 	onlineUser := &OnlineUser{ConnID: connID, Username: username, RemoteAddr: sshConn.RemoteAddr().String(), ConnectTime: time.Now(), sshConn: sshConn}
 	onlineUsers.Store(onlineUser.ConnID, onlineUser)
-	log.Printf("Auth success for user '%s' from %s\n", username, sshConn.RemoteAddr())
+	log.Printf("Auth success for user '%s' from %s", username, sshConn.RemoteAddr())
 	defer onlineUsers.Delete(onlineUser.ConnID)
 	go ssh.DiscardRequests(reqs)
 	for newChan := range chans {
@@ -485,8 +509,6 @@ func apiHandler(w http.ResponseWriter, r *http.Request) {
 		globalConfig.lock.RLock()
 		defer globalConfig.lock.RUnlock()
 		sendJSON(w, http.StatusOK, globalConfig.Accounts)
-
-	// [关键修复] 调整此 case 的顺序，必须在 HasPrefix 之前，以确保被优先匹配
 	case r.URL.Path == "/api/accounts/set_status" && r.Method == "POST":
 		var payload struct {
 			Username string `json:"username"`
@@ -503,14 +525,14 @@ func apiHandler(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 
-		log.Printf("[DIAGNOSTIC] Received set_status request: User='%s', Set Enabled to '%t'\n", payload.Username, payload.Enabled)
+		log.Printf("[DIAGNOSTIC] Received set_status request: User='%s', Set Enabled to '%t'", payload.Username, payload.Enabled)
 		var connsToClose []ssh.Conn
 
 		globalConfig.lock.Lock()
 		acc, ok := globalConfig.Accounts[payload.Username]
 		if !ok {
 			globalConfig.lock.Unlock()
-			log.Printf("[ERROR] Attempted to set status for non-existent user: '%s'\n", payload.Username)
+			log.Printf("[ERROR] Attempted to set status for non-existent user: '%s'", payload.Username)
 			sendJSON(w, http.StatusNotFound, map[string]string{"message": "错误：用户不存在"})
 			return
 		}
@@ -530,12 +552,12 @@ func apiHandler(w http.ResponseWriter, r *http.Request) {
 		globalConfig.lock.Unlock()
 
 		for _, conn := range connsToClose {
-			log.Printf("Disconnecting user '%s' due to account status change.\n", payload.Username)
+			log.Printf("Disconnecting user '%s' due to account status change.", payload.Username)
 			conn.Close()
 		}
 
 		safeSaveConfig()
-		log.Printf("Successfully updated status for user '%s' to Enabled=%t\n", payload.Username, payload.Enabled)
+		log.Printf("Successfully updated status for user '%s' to Enabled=%t", payload.Username, payload.Enabled)
 
 		var actionStr string
 		if payload.Enabled {
@@ -661,11 +683,11 @@ func main() {
 	log.SetFlags(0)
 	configFile, err := os.ReadFile("config.json")
 	if err != nil {
-		log.Fatalf("FATAL: Cannot read config.json: %v\n", err)
+		log.Fatalf("FATAL: Cannot read config.json: %v", err)
 	}
 	globalConfig = &Config{}
 	if err := json.Unmarshal(configFile, globalConfig); err != nil {
-		log.Fatalf("FATAL: Cannot parse config.json: %v\n", err)
+		log.Fatalf("FATAL: Cannot parse config.json: %v", err)
 	}
 	if globalConfig.AdminAddr == "" {
 		globalConfig.AdminAddr = "127.0.0.1:9090"
@@ -684,6 +706,12 @@ func main() {
 	}
 	if globalConfig.IdleTimeoutSeconds <= 0 {
 		globalConfig.IdleTimeoutSeconds = 120
+	}
+	if globalConfig.TolerantCopyMaxRetries <= 0 {
+		globalConfig.TolerantCopyMaxRetries = 100
+	}
+	if globalConfig.TolerantCopyRetryDelayMs <= 0 {
+		globalConfig.TolerantCopyRetryDelayMs = 500
 	}
 	if globalConfig.TargetConnectTimeoutSeconds <= 0 {
 		globalConfig.TargetConnectTimeoutSeconds = 10
@@ -705,9 +733,9 @@ func main() {
 			}
 			http.NotFound(w, r)
 		}))
-		log.Printf("Admin panel listening on http://%s\n", globalConfig.AdminAddr)
+		log.Printf("Admin panel listening on http://%s", globalConfig.AdminAddr)
 		if err := http.ListenAndServe(globalConfig.AdminAddr, mux); err != nil {
-			log.Fatalf("FATAL: Cannot start admin panel: %v\n", err)
+			log.Fatalf("FATAL: Cannot start admin panel: %v", err)
 		}
 	}()
 	sshCfg := &ssh.ServerConfig{
@@ -757,9 +785,9 @@ func main() {
 	sshCfg.AddHostKey(key)
 	l, err := net.Listen("tcp", globalConfig.ListenAddr)
 	if err != nil {
-		log.Fatalf("FATAL: Cannot listen on %s: %v\n", globalConfig.ListenAddr, err)
+		log.Fatalf("FATAL: Cannot listen on %s: %v", globalConfig.ListenAddr, err)
 	}
-	log.Printf("SSH server listening on %s\n", globalConfig.ListenAddr)
+	log.Printf("SSH server listening on %s", globalConfig.ListenAddr)
 	for {
 		conn, err := l.Accept()
 		if err != nil {
@@ -768,7 +796,7 @@ func main() {
 		go func(c net.Conn) {
 			defer func() {
 				if r := recover(); r != nil {
-					log.Printf("FATAL: Panic recovered for %s: %v\n", c.RemoteAddr(), r)
+					log.Printf("FATAL: Panic recovered for %s: %v", c.RemoteAddr(), r)
 				}
 			}()
 			handleSshConnection(c, sshCfg)
