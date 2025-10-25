@@ -5,7 +5,45 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>WSTunnel Admin</title>
     <style>
-        body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif,"Apple Color Emoji","Segoe UI Emoji","Segoe UI Symbol";background:#f4f7fb;margin:0;font-size:15px} .container{max-width:1400px;margin:0 auto;padding:0 18px} .card{background:white;border-radius:8px;padding:18px;box-shadow:0 4px 14px rgba(20,30,60,0.06)} .page-grid > .card, .right-panel-wrapper > .card { margin-top: 12px; } table{width:100%;border-collapse:collapse;font-size:14px;} th,td{padding:10px 12px;border-bottom:1px solid #f1f5f9;word-wrap:break-word; text-align: center; vertical-align: middle;} #device-list td { white-space: nowrap; } th{white-space:nowrap}thead th{position:sticky;top:0;background:#f8fafc;border-bottom:2px solid #eef2f7;font-weight:700} tr:last-child td {border-bottom: none;} td:first-child, th:first-child { text-align: left; } td:nth-child(2) { text-align: left; } td:last-child, th:last-child { text-align: center; } .table-container,.device-list-container{overflow-x:auto;border-radius:8px;border:1px solid #e6eef8;margin-top:8px}.table-container{max-height:calc(100vh - 400px)}.device-list-container{flex-grow: 1;}.btn{border:0;padding:8px 12px;border-radius:6px;cursor:pointer;font-weight:700;color:white;transition:opacity .2s}.btn:hover{opacity:0.85}.btn-sm{padding:5px 8px; font-size:12px;}.btn.primary{background:#2563eb}.btn.secondary{background:#10b981}.btn.danger{background:#dc2626}.btn.info{background:#0ea5e9}.btn.warning{background:#f59e0b}.status-pill{display:inline-block;padding:4px 10px;border-radius:999px;font-weight:600;font-size:12px} .status-normal, .status-活跃 {background:#e6ffed;color:#065f46} .status-banned {background:#fecaca;color:#991b1b} .status-expired {background:#feecdc;color:#9a3412} .status-握手 {background:#fffbeb;color:#b45309} .navbar{display:flex;gap:8px;align-items:center;padding:8px 0;flex-wrap:wrap;border-bottom: 1px solid #e2e8f0;}.navbar a{padding:8px 12px;border-radius:8px;text-decoration:none;font-weight:700;color:#0f172a;transition:background-color .2s, color .2s}.navbar a.active{background:#eef2ff; color:#2563eb;}.navbar a:not(.active):hover{background-color:#f8fafc;}.form-row{display:flex;gap:10px;align-items:center;margin-top:8px;flex-wrap:wrap}.form-row label{font-weight:600} input[type="text"],input[type="password"],input[type="number"],input[type="date"],select,textarea{font-size:14px;padding:8px;border:1px solid #e2e8f0;border-radius:6px;box-sizing:border-box} input[type="text"],input[type="password"],input[type="number"],input[type="date"],select{height:32px; padding: 4px 8px;} textarea { width: 100%; resize: vertical; } .status-bar{display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:12px;padding:12px 0}.status-card{background:#fff;border-radius:8px;padding:12px 16px;box-shadow:0 4px 12px rgba(20,30,60,0.05);border:1px solid #eef2f7;display:flex;flex-direction:column;gap:4px}.status-card span{font-size:14px;color:#64748b}.status-card strong{font-size:16px;color:#0f172a;font-weight:600}.status-card small{font-size:12px;color:#94a3b8} .settings-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(360px,1fr));gap:18px;margin-top:12px}.settings-group{border:1px solid #eef2f7;border-radius:8px;padding:12px 16px}.settings-group h3{margin-top:0;font-size:16px;border-bottom:1px solid #eef2f7;padding-bottom:10px;margin-bottom:16px}.settings-group .form-row{margin-top:12px}.settings-group .form-row label{min-width:140px;text-align:right;font-weight:normal;color:#334155}.settings-group .form-row input{flex-grow:1;} .toggle-switch{position:relative;display:inline-block;width:50px;height:28px}.toggle-switch input{opacity:0;width:0;height:0}.slider{position:absolute;cursor:pointer;top:0;left:0;right:0;bottom:0;background-color:#ccc;transition:.4s;border-radius:28px}.slider:before{position:absolute;content:"";height:20px;width:20px;left:4px;bottom:4px;background-color:white;transition:.4s;border-radius:50%}input:checked+.slider{background-color:#2563eb}input:checked+.slider:before{transform:translateX(22px)} .page-grid { display: grid; grid-template-columns: minmax(0, 2fr) minmax(450px, 1fr); gap: 12px; align-items: stretch; } .page-grid > .card, .right-panel-wrapper > .card { display: flex; flex-direction: column; height: calc(100vh - 200px); min-width: 0; } .form-panel .form-row { flex-wrap: nowrap; }.form-panel .form-row label { flex-basis: 120px; flex-shrink: 0; text-align: right; font-weight: normal; color: #334155; line-height: 32px; }.form-panel .form-row input, .form-panel .form-row select { flex-grow: 1; } .action-buttons { display: flex; flex-wrap: wrap; gap: 10px; margin-top: 15px; } #device-list-body tr { cursor: pointer; transition: background-color .2s; }#device-list-body tr:hover { background-color: #f8fafc; }#device-list-body tr.highlight { background-color: #eef2ff !important; } #toast-container { position: fixed; top: 20px; right: 20px; z-index: 9999; display: flex; flex-direction: column; gap: 10px; } .toast { padding: 12px 18px; border-radius: 6px; color: white; font-weight: 600; box-shadow: 0 4px 12px rgba(0,0,0,0.15); opacity: 0; transform: translateX(100%); transition: all 0.4s ease-in-out; }.toast.show { opacity: 1; transform: translateX(0); }.toast.success { background-color: #10b981; }.toast.error { background-color: #dc2626; } .modal-overlay { position: fixed; top: 0; left: 0; width: 100%; height: 100%; background: rgba(0,0,0,0.5); z-index: 10000; display: flex; justify-content: center; align-items: center; opacity: 0; visibility: hidden; transition: all 0.3s; }.modal-overlay.show { opacity: 1; visibility: visible; } .modal-content { background: white; padding: 25px; border-radius: 8px; max-width: 400px; width: 90%; text-align: center; transform: scale(0.9); transition: all 0.3s; }.modal-overlay.show .modal-content { transform: scale(1); } .modal-buttons { display: flex; justify-content: center; gap: 15px; margin-top: 20px; } .right-panel-wrapper { display: flex; flex-direction: column; } .right-panel-wrapper .card { margin-top: 0; } .page-grid > .card, .right-panel-wrapper { height: calc(100vh - 200px); } .right-panel-wrapper .card:last-child { margin-top: 12px; flex-grow: 1; display: flex; flex-direction: column; } #log-viewer {height:calc(100vh - 280px);overflow:auto;background:#282c34;color:#abb2bf;padding:10px;border-radius:8px;font-family:monospace;font-size:12px;white-space:pre-wrap;}
+        body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif,"Apple Color Emoji","Segoe UI Emoji","Segoe UI Symbol";background:#f4f7fb;margin:0;font-size:15px}
+        .container{max-width:1400px;margin:0 auto;padding:0 18px}
+        .card{background:white;border-radius:8px;padding:18px;box-shadow:0 4px 14px rgba(20,30,60,0.06)}
+        .page-grid > .card, .right-panel-wrapper > .card { margin-top: 12px; }
+        table{width:100%;border-collapse:collapse;font-size:14px;}
+        th,td{padding:10px 12px;border-bottom:1px solid #f1f5f9;word-wrap:break-word; text-align: center; vertical-align: middle;}
+        #device-list td { white-space: nowrap; }
+        th{white-space:nowrap}thead th{position:sticky;top:0;background:#f8fafc;border-bottom:2px solid #eef2f7;font-weight:700}
+        tr:last-child td {border-bottom: none;}
+        td:first-child, th:first-child { text-align: left; }
+        td:nth-child(2) { text-align: left; }
+        td:last-child, th:last-child { text-align: center; }
+        .table-container,.device-list-container{overflow-x:auto;border-radius:8px;border:1px solid #e6eef8;margin-top:8px}.table-container{max-height:calc(100vh - 400px)}.device-list-container{flex-grow: 1;}.btn{border:0;padding:8px 12px;border-radius:6px;cursor:pointer;font-weight:700;color:white;transition:opacity .2s}.btn:hover{opacity:0.85}.btn-sm{padding:5px 8px; font-size:12px;}.btn.primary{background:#2563eb}.btn.secondary{background:#10b981}.btn.danger{background:#dc2626}.btn.info{background:#0ea5e9}.btn.warning{background:#f59e0b}.status-pill{display:inline-block;padding:4px 10px;border-radius:999px;font-weight:600;font-size:12px}
+        .status-normal, .status-活跃 {background:#e6ffed;color:#065f46}
+        .status-banned {background:#fecaca;color:#991b1b}
+        .status-expired {background:#feecdc;color:#9a3412}
+        .status-握手 {background:#fffbeb;color:#b45309}
+        .navbar{display:flex;gap:8px;align-items:center;padding:8px 0;flex-wrap:wrap;border-bottom: 1px solid #e2e8f0;}.navbar a{padding:8px 12px;border-radius:8px;text-decoration:none;font-weight:700;color:#0f172a;transition:background-color .2s, color .2s}.navbar a.active{background:#eef2ff; color:#2563eb;}.navbar a:not(.active):hover{background-color:#f8fafc;}.form-row{display:flex;gap:10px;align-items:center;margin-top:8px;flex-wrap:wrap}.form-row label{font-weight:600}
+        input[type="text"],input[type="password"],input[type="number"],input[type="date"],select,textarea{font-size:14px;padding:8px;border:1px solid #e2e8f0;border-radius:6px;box-sizing:border-box}
+        input[type="text"],input[type="password"],input[type="number"],input[type="date"],select{height:32px; padding: 4px 8px;}
+        textarea { width: 100%; resize: vertical; }
+        .status-bar{display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:12px;padding:12px 0}.status-card{background:#fff;border-radius:8px;padding:12px 16px;box-shadow:0 4px 12px rgba(20,30,60,0.05);border:1px solid #eef2f7;display:flex;flex-direction:column;gap:4px}.status-card span{font-size:14px;color:#64748b}.status-card strong{font-size:16px;color:#0f172a;font-weight:600}.status-card small{font-size:12px;color:#94a3b8}
+        .settings-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(360px,1fr));gap:18px;margin-top:12px}.settings-group{border:1px solid #eef2f7;border-radius:8px;padding:12px 16px}.settings-group h3{margin-top:0;font-size:16px;border-bottom:1px solid #eef2f7;padding-bottom:10px;margin-bottom:16px}.settings-group .form-row{margin-top:12px}.settings-group .form-row label{min-width:140px;text-align:right;font-weight:normal;color:#334155}.settings-group .form-row input{flex-grow:1;}
+        .toggle-switch{position:relative;display:inline-block;width:50px;height:28px}.toggle-switch input{opacity:0;width:0;height:0}.slider{position:absolute;cursor:pointer;top:0;left:0;right:0;bottom:0;background-color:#ccc;transition:.4s;border-radius:28px}.slider:before{position:absolute;content:"";height:20px;width:20px;left:4px;bottom:4px;background-color:white;transition:.4s;border-radius:50%}input:checked+.slider{background-color:#2563eb}input:checked+.slider:before{transform:translateX(22px)}
+        .page-grid { display: grid; grid-template-columns: minmax(0, 2fr) minmax(450px, 1fr); gap: 12px; align-items: stretch; }
+        .page-grid > .card, .right-panel-wrapper > .card { display: flex; flex-direction: column; height: calc(100vh - 200px); min-width: 0; }
+        .form-panel .form-row { flex-wrap: nowrap; }.form-panel .form-row label { flex-basis: 120px; flex-shrink: 0; text-align: right; font-weight: normal; color: #334155; line-height: 32px; }.form-panel .form-row input, .form-panel .form-row select { flex-grow: 1; }
+        .action-buttons { display: flex; flex-wrap: wrap; gap: 10px; margin-top: 15px; }
+        #device-list-body tr { cursor: pointer; transition: background-color .2s; }#device-list-body tr:hover { background-color: #f8fafc; }#device-list-body tr.highlight { background-color: #eef2ff !important; }
+        #toast-container { position: fixed; top: 20px; right: 20px; z-index: 9999; display: flex; flex-direction: column; gap: 10px; }
+        .toast { padding: 12px 18px; border-radius: 6px; color: white; font-weight: 600; box-shadow: 0 4px 12px rgba(0,0,0,0.15); opacity: 0; transform: translateX(100%); transition: all 0.4s ease-in-out; }.toast.show { opacity: 1; transform: translateX(0); }.toast.success { background-color: #10b981; }.toast.error { background-color: #dc2626; }
+        .modal-overlay { position: fixed; top: 0; left: 0; width: 100%; height: 100%; background: rgba(0,0,0,0.5); z-index: 10000; display: flex; justify-content: center; align-items: center; opacity: 0; visibility: hidden; transition: all 0.3s; }.modal-overlay.show { opacity: 1; visibility: visible; }
+        .modal-content { background: white; padding: 25px; border-radius: 8px; max-width: 400px; width: 90%; text-align: center; transform: scale(0.9); transition: all 0.3s; }.modal-overlay.show .modal-content { transform: scale(1); }
+        .modal-buttons { display: flex; justify-content: center; gap: 15px; margin-top: 20px; }
+        .right-panel-wrapper { display: flex; flex-direction: column; }
+        .right-panel-wrapper .card { margin-top: 0; }
+        .page-grid > .card, .right-panel-wrapper { height: calc(100vh - 200px); }
+        .right-panel-wrapper .card:last-child { margin-top: 12px; flex-grow: 1; display: flex; flex-direction: column; }
+        #log-viewer {height:calc(100vh - 280px);overflow:auto;background:#282c34;color:#abb2bf;padding:10px;border-radius:8px;font-family:monospace;font-size:12px;white-space:pre-wrap;}
 
         @media (max-width: 1024px) {
             .page-grid { grid-template-columns: 1fr; } 
@@ -84,12 +122,60 @@
 
     // --- Page Renderers ---
     function renderStatusPage() {
-        // 您的版本，保持不变
         contentArea.innerHTML = `<div class="card"><div style="display:flex; justify-content: space-between; align-items: center;"><h2>连接状态</h2></div><div class="table-container"><table><thead><tr><th>账号名称</th><th>状态</th><th>上传</th><th>下载</th><th>剩余流量</th><th>有效期</th><th>IP地址</th><th>连接时间</th><th>操作</th></tr></thead><tbody id="connections-body"></tbody></table></div></div>`;
         renderConnectionsTable();
     }
     function renderDevicePage() {
-        contentArea.innerHTML = `<div class="page-grid"><div class="card"><h3 style="margin:0;">账号列表</h3><div class="device-list-container"><table><thead><tr><th>状态</th><th>名称</th><th>用户名 (Key)</th><th>有效期</th><th>已用/总量</th><th>连接数</th><th>操作</th></tr></thead><tbody id="device-list-body"></tbody></table></div></div><div class="right-panel-wrapper"><div class="card form-panel"><h3 id="form-title" style="margin:0;">创建账号</h3><input type="hidden" id="current_editing_key"><div class="form-row"><label>友好名称:</label><input id="friendly_name" type="text" placeholder="e.g. MyPhone"></div><div class="form-row"><label>用户名:</label><input id="username" type="text" placeholder="e.g. user01"></div><div class="form-row"><label>密码:</label><input id="password" type="text"></div><div class="form-row"><label>有效期:</label><input id="expiry_date" type="date"></div><div class="form-row"><label>流量 (GB):</label><input id="limit_gb" type="number" placeholder="0为无限"></div><div class="form-row"><label>最大连接数:</label><input id="max_sessions" type="number" value="1"></div><div class="form-row" style="align-items:center;"><label>启用账号:</label><label class="toggle-switch"><input type="checkbox" id="enabled" checked><span class="slider"></span></label></div><div class="action-buttons" style="flex-direction:column; align-items:stretch; gap:8px; margin-top:20px;"><button class="btn info" onclick="generateNewDevice()">一键填充</button><button class="btn secondary" onclick="resetTraffic()">重置流量</button><button class="btn primary" onclick="saveAccount()">保存设置</button><button class="btn" style="background:#64748b" onclick="clearForm()">清空表单</button></div></div><div class="card"><h3 style="margin-top:0;">封禁列表</h3><div class="device-list-container" style="max-height: 200px;"><table id="blacklist-table"><thead><tr><th>名称</th><th>用户名</th><th>操作</th></tr></thead><tbody></tbody></table></div></div></div></div>`;
+        // [修改] 增加搜索框HTML，并调整开关按钮的HTML结构
+        contentArea.innerHTML = `<div class="page-grid">
+            <div class="card">
+                <h3 style="margin:0;">账号列表</h3>
+                <div class="form-row" style="padding-bottom: 10px; margin-top: 15px;">
+                    <input id="device-search-box" type="text" placeholder="通过名称或用户名搜索..." oninput="renderDevicesTable()" style="width: 100%;">
+                </div>
+                <div class="device-list-container">
+                    <table>
+                        <thead><tr><th>状态</th><th>名称</th><th>用户名 (Key)</th><th>有效期</th><th>已用/总量</th><th>连接数</th><th>操作</th></tr></thead>
+                        <tbody id="device-list-body"></tbody>
+                    </table>
+                </div>
+            </div>
+            <div class="right-panel-wrapper">
+                <div class="card form-panel">
+                    <h3 id="form-title" style="margin:0;">创建账号</h3>
+                    <input type="hidden" id="current_editing_key">
+                    <div class="form-row"><label>友好名称:</label><input id="friendly_name" type="text" placeholder="e.g. MyPhone"></div>
+                    <div class="form-row"><label>用户名:</label><input id="username" type="text" placeholder="e.g. user01"></div>
+                    <div class="form-row"><label>密码:</label><input id="password" type="text"></div>
+                    <div class="form-row"><label>有效期:</label><input id="expiry_date" type="date"></div>
+                    <div class="form-row"><label>流量 (GB):</label><input id="limit_gb" type="number" placeholder="0为无限"></div>
+                    <div class="form-row"><label>最大连接数:</label><input id="max_sessions" type="number" value="1"></div>
+                    <div class="form-row">
+                        <label for="enabled">启用账号:</label>
+                        <div style="flex-grow: 1; display: flex; align-items: center;">
+                            <label class="toggle-switch">
+                                <input type="checkbox" id="enabled" checked><span class="slider"></span>
+                            </label>
+                        </div>
+                    </div>
+                    <div class="action-buttons" style="flex-direction:column; align-items:stretch; gap:8px; margin-top:20px;">
+                        <button class="btn info" onclick="generateNewDevice()">一键填充</button>
+                        <button class="btn secondary" onclick="resetTraffic()">重置流量</button>
+                        <button class="btn primary" onclick="saveAccount()">保存设置</button>
+                        <button class="btn" style="background:#64748b" onclick="clearForm()">清空表单</button>
+                    </div>
+                </div>
+                <div class="card">
+                    <h3 style="margin-top:0;">封禁列表</h3>
+                    <div class="device-list-container" style="max-height: 200px;">
+                        <table id="blacklist-table">
+                            <thead><tr><th>名称</th><th>用户名</th><th>操作</th></tr></thead>
+                            <tbody></tbody>
+                        </table>
+                    </div>
+                </div>
+            </div>
+        </div>`;
         renderDevicesTable();
         renderBlacklistTable();
     }
@@ -119,12 +205,10 @@
         gid('mem-usage').textContent = s.mem_percent ? `${(s.mem_used_bytes / 1024**3).toFixed(1)}GB (${s.mem_percent.toFixed(1)}%)` : '...';
     }
     
-    // [按钮修复] 只修改了按钮的 onclick
     function renderConnectionsTable() {
         const tbody = gid('connections-body'); if (!tbody) return;
         tbody.innerHTML = appState.connections.map(c => {
             const acc = appState.accounts[c.username] || {};
-            // 您的这个数据获取逻辑是正确的，保持原样
             const sent = formatBytes(c.sent_bytes); 
             const received = formatBytes(c.received_bytes); 
             const remaining = c.remaining_bytes === -1 ? '无限' : formatBytes(c.remaining_bytes);
@@ -132,10 +216,22 @@
         }).join('') || '<tr><td colspan="9" style="text-align:center;">暂无连接</td></tr>';
     }
     
-    // [按钮修复] 只修改了按钮的 onclick
     function renderDevicesTable() {
         const tbody = gid('device-list-body'); if (!tbody) return;
-        tbody.innerHTML = Object.entries(appState.accounts).filter(([_, acc]) => acc.enabled).sort((a,b) => (a[1].friendly_name || "").localeCompare(b[1].friendly_name || "")).map(([user, acc]) => {
+        // [修改] 增加搜索逻辑
+        const searchTerm = gid('device-search-box')?.value.toLowerCase() || '';
+
+        const accountsToShow = Object.entries(appState.accounts)
+            .filter(([_, acc]) => acc.enabled)
+            .filter(([user, acc]) => {
+                if (!searchTerm) return true;
+                const friendlyName = (acc.friendly_name || '').toLowerCase();
+                const username = user.toLowerCase();
+                return friendlyName.includes(searchTerm) || username.includes(searchTerm);
+            })
+            .sort((a,b) => (a[1].friendly_name || "").localeCompare(b[1].friendly_name || ""));
+
+        tbody.innerHTML = accountsToShow.map(([user, acc]) => {
             const t = appState.traffic[user] || { sent: 0, received: 0 };
             const used = formatBytes(t.sent + t.received);
             const limit = acc.limit_gb > 0 ? `${acc.limit_gb} GB` : '无限';
@@ -146,13 +242,11 @@
         }).join('') || '<tr><td colspan="7" style="text-align:center;">暂无账号</td></tr>';
     }
     
-    // [按钮修复] 只修改了按钮的 onclick
     function renderBlacklistTable() {
         const tbody = gid('blacklist-table').querySelector('tbody'); if (!tbody) return;
         tbody.innerHTML = Object.entries(appState.accounts).filter(([_, acc]) => !acc.enabled).map(([user, acc]) => `<tr><td>${acc.friendly_name}</td><td>${user}</td><td><button class="btn secondary btn-sm btn-unban" data-username="${user}">解封</button></td></tr>`).join('') || '<tr><td colspan="3" style="text-align:center;">暂无封禁账号</td></tr>';
     }
     
-    // [日志修复] 只修改这一行
     function renderLogs() {
         const viewer = gid('log-viewer'); if (!viewer) return;
         viewer.textContent = appState.logs.join('\n');
@@ -160,7 +254,6 @@
     }
 
     // --- Data Fetching ---
-    // 您的这个数据获取逻辑是正确的，保持原样
     async function updateDynamicData() {
         const path = window.location.hash || '#/status';
         const status = await apiRequest('/api/server_status');
@@ -215,8 +308,14 @@
         const origUser = gid('current_editing_key').value;
         let pass = gid('password').value;
         if (!origUser && !pass) return showToast('新用户必须设置密码', 'error');
-        if (origUser && !pass) pass = appState.accounts[origUser].password;
-        const payload = { password: pass, friendly_name: gid('friendly_name').value.trim() || user, enabled: gid('enabled').checked, expiry_date: gid('expiry_date').value, limit_gb: parseFloat(gid('limit_gb').value) || 0, max_sessions: parseInt(gid('max_sessions').value) || 0, };
+        const payload = { 
+            password: pass,
+            friendly_name: gid('friendly_name').value.trim() || user, 
+            enabled: gid('enabled').checked, 
+            expiry_date: gid('expiry_date').value, 
+            limit_gb: parseFloat(gid('limit_gb').value) || 0, 
+            max_sessions: parseInt(gid('max_sessions').value) || 0, 
+        };
         const res = await apiRequest(`/api/accounts/${user}`, { method: 'POST', body: JSON.stringify(payload) });
         if (res) { showToast(res.message); clearForm(); updateDynamicData(); }
     }
@@ -268,11 +367,33 @@
         const res = await apiRequest('/api/settings', { method: 'POST', body: JSON.stringify(payload) });
         if (res) { showToast(res.message); appState.settings = await apiRequest('/api/settings'); }
     }
+    
     function copyToClipboard(user) {
         const acc = appState.accounts[user];
-        if(!acc) return;
+        if (!acc) return;
         const textToCopy = `用户名: ${user}\n密码: ${acc.password}`;
-        navigator.clipboard.writeText(textToCopy).then(() => showToast('用户名和密码已复制'), () => showToast('复制失败', 'error'));
+
+        if (navigator.clipboard && window.isSecureContext) {
+            navigator.clipboard.writeText(textToCopy).then(
+                () => showToast('用户名和密码已复制'),
+                () => showToast('复制失败', 'error')
+            );
+        } else {
+            const textArea = document.createElement('textarea');
+            textArea.value = textToCopy;
+            textArea.style.position = 'fixed';
+            textArea.style.left = '-9999px';
+            document.body.appendChild(textArea);
+            textArea.focus();
+            textArea.select();
+            try {
+                document.execCommand('copy');
+                showToast('用户名和密码已复制');
+            } catch (err) {
+                showToast('复制失败', 'error');
+            }
+            document.body.removeChild(textArea);
+        }
     }
 
     // --- Router and Init ---
@@ -287,24 +408,21 @@
         refreshInterval = setInterval(updateDynamicData, 5000);
     }
     
-    // [按钮修复]
     async function initializeApp() {
         contentArea.addEventListener('click', function(event){
             const target = event.target.closest('button');
             if(!target) return;
-            
-            if (target.textContent === '复制') { return; }
 
             const username = target.dataset.username;
-            if(!username) return;
-
-            event.stopPropagation();
-            if(target.classList.contains('btn-ban')) {
-                setDeviceStatus(username, false);
-            } else if (target.classList.contains('btn-unban')) {
-                setDeviceStatus(username, true);
-            } else if (target.classList.contains('btn-delete')) {
-                deleteAccount(username);
+            if (username) {
+                event.stopPropagation();
+                if(target.classList.contains('btn-ban')) {
+                    setDeviceStatus(username, false);
+                } else if (target.classList.contains('btn-unban')) {
+                    setDeviceStatus(username, true);
+                } else if (target.classList.contains('btn-delete')) {
+                    deleteAccount(username);
+                }
             }
         });
 
