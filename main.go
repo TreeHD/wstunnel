@@ -1,4 +1,4 @@
-// main.go (完整修复版)
+// main.go (最终修复版)
 package main
 
 import (
@@ -20,7 +20,7 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/shirou/gopsutil/v3/cpu"
+	"github.comcom/shirou/gopsutil/v3/cpu"
 	"github.com/shirou/gopsutil/v3/mem"
 	"golang.org/x/crypto/ssh"
 )
@@ -454,8 +454,7 @@ func apiHandler(w http.ResponseWriter, r *http.Request) {
 			}
 			t_val, _ := globalTraffic.LoadOrStore(u.Username, &TrafficInfo{})
 			t := t_val.(*TrafficInfo)
-
-			// [修复] 分别获取上传和下载的流量，以匹配前端的'sent_bytes'和'received_bytes'字段
+			
 			sentBytes := atomic.LoadUint64(&t.Sent)
 			receivedBytes := atomic.LoadUint64(&t.Received)
 			usedBytes := sentBytes + receivedBytes
@@ -468,14 +467,13 @@ func apiHandler(w http.ResponseWriter, r *http.Request) {
 				}
 			}
 
-			// [修复] 在返回给前端的JSON中加入sent_bytes和received_bytes字段
 			conns = append(conns, map[string]interface{}{
 				"conn_id":         u.ConnID,
 				"username":        u.Username,
 				"ip":              u.RemoteAddr,
 				"connect_time":    u.ConnectTime,
-				"sent_bytes":      sentBytes,     // <-- 新增此字段
-				"received_bytes":  receivedBytes, // <-- 新增此字段
+				"sent_bytes":      sentBytes,
+				"received_bytes":  receivedBytes,
 				"expiry_date":     acc.ExpiryDate,
 				"used_bytes":      usedBytes,
 				"remaining_bytes": remainingBytes,
@@ -528,7 +526,7 @@ func apiHandler(w http.ResponseWriter, r *http.Request) {
 		}
 
 		if payload.Username == "" {
-			log.Printf("[ERROR] Received set_status request with EMPTY username.")
+			log.Printf("[ERROR] Received set_status request with an EMPTY username.")
 			sendJSON(w, http.StatusBadRequest, map[string]string{"message": "错误：用户名不能为空"})
 			return
 		}
@@ -566,7 +564,16 @@ func apiHandler(w http.ResponseWriter, r *http.Request) {
 
 		safeSaveConfig()
 		log.Printf("Successfully updated status for user '%s' to Enabled=%t\n", payload.Username, payload.Enabled)
-		sendJSON(w, http.StatusOK, map[string]string{"message": "状态更新成功"})
+		
+		var actionStr string
+		if payload.Enabled {
+			actionStr = "解封"
+		} else {
+			actionStr = "封禁"
+		}
+		successMessage := fmt.Sprintf("账号 %s 已成功%s", payload.Username, actionStr)
+		sendJSON(w, http.StatusOK, map[string]string{"message": successMessage})
+
 	case r.URL.Path == "/api/admin/update_password" && r.Method == "POST":
 		var payload struct {
 			OldPassword string `json:"oldPassword"`
