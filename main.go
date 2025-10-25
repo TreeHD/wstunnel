@@ -1,4 +1,4 @@
-// main.go (最终修复版)
+// main.go (完整修复版)
 package main
 
 import (
@@ -454,7 +454,12 @@ func apiHandler(w http.ResponseWriter, r *http.Request) {
 			}
 			t_val, _ := globalTraffic.LoadOrStore(u.Username, &TrafficInfo{})
 			t := t_val.(*TrafficInfo)
-			usedBytes := atomic.LoadUint64(&t.Sent) + atomic.LoadUint64(&t.Received)
+
+			// [修复] 分别获取上传和下载的流量，以匹配前端的'sent_bytes'和'received_bytes'字段
+			sentBytes := atomic.LoadUint64(&t.Sent)
+			receivedBytes := atomic.LoadUint64(&t.Received)
+			usedBytes := sentBytes + receivedBytes
+
 			var remainingBytes int64 = -1
 			if acc.LimitGB > 0 {
 				remainingBytes = int64(acc.LimitGB*1e9) - int64(usedBytes)
@@ -462,7 +467,19 @@ func apiHandler(w http.ResponseWriter, r *http.Request) {
 					remainingBytes = 0
 				}
 			}
-			conns = append(conns, map[string]interface{}{"conn_id": u.ConnID, "username": u.Username, "ip": u.RemoteAddr, "connect_time": u.ConnectTime, "expiry_date": acc.ExpiryDate, "used_bytes": usedBytes, "remaining_bytes": remainingBytes})
+
+			// [修复] 在返回给前端的JSON中加入sent_bytes和received_bytes字段
+			conns = append(conns, map[string]interface{}{
+				"conn_id":         u.ConnID,
+				"username":        u.Username,
+				"ip":              u.RemoteAddr,
+				"connect_time":    u.ConnectTime,
+				"sent_bytes":      sentBytes,     // <-- 新增此字段
+				"received_bytes":  receivedBytes, // <-- 新增此字段
+				"expiry_date":     acc.ExpiryDate,
+				"used_bytes":      usedBytes,
+				"remaining_bytes": remainingBytes,
+			})
 			return true
 		})
 		sendJSON(w, http.StatusOK, conns)
@@ -472,7 +489,6 @@ func apiHandler(w http.ResponseWriter, r *http.Request) {
 		sendJSON(w, http.StatusOK, globalConfig.Accounts)
 	case strings.HasPrefix(r.URL.Path, "/api/accounts/") && r.Method == "POST":
 		username := strings.TrimPrefix(r.URL.Path, "/api/accounts/")
-		// --- [最终修复] 后端增加严格验证，禁止空用户名 ---
 		if username == "" {
 			sendJSON(w, http.StatusBadRequest, map[string]string{"message": "错误：用户名不能为空"})
 			return
@@ -511,7 +527,6 @@ func apiHandler(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 
-		// --- [最终修复] 后端增加严格验证，禁止操作空用户 ---
 		if payload.Username == "" {
 			log.Printf("[ERROR] Received set_status request with EMPTY username.")
 			sendJSON(w, http.StatusBadRequest, map[string]string{"message": "错误：用户名不能为空"})
