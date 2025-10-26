@@ -466,6 +466,7 @@ func apiHandler(w http.ResponseWriter, r *http.Request) {
 		cpuPercent, _ := cpu.Percent(0, false)
 		memInfo, _ := mem.VirtualMemory()
 		sendJSON(w, http.StatusOK, map[string]interface{}{"uptime": time.Since(serverStartTime).Round(time.Second).String(), "active_conns": activeConns, "global_sent": globalSent, "global_rcvd": globalRcvd, "cpu_percent": cpuPercent[0], "mem_percent": memInfo.UsedPercent, "mem_used_bytes": memInfo.Used, "mem_total_bytes": memInfo.Total})
+
 	case r.URL.Path == "/api/connections":
 		var conns []map[string]interface{}
 		onlineUsers.Range(func(_, v interface{}) bool {
@@ -505,10 +506,13 @@ func apiHandler(w http.ResponseWriter, r *http.Request) {
 			return true
 		})
 		sendJSON(w, http.StatusOK, conns)
+
 	case r.URL.Path == "/api/accounts":
 		globalConfig.lock.RLock()
 		defer globalConfig.lock.RUnlock()
 		sendJSON(w, http.StatusOK, globalConfig.Accounts)
+
+	// [最终修复] 将所有具体的 /api/accounts/ 下的 POST 路由，全部移到模糊匹配之前
 	case r.URL.Path == "/api/accounts/set_status" && r.Method == "POST":
 		var payload struct {
 			Username string `json:"username"`
@@ -520,27 +524,21 @@ func apiHandler(w http.ResponseWriter, r *http.Request) {
 		}
 
 		if payload.Username == "" {
-			log.Printf("[ERROR] Received set_status request with an EMPTY username.")
 			sendJSON(w, http.StatusBadRequest, map[string]string{"message": "错误：用户名不能为空"})
 			return
 		}
-
-		log.Printf("[DIAGNOSTIC] Received set_status request: User='%s', Set Enabled to '%t'", payload.Username, payload.Enabled)
-		var connsToClose []ssh.Conn
 
 		globalConfig.lock.Lock()
 		acc, ok := globalConfig.Accounts[payload.Username]
 		if !ok {
 			globalConfig.lock.Unlock()
-			log.Printf("[ERROR] Attempted to set status for non-existent user: '%s'", payload.Username)
 			sendJSON(w, http.StatusNotFound, map[string]string{"message": "错误：用户不存在"})
 			return
 		}
-
 		acc.Enabled = payload.Enabled
 		globalConfig.Accounts[payload.Username] = acc
-
 		if !payload.Enabled {
+			var connsToClose []ssh.Conn
 			onlineUsers.Range(func(_, v interface{}) bool {
 				u := v.(*OnlineUser)
 				if u.Username == payload.Username {
@@ -548,39 +546,83 @@ func apiHandler(w http.ResponseWriter, r *http.Request) {
 				}
 				return true
 			})
+			for _, conn := range connsToClose {
+				conn.Close()
+			}
 		}
 		globalConfig.lock.Unlock()
-
-		for _, conn := range connsToClose {
-			log.Printf("Disconnecting user '%s' due to account status change.", payload.Username)
-			conn.Close()
-		}
-
 		safeSaveConfig()
-		log.Printf("Successfully updated status for user '%s' to Enabled=%t", payload.Username, payload.Enabled)
-
-		var actionStr string
-		if payload.Enabled {
-			actionStr = "解封"
-		} else {
-			actionStr = "封禁"
-		}
+		
+		actionStr := "封禁"
+		if payload.Enabled { actionStr = "解封" }
 		successMessage := fmt.Sprintf("账号 %s 已成功%s", payload.Username, actionStr)
 		sendJSON(w, http.StatusOK, map[string]string{"message": successMessage})
 
+	case r.URL.Path == "/api/accounts/reset-traffic" && r.Method == "POST":
+		var p struct{ Username string `json:"username"` }
+		if err := json.NewDecoder(r.Body).Decode(&p); err != nil {
+			sendJSON(w, http.StatusBadRequest, map[string]string{"message": "无效请求"})
+			return
+		}
+		if p.Username == "" {
+			sendJSON(w, http.StatusBadRequest, map[string]string{"message": "错误：用户名不能为空"})
+			return
+		}
+		if v, ok := globalTraffic.Load(p.Username); ok {
+			t := v.(*TrafficInfo)
+			atomic.StoreUint64(&t.Sent, 0)
+			atomic.StoreUint64(&t.Received, 0)
+			sendJSON(w, http.StatusOK, map[string]string{"message": fmt.Sprintf("账号 %s 的流量已重置", p.Username)})
+		} else {
+			sendJSON(w, http.StatusNotFound, map[string]string{"message": "未找到该用户的流量记录"})
+		}
+
+	// [最终修复] 模糊匹配的路由，必须放在所有具体路由之后
 	case strings.HasPrefix(r.URL.Path, "/api/accounts/") && r.Method == "POST":
 		username := strings.TrimPrefix(r.URL.Path, "/api/accounts/")
 		if username == "" {
 			sendJSON(w, http.StatusBadRequest, map[string]string{"message": "错误：用户名不能为空"})
 			return
 		}
-		var accInfo AccountInfo
-		json.NewDecoder(r.Body).Decode(&accInfo)
+
 		globalConfig.lock.Lock()
-		globalConfig.Accounts[username] = accInfo
+		existingInfo, isUpdate := globalConfig.Accounts[username]
+
+		var reqData map[string]interface{}
+		if err := json.NewDecoder(r.Body).Decode(&reqData); err != nil {
+			globalConfig.lock.Unlock()
+			sendJSON(w, http.StatusBadRequest, map[string]string{"message": "无效的请求数据"})
+			return
+		}
+
+		var finalInfo AccountInfo
+		if isUpdate {
+			finalInfo = existingInfo
+		}
+
+		if val, ok := reqData["friendly_name"].(string); ok { finalInfo.FriendlyName = val }
+		if val, ok := reqData["enabled"].(bool); ok { finalInfo.Enabled = val }
+		if val, ok := reqData["expiry_date"].(string); ok { finalInfo.ExpiryDate = val }
+		if val, ok := reqData["limit_gb"].(float64); ok { finalInfo.LimitGB = val }
+		if val, ok := reqData["max_sessions"].(float64); ok { finalInfo.MaxSessions = int(val) }
+		
+		if val, ok := reqData["password"].(string); ok && val != "" {
+			finalInfo.Password = val
+		} else if !isUpdate {
+			globalConfig.lock.Unlock()
+			sendJSON(w, http.StatusBadRequest, map[string]string{"message": "新用户必须提供密码"})
+			return
+		}
+		
+		globalConfig.Accounts[username] = finalInfo
 		globalConfig.lock.Unlock()
-		safeSaveConfig()
+
+		if err := safeSaveConfig(); err != nil {
+			sendJSON(w, http.StatusInternalServerError, map[string]string{"message": "保存配置失败"})
+			return
+		}
 		sendJSON(w, http.StatusOK, map[string]string{"message": "账户 " + username + " 更新成功"})
+
 	case strings.HasPrefix(r.URL.Path, "/api/accounts/") && r.Method == "DELETE":
 		username := strings.TrimPrefix(r.URL.Path, "/api/accounts/")
 		if username == "" {
@@ -592,12 +634,14 @@ func apiHandler(w http.ResponseWriter, r *http.Request) {
 		globalConfig.lock.Unlock()
 		safeSaveConfig()
 		sendJSON(w, http.StatusOK, map[string]string{"message": "账户 " + username + " 删除成功"})
+
 	case strings.HasPrefix(r.URL.Path, "/api/connections/") && r.Method == "DELETE":
 		connID := strings.TrimPrefix(r.URL.Path, "/api/connections/")
 		if user, ok := onlineUsers.Load(connID); ok {
 			user.(*OnlineUser).sshConn.Close()
 			sendJSON(w, http.StatusOK, map[string]string{"message": "连接已断开"})
 		}
+
 	case r.URL.Path == "/api/admin/update_password" && r.Method == "POST":
 		var payload struct {
 			OldPassword string `json:"oldPassword"`
@@ -608,19 +652,17 @@ func apiHandler(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		user, _ := validateSession(r)
-		success := false
 		globalConfig.lock.Lock()
 		if globalConfig.AdminAccounts[user] == payload.OldPassword {
 			globalConfig.AdminAccounts[user] = payload.NewPassword
-			success = true
-		}
-		globalConfig.lock.Unlock()
-		if success {
+			globalConfig.lock.Unlock()
 			safeSaveConfig()
 			sendJSON(w, http.StatusOK, map[string]string{"message": "密码更新成功"})
 		} else {
+			globalConfig.lock.Unlock()
 			sendJSON(w, http.StatusForbidden, map[string]string{"message": "旧密码错误"})
 		}
+
 	case r.URL.Path == "/api/settings":
 		if r.Method == "GET" {
 			globalConfig.lock.RLock()
@@ -648,8 +690,10 @@ func apiHandler(w http.ResponseWriter, r *http.Request) {
 			}}
 			sendJSON(w, http.StatusOK, map[string]string{"message": "设置已保存"})
 		}
+
 	case r.URL.Path == "/api/logs":
 		sendJSON(w, http.StatusOK, globalLog.GetLogs())
+
 	case r.URL.Path == "/api/traffic":
 		trafficData := make(map[string]*TrafficInfo)
 		globalTraffic.Range(func(k, v interface{}) bool {
@@ -657,17 +701,7 @@ func apiHandler(w http.ResponseWriter, r *http.Request) {
 			return true
 		})
 		sendJSON(w, http.StatusOK, trafficData)
-	case r.URL.Path == "/api/accounts/reset-traffic":
-		var p struct {
-			Username string `json:"username"`
-		}
-		json.NewDecoder(r.Body).Decode(&p)
-		if v, ok := globalTraffic.Load(p.Username); ok {
-			t := v.(*TrafficInfo)
-			atomic.StoreUint64(&t.Sent, 0)
-			atomic.StoreUint64(&t.Received, 0)
-			sendJSON(w, http.StatusOK, map[string]string{"message": "流量已重置"})
-		}
+		
 	case r.URL.Path == "/api/whoami":
 		if user, ok := validateSession(r); ok {
 			sendJSON(w, http.StatusOK, map[string]string{"username": user})
@@ -676,7 +710,6 @@ func apiHandler(w http.ResponseWriter, r *http.Request) {
 		http.NotFound(w, r)
 	}
 }
-
 // --- main ---
 func main() {
 	log.SetOutput(globalLog)
