@@ -1,4 +1,4 @@
-// main.go (最终完整版 - 包含所有功能、修复和优化)
+// main.go (最终完整版 + 优雅退出 + 秒级配置)
 package main
 
 import (
@@ -15,9 +15,11 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"os/signal"
 	"strings"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"time"
 
 	"github.com/shirou/gopsutil/v3/cpu"
@@ -50,7 +52,7 @@ type Config struct {
 	TargetConnectTimeoutSeconds int                    `json:"target_connect_timeout_seconds,omitempty"`
 	DefaultExpiryDays           int                    `json:"default_expiry_days,omitempty"`
 	DefaultLimitGB              float64                `json:"default_limit_gb,omitempty"`
-	TrafficSaveIntervalMinutes  int                    `json:"traffic_save_interval_minutes,omitempty"`
+	TrafficSaveIntervalSeconds  int                    `json:"traffic_save_interval_seconds,omitempty"`
 	lock                        sync.RWMutex
 }
 
@@ -307,7 +309,6 @@ func handleDirectTCPIP(ch ssh.Channel, destHost string, destPort uint32, remoteA
 	}()
 	wg.Wait()
 }
-
 
 // --- SSH & HTTP 握手与连接管理 ---
 func sendKeepAlives(sshConn ssh.Conn, done <-chan struct{}) {
@@ -603,8 +604,6 @@ func apiHandler(w http.ResponseWriter, r *http.Request) {
 			atomic.StoreUint64(&t.Received, 0)
 			sendJSON(w, http.StatusOK, map[string]string{"message": fmt.Sprintf("账号 %s 的流量已重置", p.Username)})
 		} else {
-			// 如果内存中没有，也应该重置文件中的（虽然可能性不大）
-			// 为了简单，我们只重置内存中的。如果需要更强一致性，这里应该保存一次。
 			sendJSON(w, http.StatusNotFound, map[string]string{"message": "未找到该用户的流量记录，无法重置"})
 		}
 	
@@ -615,19 +614,26 @@ func apiHandler(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 
+		var newInfo AccountInfo
+		// Need to decode into a temp structure to check password
+		bodyBytes, _ := ioutil.ReadAll(r.Body)
+		r.Body = ioutil.NopCloser(bytes.NewBuffer(bodyBytes)) // re-buffer body for next read
+		
+		tempInfo := struct {
+			Password *string `json:"password"`
+		}{}
+		json.Unmarshal(bodyBytes, &tempInfo)
+		json.Unmarshal(bodyBytes, &newInfo)
+
+
 		globalConfig.lock.Lock()
 		existingInfo, isUpdate := globalConfig.Accounts[username]
-
-		var newInfo AccountInfo
-		if err := json.NewDecoder(r.Body).Decode(&newInfo); err != nil {
-			globalConfig.lock.Unlock()
-			sendJSON(w, http.StatusBadRequest, map[string]string{"message": "无效的请求数据"})
-			return
-		}
 		
-		if isUpdate && newInfo.Password == "" {
-			newInfo.Password = existingInfo.Password
-		} else if !isUpdate && newInfo.Password == "" {
+		if isUpdate {
+			if tempInfo.Password == nil { // Password field was not in the request JSON
+				newInfo.Password = existingInfo.Password
+			}
+		} else if newInfo.Password == "" {
 			globalConfig.lock.Unlock()
 			sendJSON(w, http.StatusBadRequest, map[string]string{"message": "新用户必须提供密码"})
 			return
@@ -745,7 +751,7 @@ func main() {
 	if globalConfig.TolerantCopyMaxRetries <= 0 { globalConfig.TolerantCopyMaxRetries = 100 }
 	if globalConfig.TolerantCopyRetryDelayMs <= 0 { globalConfig.TolerantCopyRetryDelayMs = 500 }
 	if globalConfig.TargetConnectTimeoutSeconds <= 0 { globalConfig.TargetConnectTimeoutSeconds = 10 }
-    if globalConfig.TrafficSaveIntervalMinutes <= 0 { globalConfig.TrafficSaveIntervalMinutes = 5 }
+    if globalConfig.TrafficSaveIntervalSeconds <= 0 { globalConfig.TrafficSaveIntervalSeconds = 300 } // Default to 300 seconds (5 minutes)
 
     log.Println("==================================================")
     log.Println("          WSTunnel Service Starting Up")
@@ -765,13 +771,13 @@ func main() {
     log.Printf("  New User Default Expiry: %d days", globalConfig.DefaultExpiryDays)
     log.Printf("  New User Default Traffic: %.2f GB", globalConfig.DefaultLimitGB)
     log.Println("------------------ Persistence -------------------")
-    log.Printf("  Traffic Save Interval: %d minutes", globalConfig.TrafficSaveIntervalMinutes)
+    log.Printf("  Traffic Save Interval: %d seconds", globalConfig.TrafficSaveIntervalSeconds)
     log.Println("==================================================")
 	
 	loadTrafficData()
 
 	go func() {
-		saveInterval := time.Duration(globalConfig.TrafficSaveIntervalMinutes) * time.Minute
+		saveInterval := time.Duration(globalConfig.TrafficSaveIntervalSeconds) * time.Second
 		log.Printf("System: Traffic data will be saved every %v.", saveInterval)
 		ticker := time.NewTicker(saveInterval)
 		defer ticker.Stop()
@@ -787,6 +793,16 @@ func main() {
 		buf := make([]byte, globalConfig.BufferSizeKB*1024)
 		return &buf
 	}}
+
+	// [修改] 将监听器提取出来，以便后续可以关闭
+	sshListener, err := net.Listen("tcp", globalConfig.ListenAddr)
+	if err != nil {
+		log.Fatalf("FATAL: Cannot listen on %s: %v", globalConfig.ListenAddr, err)
+	}
+	log.Printf("System: SSH server listening on %s", globalConfig.ListenAddr)
+
+	// [修改] 将 http server 的启动也放入 goroutine
+	adminServer := &http.Server{Addr: globalConfig.AdminAddr}
 	go func() {
 		mux := http.NewServeMux()
 		mux.HandleFunc("/login.html", func(w http.ResponseWriter, r *http.Request) { http.ServeFile(w, r, "login.html") })
@@ -800,11 +816,13 @@ func main() {
 			}
 			http.NotFound(w, r)
 		}))
+		adminServer.Handler = mux
 		log.Printf("System: Admin panel listening on http://%s", globalConfig.AdminAddr)
-		if err := http.ListenAndServe(globalConfig.AdminAddr, mux); err != nil {
+		if err := adminServer.ListenAndServe(); err != http.ErrServerClosed {
 			log.Fatalf("FATAL: Cannot start admin panel: %v", err)
 		}
 	}()
+	
 	sshCfg := &ssh.ServerConfig{
 		ServerVersion: "SSH-2.0-WSTunnel_Pro",
 		PasswordCallback: func(c ssh.ConnMetadata, p []byte) (*ssh.Permissions, error) {
@@ -850,23 +868,55 @@ func main() {
 	_, priv, _ := ed25519.GenerateKey(rand.Reader)
 	key, _ := ssh.NewSignerFromKey(priv)
 	sshCfg.AddHostKey(key)
-	l, err := net.Listen("tcp", globalConfig.ListenAddr)
-	if err != nil {
-		log.Fatalf("FATAL: Cannot listen on %s: %v", globalConfig.ListenAddr, err)
-	}
-	log.Printf("System: SSH server listening on %s", globalConfig.ListenAddr)
-	for {
-		conn, err := l.Accept()
-		if err != nil {
-			continue
+
+	// [新增] 优雅退出逻辑
+	go func() {
+		for {
+			conn, err := sshListener.Accept()
+			if err != nil {
+				// 当 sshListener.Close() 被调用时，这里会收到一个错误，循环自然退出
+				log.Printf("System: SSH listener stopped. %v", err)
+				return
+			}
+			go func(c net.Conn) {
+				defer func() {
+					if r := recover(); r != nil {
+						log.Printf("FATAL: Panic recovered for %s: %v", c.RemoteAddr(), r)
+					}
+				}()
+				handleSshConnection(c, sshCfg)
+			}(conn)
 		}
-		go func(c net.Conn) {
-			defer func() {
-				if r := recover(); r != nil {
-					log.Printf("FATAL: Panic recovered for %s: %v", c.RemoteAddr(), r)
-				}
-			}()
-			handleSshConnection(c, sshCfg)
-		}(conn)
+	}()
+
+	// [新增] 监听系统信号，实现优雅退出
+	quit := make(chan os.Signal, 1)
+	signal.Notify(quit, syscall.SIGINT, syscall.SIGTERM)
+	<-quit // 阻塞在这里，直到收到退出信号
+
+	log.Println("==================================================")
+	log.Println("         WSTunnel Service Shutting Down...")
+	log.Println("==================================================")
+
+	// 关闭 HTTP 服务器
+	if err := adminServer.Close(); err != nil {
+		log.Printf("System: Error closing admin panel: %v", err)
+	} else {
+		log.Println("System: Admin panel gracefully shut down.")
 	}
+
+	// 关闭 SSH 监听器
+	if err := sshListener.Close(); err != nil {
+		log.Printf("System: Error closing SSH listener: %v", err)
+	} else {
+		log.Println("System: SSH listener gracefully shut down.")
+	}
+
+	// 在退出前，最后保存一次流量数据
+	log.Println("System: Performing final traffic data save...")
+	if err := saveTrafficData(); err != nil {
+		log.Printf("System: Error during final traffic data save: %v", err)
+	}
+
+	log.Println("Shutdown complete.")
 }
