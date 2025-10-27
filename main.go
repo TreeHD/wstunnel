@@ -29,7 +29,7 @@ import (
 	"syscall"
 	"time"
 
-	"github.comcom/shirou/gopsutil/v3/cpu"
+	"github.com/shirou/gopsutil/v3/cpu"
 	"github.com/shirou/gopsutil/v3/mem"
 	"golang.org/x/crypto/ssh"
 )
