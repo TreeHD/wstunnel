@@ -1,4 +1,4 @@
-// main.go (最终集成版 + 优雅退出 + 秒级配置 + TLS/SNI + 443端口协议嗅探)
+// main.go (最终修正版 + 修复EOF竞态条件 + 全局握手延迟)
 package main
 
 import (
@@ -378,13 +378,18 @@ func sendKeepAlives(sshConn ssh.Conn, done <-chan struct{}) {
 	}
 }
 
-// [微调] handleSshConnection 现在接收一个 io.Reader，以处理预读数据
+// [修正] 核心SSH处理器，增加了全局延迟
 func handleSshConnection(c net.Conn, r io.Reader, sshCfg *ssh.ServerConfig) {
 	connForSSH := &handshakeConn{Conn: c, r: r}
 	c.SetReadDeadline(time.Now().Add(15 * time.Second))
 	sshConn, chans, reqs, err := ssh.NewServerConn(connForSSH, sshCfg)
 	if err != nil {
-		log.Printf("SSH handshake failed for %s: %v", c.RemoteAddr(), err)
+		// EOF错误在这里很常见，是客户端主动断开，可以降低日志级别
+		if err == io.EOF || strings.Contains(err.Error(), "connection reset by peer") {
+			log.Printf("SSH handshake failed for %s: client closed connection.", c.RemoteAddr())
+		} else {
+			log.Printf("SSH handshake failed for %s: %v", c.RemoteAddr(), err)
+		}
 		return
 	}
 	idleTimeout := time.Duration(globalConfig.IdleTimeoutSeconds) * time.Second
@@ -414,13 +419,17 @@ func handleSshConnection(c net.Conn, r io.Reader, sshCfg *ssh.ServerConfig) {
 			atomic.AddInt32(val.(*int32), -1)
 		}
 	}()
+	log.Printf("Auth success for user '%s' from %s", username, sshConn.RemoteAddr())
+
+	// [修正] 全局握手后延迟，确保客户端状态切换完成
+	time.Sleep(500 * time.Millisecond)
+
 	done := make(chan struct{})
 	defer close(done)
 	go sendKeepAlives(sshConn, done)
 	connID := sshConn.RemoteAddr().String() + "-" + hex.EncodeToString(sshConn.SessionID())
 	onlineUser := &OnlineUser{ConnID: connID, Username: username, RemoteAddr: sshConn.RemoteAddr().String(), ConnectTime: time.Now(), sshConn: sshConn}
 	onlineUsers.Store(onlineUser.ConnID, onlineUser)
-	log.Printf("Auth success for user '%s' from %s", username, sshConn.RemoteAddr())
 	defer onlineUsers.Delete(onlineUser.ConnID)
 	go ssh.DiscardRequests(reqs)
 	for newChan := range chans {
@@ -441,7 +450,7 @@ func handleSshConnection(c net.Conn, r io.Reader, sshCfg *ssh.ServerConfig) {
 	}
 }
 
-// [新增] dispatchConnection - 新的智能分发器
+// [修正] dispatchConnection 修复了EOF竞态条件
 func dispatchConnection(c net.Conn, sshCfg *ssh.ServerConfig) {
 	defer func() {
 		if r := recover(); r != nil {
@@ -467,9 +476,8 @@ func dispatchConnection(c net.Conn, sshCfg *ssh.ServerConfig) {
 		return
 	}
 
-	// 协议嗅探
 	reader := bufio.NewReader(c)
-	peekedBytes, err := reader.Peek(8) // 偷看8个字节足够判断
+	peekedBytes, err := reader.Peek(8)
 	if err != nil {
 		if err != io.EOF {
 			log.Printf("System: Protocol sniffing failed for %s: %v", c.RemoteAddr(), err)
@@ -477,11 +485,10 @@ func dispatchConnection(c net.Conn, sshCfg *ssh.ServerConfig) {
 		return
 	}
 
-	// 判断是SSH直连还是HTTP请求
 	if bytes.HasPrefix(peekedBytes, []byte("SSH-2.0")) {
 		log.Printf("System: Detected direct SSH connection via TLS for %s (SNI: %s)", c.RemoteAddr(), sni)
 		handleSshConnection(c, reader, sshCfg)
-	} else { // 假设不是SSH直连，就当做HTTP处理
+	} else {
 		log.Printf("System: Detected HTTP-based connection via TLS for %s (SNI: %s), attempting Upgrade.", c.RemoteAddr(), sni)
 		
 		req, err := http.ReadRequest(reader)
@@ -498,24 +505,33 @@ func dispatchConnection(c net.Conn, sshCfg *ssh.ServerConfig) {
 				log.Printf("System: Failed to write HTTP 101 response for %s: %v", c.RemoteAddr(), err)
 				return
 			}
-			// 成功后，将剩余的数据流交给SSH处理器
-			handleSshConnection(c, reader, sshCfg)
+			
+			// [修正] 关键修复：处理完HTTP后，必须将缓冲区中剩余的数据和原始连接一起传给SSH处理器
+			var finalReader io.Reader
+			if reader.Buffered() > 0 {
+				log.Printf("System: Forwarding %d buffered bytes for %s after HTTP upgrade.", reader.Buffered(), c.RemoteAddr())
+				preReadData, _ := ioutil.ReadAll(reader)
+				finalReader = io.MultiReader(bytes.NewReader(preReadData), c)
+			} else {
+				finalReader = c
+			}
+
+			handleSshConnection(c, finalReader, sshCfg)
 		} else {
-			// 对于非法的HTTP请求，可以返回一个伪装的页面或错误
 			log.Printf("System: Rejected invalid HTTP request via TLS for %s (UA: %s)", c.RemoteAddr(), req.UserAgent())
 			c.Write([]byte("HTTP/1.1 404 Not Found\r\nContent-Type: text/html\r\nConnection: close\r\n\r\nPage not found."))
 		}
 	}
 }
 
-// 80端口的处理器，现在更简单，只处理HTTP Upgrade
+// 80端口的处理器
 func handleHttpUpgrade(c net.Conn, sshCfg *ssh.ServerConfig) {
 	defer c.Close()
 	timeoutDuration := time.Duration(globalConfig.HandshakeTimeout) * time.Second
 	expectedUA := globalConfig.ConnectUA
 	reader := bufio.NewReader(c)
 
-	for { // 循环是为了处理一些客户端可能会先发送空行的情况
+	for {
 		if err := c.SetReadDeadline(time.Now().Add(timeoutDuration)); err != nil { return }
 		
 		peekBytes, err := reader.Peek(1)
@@ -534,18 +550,25 @@ func handleHttpUpgrade(c net.Conn, sshCfg *ssh.ServerConfig) {
 			_, err := c.Write([]byte("HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\r\n"))
 			if err != nil { return }
 			
-			// 成功后，直接调用核心SSH处理器
-			handleSshConnection(c, reader, sshCfg)
-			return // 处理完毕，退出函数
+			// [修正] 同样修复这里的缓冲区问题，以保持逻辑一致和健壮
+			var finalReader io.Reader
+			if reader.Buffered() > 0 {
+				log.Printf("System: Forwarding %d buffered bytes for %s after HTTP upgrade on port 80.", reader.Buffered(), c.RemoteAddr())
+				preReadData, _ := ioutil.ReadAll(reader)
+				finalReader = io.MultiReader(bytes.NewReader(preReadData), c)
+			} else {
+				finalReader = c
+			}
+
+			handleSshConnection(c, finalReader, sshCfg)
+			return
 		} else {
-			// 对于非法的HTTP请求，直接关闭
 			log.Printf("System: Rejected invalid HTTP request on port 80 from %s (UA: %s)", c.RemoteAddr(), req.UserAgent())
 			c.Write([]byte("HTTP/1.1 400 Bad Request\r\nContent-Type: text/html\r\nConnection: close\r\n\r\nBad Request."))
 			return
 		}
 	}
 }
-
 
 // --- Web服务器逻辑 (无变动) ---
 func authMiddleware(next http.HandlerFunc) http.HandlerFunc {
@@ -706,7 +729,7 @@ func apiHandler(w http.ResponseWriter, r *http.Request) {
 		if r.Method == "POST" {
 			var newSettings Config; json.NewDecoder(r.Body).Decode(&newSettings)
 			globalConfig.lock.Lock()
-			globalConfig.HandshakeTimeout = newSettings.HandshakeTimeout; globalConfig.ConnectUA = newSettings.ConnectUA; globalConfig.BufferSizeKB = newSettings.BufferSizeKB; globalConfig.IdleTimeoutSeconds = newSettings.IdleTimeoutSeconds; globalConfig.TolerantCopyMaxRetries = newSettings.TolerantCopyMaxRetries; globalConfig.TolerantCopyRetryDelayMs = newSettings.TolerantCopyRetryDelayMs; globalConfig.TargetConnectTimeoutSeconds = newSettings.TargetConnectTimeoutSeconds; globalConfig.DefaultExpiryDays = newSettings.DefaultExpiryDays; globalConfig.DefaultLimitGB = newSettings.DefaultLimitGB
+			globalConfig.HandshakeTimeout = newSettings.HandshakeTimeout; globalConfig.ConnectUA = newSettings.ConnectUA; globalConfig.BufferSizeKB = newSettings.BufferSizeKB; globalConfig.IdleTimeoutSeconds = newSettings.IdleTimeoutSeconds; globalConfig.TolerantCopyMaxRetries = newSettings.TolerantCopyMaxRetries; globalConfig.TolerantCopyRetryDelayMs = newSettings.TolerantCopyRetryDelayMs; globalConfig.TargetConnectTimeoutSeconds = newSettings.TargetConnectTimeoutSeconds; global_Config.DefaultExpiryDays = newSettings.DefaultExpiryDays; globalConfig.DefaultLimitGB = newSettings.DefaultLimitGB
 			globalConfig.lock.Unlock()
 			safeSaveConfig()
 			bufferPool = sync.Pool{New: func() interface{} { buf := make([]byte, globalConfig.BufferSizeKB*1024); return &buf }}
