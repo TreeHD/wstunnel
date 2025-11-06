@@ -887,12 +887,6 @@ func main() {
 			if acc.MaxSessions > 0 { if v, ok := userConnectionCount.Load(user); ok { atomic.AddInt32(v.(*int32), -1) } }
 			return nil, fmt.Errorf("invalid credentials")
 		},
-		// +++ 最终的、完整的性能优化配置 +++
-		Config: ssh.Config{
-			Ciphers: []string{
-				"chacha20-poly1305@openssh.com,",
-			},
-		},
 	}
 	_, priv, _ := ed25519.GenerateKey(rand.Reader)
 	key, _ := ssh.NewSignerFromKey(priv)
