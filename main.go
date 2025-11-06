@@ -1,10 +1,9 @@
-// main.go (重构为 charmbracelet/ssh 框架 - 已修正)
+// main.go (最终完整版 - 集成所有功能和修正)
 package main
 
 import (
 	"bufio"
 	"bytes"
-	"context"
 	"crypto/ecdsa"
 	"crypto/ed25519"
 	"crypto/elliptic"
@@ -30,11 +29,17 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/charmbracelet/ssh"
 	"github.com/shirou/gopsutil/v3/cpu"
 	"github.com/shirou/gopsutil/v3/mem"
-	gossh "golang.org/x/crypto/ssh"
+	"golang.org/x/crypto/ssh"
+	// +++ MODIFIED START +++
+	// 1. 导入 goph 库，我们将用它来获取一个已知能工作的默认算法配置
+	"github.com/melbahja/goph"
+	// +++ MODIFIED END +++
 )
+
+// ... (您代码的其他部分，从 AccountInfo 结构体到 apiHandler 函数，完全保持不变) ...
+// ... (为了简洁，我省略了中间这部分代码，您不需要改动它们) ...
 
 // --- 结构体及全局变量 ---
 
@@ -58,6 +63,8 @@ type Config struct {
 	ConnectUA                   string                 `json:"connect_ua,omitempty"`
 	BufferSizeKB                int                    `json:"buffer_size_kb,omitempty"`
 	IdleTimeoutSeconds          int                    `json:"idle_timeout_seconds,omitempty"`
+	TolerantCopyMaxRetries      int                    `json:"tolerant_copy_max_retries,omitempty"`
+	TolerantCopyRetryDelayMs    int                    `json:"tolerant_copy_retry_delay_ms,omitempty"`
 	TargetConnectTimeoutSeconds int                    `json:"target_connect_timeout_seconds,omitempty"`
 	DefaultExpiryDays           int                    `json:"default_expiry_days,omitempty"`
 	DefaultLimitGB              float64                `json:"default_limit_gb,omitempty"`
@@ -73,7 +80,7 @@ type OnlineUser struct {
 	Username    string    `json:"username"`
 	RemoteAddr  string    `json:"remote_addr"`
 	ConnectTime time.Time `json:"connect_time"`
-	sshSession  ssh.Session
+	sshConn     ssh.Conn
 }
 
 var onlineUsers sync.Map
@@ -259,7 +266,6 @@ func generateOrLoadTLSConfig() (*tls.Config, error) {
 
 // --- 核心数据转发逻辑 ---
 
-// handshakeConn 保持不变
 type handshakeConn struct {
 	net.Conn
 	r io.Reader
@@ -267,57 +273,239 @@ type handshakeConn struct {
 
 func (hc *handshakeConn) Read(p []byte) (n int, err error) { return hc.r.Read(p) }
 
+func tolerantCopy(dst io.Writer, src io.Reader, direction string, remoteAddr net.Addr, username string) {
+	bufPtr := bufferPool.Get().(*[]byte)
+	defer bufferPool.Put(bufPtr)
+	buf := *bufPtr
+	maxRetries := globalConfig.TolerantCopyMaxRetries
+	retryDelay := time.Duration(globalConfig.TolerantCopyRetryDelayMs) * time.Millisecond
+	consecutiveTempErrors := 0
+	val, _ := globalTraffic.LoadOrStore(username, &TrafficInfo{})
+	traffic := val.(*TrafficInfo)
+	for {
+		nr, rErr := src.Read(buf)
+		if nr > 0 {
+			if consecutiveTempErrors > 0 {
+				log.Printf("TCP Proxy (%s): Network recovery for %s after %d failed attempts.", direction, remoteAddr, consecutiveTempErrors)
+			}
+			consecutiveTempErrors = 0
+			nw, wErr := dst.Write(buf[0:nr])
+			if nw > 0 {
+				if direction == "Client->Target" {
+					atomic.AddUint64(&traffic.Sent, uint64(nw))
+				} else {
+					atomic.AddUint64(&traffic.Received, uint64(nw))
+				}
+			}
+			if wErr != nil {
+				if wErr != io.EOF {
+					log.Printf("TCP Proxy (%s): Permanent write error for %s: %v", direction, remoteAddr, wErr)
+				}
+				break
+			}
+			if nr != nw {
+				log.Printf("TCP Proxy (%s): Short write for %s, closing", direction, remoteAddr)
+				break
+			}
+		}
+		if rErr != nil {
+			if rErr == io.EOF {
+				break
+			}
+			if netErr, ok := rErr.(net.Error); ok && (netErr.Timeout() || netErr.Temporary()) {
+				consecutiveTempErrors++
+				if consecutiveTempErrors > maxRetries {
+					log.Printf("TCP Proxy (%s): Too many errors for %s, giving up. Last error: %v", direction, remoteAddr, rErr)
+					break
+				}
+				log.Printf("TCP Proxy (%s): Temporary error for %s: %v. Retrying in %v... (Attempt %d/%d)", direction, remoteAddr, rErr, retryDelay, consecutiveTempErrors, maxRetries)
+				time.Sleep(retryDelay)
+				continue
+			}
+			log.Printf("TCP Proxy (%s): Unrecoverable read error for %s: %v", direction, remoteAddr, rErr)
+			break
+		}
+	}
+}
+
+func handleDirectTCPIP(ch ssh.Channel, destHost string, destPort uint32, remoteAddr net.Addr, username string) {
+	var destAddr string
+	if strings.Contains(destHost, ":") {
+		destAddr = fmt.Sprintf("[%s]:%d", destHost, destPort)
+	} else {
+		destAddr = fmt.Sprintf("%s:%d", destHost, destPort)
+	}
+	connectTimeout := time.Duration(globalConfig.TargetConnectTimeoutSeconds) * time.Second
+	destConn, err := net.DialTimeout("tcp", destAddr, connectTimeout)
+	if err != nil {
+		log.Printf("TCP Proxy: Failed to connect to %s for user %s: %v", destAddr, username, err)
+		ch.Close()
+		return
+	}
+	defer destConn.Close()
+	if tcpConn, ok := destConn.(*net.TCPConn); ok {
+		tcpConn.SetNoDelay(true)
+		tcpConn.SetKeepAlive(true)
+		tcpConn.SetKeepAlivePeriod(1 * time.Minute)
+	}
+	var wg sync.WaitGroup
+	wg.Add(2)
+	go func() {
+		defer wg.Done()
+		if tcpConn, ok := destConn.(*net.TCPConn); ok {
+			defer tcpConn.CloseWrite()
+		} else {
+			defer destConn.Close()
+		}
+		tolerantCopy(destConn, ch, "Client->Target", remoteAddr, username)
+	}()
+	go func() {
+		defer wg.Done()
+		defer ch.CloseWrite()
+		tolerantCopy(ch, destConn, "Target->Client", remoteAddr, username)
+	}()
+	wg.Wait()
+}
 
 // --- SSH & HTTP 握手与连接管理 ---
 
-// dispatchConnection 和 handleHttpUpgrade 保持不变
-func dispatchConnection(c net.Conn, server *ssh.Server) {
+func sendKeepAlives(sshConn ssh.Conn, done <-chan struct{}) {
+	ticker := time.NewTicker(30 * time.Second)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ticker.C:
+			_, _, err := sshConn.SendRequest("keepalive@openssh.com", true, nil)
+			if err != nil {
+				return
+			}
+		case <-done:
+			return
+		}
+	}
+}
+
+// 核心SSH处理器
+func handleSshConnection(c net.Conn, r io.Reader, sshCfg *ssh.ServerConfig) {
+	connForSSH := &handshakeConn{Conn: c, r: r}
+	c.SetReadDeadline(time.Now().Add(15 * time.Second))
+	sshConn, chans, reqs, err := ssh.NewServerConn(connForSSH, sshCfg)
+	if err != nil {
+		if err == io.EOF || strings.Contains(err.Error(), "connection reset by peer") {
+			//log.Printf("SSH handshake failed for %s: client closed connection.", c.RemoteAddr())
+		} else {
+			log.Printf("SSH handshake failed for %s: %v", c.RemoteAddr(), err)
+		}
+		return
+	}
+	idleTimeout := time.Duration(globalConfig.IdleTimeoutSeconds) * time.Second
+	if idleTimeout > 0 {
+		c.SetReadDeadline(time.Time{})
+		doneDeadline := make(chan struct{})
+		defer close(doneDeadline)
+		go func() {
+			ticker := time.NewTicker(idleTimeout / 2)
+			defer ticker.Stop()
+			for {
+				select {
+				case <-ticker.C:
+					c.SetReadDeadline(time.Now().Add(idleTimeout))
+				case <-doneDeadline:
+					return
+				}
+			}
+		}()
+	} else {
+		c.SetReadDeadline(time.Time{})
+	}
+	defer sshConn.Close()
+	username := sshConn.User()
+	defer func() {
+		if val, ok := userConnectionCount.Load(username); ok {
+			atomic.AddInt32(val.(*int32), -1)
+		}
+	}()
+	log.Printf("Auth success for user '%s' from %s", username, sshConn.RemoteAddr())
+
+	done := make(chan struct{})
+	defer close(done)
+	go sendKeepAlives(sshConn, done)
+	connID := sshConn.RemoteAddr().String() + "-" + hex.EncodeToString(sshConn.SessionID())
+	onlineUser := &OnlineUser{ConnID: connID, Username: username, RemoteAddr: sshConn.RemoteAddr().String(), ConnectTime: time.Now(), sshConn: sshConn}
+	onlineUsers.Store(onlineUser.ConnID, onlineUser)
+	defer onlineUsers.Delete(onlineUser.ConnID)
+	go ssh.DiscardRequests(reqs)
+	for newChan := range chans {
+		if newChan.ChannelType() != "direct-tcpip" {
+			newChan.Reject(ssh.UnknownChannelType, "unsupported")
+			continue
+		}
+		ch, _, err := newChan.Accept()
+		if err != nil {
+			continue
+		}
+		var payload struct {
+			Host string
+			Port uint32
+		}
+		ssh.Unmarshal(newChan.ExtraData(), &payload)
+		go handleDirectTCPIP(ch, payload.Host, payload.Port, sshConn.RemoteAddr(), username)
+	}
+}
+
+// 443端口的智能分发器
+func dispatchConnection(c net.Conn, sshCfg *ssh.ServerConfig) {
 	defer func() {
 		if r := recover(); r != nil {
 			log.Printf("FATAL: Panic recovered during dispatch for %s: %v", c.RemoteAddr(), r)
 		}
+		c.Close()
 	}()
 
 	tlsConn, ok := c.(*tls.Conn)
 	if !ok {
 		log.Printf("System: Dispatcher expected a TLS connection, but got something else.")
-		c.Close()
 		return
 	}
 
 	if err := tlsConn.Handshake(); err != nil {
-		c.Close()
+		//log.Printf("System: TLS handshake failed for %s: %v", c.RemoteAddr(), err)
 		return
 	}
 
 	sni := tlsConn.ConnectionState().ServerName
 	if !isSNIAllowed(sni) {
 		log.Printf("System: Denied connection from %s due to invalid SNI: '%s'", c.RemoteAddr(), sni)
-		c.Close()
 		return
 	}
 
 	reader := bufio.NewReader(c)
 	peekedBytes, err := reader.Peek(8)
 	if err != nil {
-		c.Close()
+		if err != io.EOF {
+			//log.Printf("System: Protocol sniffing failed for %s: %v", c.RemoteAddr(), err)
+		}
 		return
 	}
 
 	if bytes.HasPrefix(peekedBytes, []byte("SSH-2.0")) {
 		log.Printf("System: Detected direct SSH connection via TLS for %s (SNI: %s)", c.RemoteAddr(), sni)
 		time.Sleep(500 * time.Millisecond)
-		go server.Serve(c)
+		handleSshConnection(c, reader, sshCfg)
 	} else {
 		log.Printf("System: Detected HTTP-based connection via TLS for %s (SNI: %s), attempting Upgrade.", c.RemoteAddr(), sni)
 		
 		timeoutDuration := time.Duration(globalConfig.HandshakeTimeout) * time.Second
 		for {
-			if err := c.SetReadDeadline(time.Now().Add(timeoutDuration)); err != nil { c.Close(); return }
+			if err := c.SetReadDeadline(time.Now().Add(timeoutDuration)); err != nil { return }
 
 			req, err := http.ReadRequest(reader)
 			if err != nil {
-				c.Close()
+				if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
+					log.Printf("System: Timeout waiting for valid HTTP Upgrade on TLS for %s", c.RemoteAddr())
+				} else if err != io.EOF {
+					//log.Printf("System: Failed to read HTTP request from TLS stream for %s: %v", c.RemoteAddr(), err)
+				}
 				return
 			}
 			io.Copy(ioutil.Discard, req.Body)
@@ -325,7 +513,7 @@ func dispatchConnection(c net.Conn, server *ssh.Server) {
 
 			if strings.Contains(req.UserAgent(), globalConfig.ConnectUA) {
 				_, err := c.Write([]byte("HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\r\n"))
-				if err != nil { c.Close(); return }
+				if err != nil { return }
 				break
 			} else {
 				log.Printf("System: Ignored invalid HTTP request via TLS for %s (UA: %s)", c.RemoteAddr(), req.UserAgent())
@@ -335,23 +523,35 @@ func dispatchConnection(c net.Conn, server *ssh.Server) {
 		}
 
 		time.Sleep(500 * time.Millisecond)
-		
-		wrappedConn := &handshakeConn{Conn: c, r: reader}
-		go server.Serve(wrappedConn)
+
+		var finalReader io.Reader
+		if reader.Buffered() > 0 {
+			preReadData, _ := ioutil.ReadAll(reader)
+			finalReader = io.MultiReader(bytes.NewReader(preReadData), c)
+		} else {
+			finalReader = c
+		}
+		handleSshConnection(c, finalReader, sshCfg)
 	}
 }
 
-func handleHttpUpgrade(c net.Conn, server *ssh.Server) {
+// 80端口的HTTP Upgrade处理器
+func handleHttpUpgrade(c net.Conn, sshCfg *ssh.ServerConfig) {
+	defer c.Close()
 	timeoutDuration := time.Duration(globalConfig.HandshakeTimeout) * time.Second
 	expectedUA := globalConfig.ConnectUA
 	reader := bufio.NewReader(c)
 
 	for {
-		if err := c.SetReadDeadline(time.Now().Add(timeoutDuration)); err != nil { c.Close(); return }
+		if err := c.SetReadDeadline(time.Now().Add(timeoutDuration)); err != nil { return }
 		
 		req, err := http.ReadRequest(reader)
 		if err != nil {
-			c.Close()
+			if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
+				log.Printf("System: Timeout waiting for valid HTTP Upgrade on port 80 for %s", c.RemoteAddr())
+			} else if err != io.EOF {
+				//log.Printf("System: Failed to read HTTP request on port 80 for %s: %v", c.RemoteAddr(), err)
+			}
 			return
 		}
 		io.Copy(ioutil.Discard, req.Body)
@@ -359,7 +559,7 @@ func handleHttpUpgrade(c net.Conn, server *ssh.Server) {
 
 		if strings.Contains(req.UserAgent(), expectedUA) {
 			_, err := c.Write([]byte("HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\r\n"))
-			if err != nil { c.Close(); return }
+			if err != nil { return }
 			break
 		} else {
 			log.Printf("System: Ignored invalid HTTP request on port 80 from %s (UA: %s)", c.RemoteAddr(), req.UserAgent())
@@ -370,12 +570,17 @@ func handleHttpUpgrade(c net.Conn, server *ssh.Server) {
 	
 	time.Sleep(500 * time.Millisecond)
 	
-	wrappedConn := &handshakeConn{Conn: c, r: reader}
-	go server.Serve(wrappedConn)
+	var finalReader io.Reader
+	if reader.Buffered() > 0 {
+		preReadData, _ := ioutil.ReadAll(reader)
+		finalReader = io.MultiReader(bytes.NewReader(preReadData), c)
+	} else {
+		finalReader = c
+	}
+	handleSshConnection(c, finalReader, sshCfg)
 }
 
-
-// --- Web服务器逻辑 (保持不变) ---
+// --- Web服务器逻辑 ---
 func authMiddleware(next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		if _, ok := validateSession(r); ok {
@@ -478,13 +683,13 @@ func apiHandler(w http.ResponseWriter, r *http.Request) {
 		acc.Enabled = payload.Enabled
 		globalConfig.Accounts[payload.Username] = acc
 		if !payload.Enabled {
-			var connsToClose []ssh.Session
+			var connsToClose []ssh.Conn
 			onlineUsers.Range(func(_, v interface{}) bool {
 				u := v.(*OnlineUser)
-				if u.Username == payload.Username { connsToClose = append(connsToClose, u.sshSession) }
+				if u.Username == payload.Username { connsToClose = append(connsToClose, u.sshConn) }
 				return true
 			})
-			for _, sess := range connsToClose { sess.Close() }
+			for _, conn := range connsToClose { conn.Close() }
 		}
 		globalConfig.lock.Unlock()
 		safeSaveConfig()
@@ -519,7 +724,7 @@ func apiHandler(w http.ResponseWriter, r *http.Request) {
 		sendJSON(w, http.StatusOK, map[string]string{"message": "账户 " + username + " 删除成功"})
 	case strings.HasPrefix(r.URL.Path, "/api/connections/") && r.Method == "DELETE":
 		connID := strings.TrimPrefix(r.URL.Path, "/api/connections/")
-		if user, ok := onlineUsers.Load(connID); ok { user.(*OnlineUser).sshSession.Close() }
+		if user, ok := onlineUsers.Load(connID); ok { user.(*OnlineUser).sshConn.Close(); sendJSON(w, http.StatusOK, map[string]string{"message": "连接已断开"}) }
 	case r.URL.Path == "/api/admin/update_password" && r.Method == "POST":
 		var payload struct { OldPassword string `json:"oldPassword"`; NewPassword string `json:"newPassword"`}
 		if json.NewDecoder(r.Body).Decode(&payload) != nil { sendJSON(w, http.StatusBadRequest, map[string]string{"message": "无效请求"}); return }
@@ -527,7 +732,7 @@ func apiHandler(w http.ResponseWriter, r *http.Request) {
 		globalConfig.lock.Lock()
 		if globalConfig.AdminAccounts[user] == payload.OldPassword {
 			globalConfig.AdminAccounts[user] = payload.NewPassword
-			global.lock.Unlock(); safeSaveConfig(); sendJSON(w, http.StatusOK, map[string]string{"message": "密码更新成功"})
+			globalConfig.lock.Unlock(); safeSaveConfig(); sendJSON(w, http.StatusOK, map[string]string{"message": "密码更新成功"})
 		} else { globalConfig.lock.Unlock(); sendJSON(w, http.StatusForbidden, map[string]string{"message": "旧密码错误"}) }
 	case r.URL.Path == "/api/settings":
 		if r.Method == "GET" { 
@@ -546,6 +751,8 @@ func apiHandler(w http.ResponseWriter, r *http.Request) {
 			globalConfig.ConnectUA = newSettings.ConnectUA
 			globalConfig.BufferSizeKB = newSettings.BufferSizeKB
 			globalConfig.IdleTimeoutSeconds = newSettings.IdleTimeoutSeconds
+			globalConfig.TolerantCopyMaxRetries = newSettings.TolerantCopyMaxRetries
+			globalConfig.TolerantCopyRetryDelayMs = newSettings.TolerantCopyRetryDelayMs
 			globalConfig.TargetConnectTimeoutSeconds = newSettings.TargetConnectTimeoutSeconds
 			globalConfig.DefaultExpiryDays = newSettings.DefaultExpiryDays
 			globalConfig.DefaultLimitGB = newSettings.DefaultLimitGB
@@ -590,11 +797,13 @@ func main() {
 	if globalConfig.BufferSizeKB <= 0 { globalConfig.BufferSizeKB = 32 }
 	if globalConfig.DefaultExpiryDays <= 0 { globalConfig.DefaultExpiryDays = 30 }
 	if globalConfig.IdleTimeoutSeconds <= 0 { globalConfig.IdleTimeoutSeconds = 120 }
+	if globalConfig.TolerantCopyMaxRetries <= 0 { globalConfig.TolerantCopyMaxRetries = 100 }
+	if globalConfig.TolerantCopyRetryDelayMs <= 0 { globalConfig.TolerantCopyRetryDelayMs = 500 }
 	if globalConfig.TargetConnectTimeoutSeconds <= 0 { globalConfig.TargetConnectTimeoutSeconds = 10 }
     if globalConfig.TrafficSaveIntervalSeconds <= 0 { globalConfig.TrafficSaveIntervalSeconds = 300 }
 
     log.Println("==================================================")
-    log.Println("          WSTunnel Service Starting Up (charmbracelet/ssh)")
+    log.Println("          WSTunnel Service Starting Up")
     log.Println("==================================================")
     log.Printf("  Listen Addr (HTTP Upgrade): %s", globalConfig.ListenAddr)
 	log.Printf("  Listen Addr (TLS Multiplexer): %s  <-- SUPER PORT", globalConfig.ListenTLSAddr)
@@ -607,6 +816,8 @@ func main() {
     log.Printf("  Target Connect Timeout: %d seconds", globalConfig.TargetConnectTimeoutSeconds)
     log.Println("------------------- Performance ------------------")
     log.Printf("  Buffer Size: %d KB", globalConfig.BufferSizeKB)
+    log.Printf("  Network Error Retries: %d times", globalConfig.TolerantCopyMaxRetries)
+    log.Printf("  Retry Delay: %d ms", globalConfig.TolerantCopyRetryDelayMs)
     log.Println("--------------------- Defaults -------------------")
     log.Printf("  New User Default Expiry: %d days", globalConfig.DefaultExpiryDays)
     log.Printf("  New User Default Traffic: %.2f GB", globalConfig.DefaultLimitGB)
@@ -656,90 +867,62 @@ func main() {
 		}
 	}()
 	
-	// --- 新的 charmbracelet/ssh 服务器设置 ---
-	
-	server := &ssh.Server{
-		Version: "SSH-2.0-WSTunnel_Pro",
-
-		PasswordHandler: func(ctx ssh.Context, password string) bool {
-			user := ctx.User()
-			
+	// +++ MODIFIED START +++
+	// 2. 修改 sshCfg 的初始化部分
+	// 我们不再直接初始化 ssh.ServerConfig，而是先获取一个已知能工作的默认配置
+	sshCfg := &ssh.ServerConfig{
+		ServerVersion:    "SSH-2.0-WSTunnel_Pro",
+		PasswordCallback: func(c ssh.ConnMetadata, p []byte) (*ssh.Permissions, error) {
+			// ... 您的认证逻辑保持不变 ...
+			user := c.User()
 			globalConfig.lock.RLock()
 			acc, ok := globalConfig.Accounts[user]
 			globalConfig.lock.RUnlock()
-
-			if !ok || !acc.Enabled {
-				log.Printf("Auth failed for user '%s': not found or disabled", user)
-				return false
-			}
-
+			if !ok || !acc.Enabled { return nil, fmt.Errorf("auth failed") }
 			if acc.ExpiryDate != "" {
 				exp, err := time.Parse("2006-01-02", acc.ExpiryDate)
-				if err != nil || time.Now().After(exp.Add(24*time.Hour)) {
-					log.Printf("Auth failed for user '%s': expired", user)
-					return false
-				}
+				if err != nil || time.Now().After(exp.Add(24*time.Hour)) { return nil, fmt.Errorf("user expired") }
 			}
-
 			if acc.LimitGB > 0 {
 				v, _ := globalTraffic.LoadOrStore(user, &TrafficInfo{})
 				t := v.(*TrafficInfo)
-				if atomic.LoadUint64(&t.Sent)+atomic.LoadUint64(&t.Received) >= uint64(acc.LimitGB*1e9) {
-					log.Printf("Auth failed for user '%s': traffic limit exceeded", user)
-					return false
-				}
+				if atomic.LoadUint64(&t.Sent)+atomic.LoadUint64(&t.Received) >= uint64(acc.LimitGB*1e9) { return nil, fmt.Errorf("traffic limit exceeded") }
 			}
-
 			if acc.MaxSessions > 0 {
 				v, _ := userConnectionCount.LoadOrStore(user, new(int32))
 				countPtr := v.(*int32)
-				if atomic.LoadInt32(countPtr) >= int32(acc.MaxSessions) {
-					log.Printf("Auth failed for user '%s': max sessions exceeded", user)
-					return false
-				}
+				if atomic.LoadInt32(countPtr) >= int32(acc.MaxSessions) { return nil, fmt.Errorf("max sessions exceeded") }
+				atomic.AddInt32(countPtr, 1)
 			}
-
-			if password == acc.Password {
-				return true
-			}
-
-			log.Printf("Auth failed for user '%s': invalid credentials", user)
-			return false
-		},
-
-		Handler: func(s ssh.Session) {
-			user := s.User()
-			connID := s.Context().SessionID()
-
-			if val, ok := userConnectionCount.Load(user); ok {
-				atomic.AddInt32(val.(*int32), 1)
-			}
-			onlineUser := &OnlineUser{ConnID: connID, Username: user, RemoteAddr: s.RemoteAddr().String(), ConnectTime: time.Now(), sshSession: s}
-			onlineUsers.Store(onlineUser.ConnID, onlineUser)
-			log.Printf("Auth success for user '%s' from %s", user, s.RemoteAddr())
-
-			defer func() {
-				if val, ok := userConnectionCount.Load(user); ok {
-					atomic.AddInt32(val.(*int32), -1)
-				}
-				onlineUsers.Delete(onlineUser.ConnID)
-				log.Printf("Session closed for user '%s' from %s", user, s.RemoteAddr())
-			}()
-			
-			<-s.Context().Done()
-		},
-		
-		ChannelHandlers: map[string]ssh.ChannelHandler{
-			"session":      ssh.DefaultSessionHandler,
-			"direct-tcpip": ssh.DirectTCPIPHandler,
+			if string(p) == acc.Password { return nil, nil }
+			if acc.MaxSessions > 0 { if v, ok := userConnectionCount.Load(user); ok { atomic.AddInt32(v.(*int32), -1) } }
+			return nil, fmt.Errorf("invalid credentials")
 		},
 	}
 	
-	_, priv, _ := ed25519.GenerateKey(rand.Reader)
-	signer, _ := gossh.NewSignerFromKey(priv)
-	server.AddHostKey(signer)
+	// 借用 goph 库来获取一个完整的、默认的 ssh.Config
+	// 这可以避免我们手动配置不完整导致的Bug
+	defaultConfig := goph.DefaultConfig()
+	sshCfg.Config = *defaultConfig
+
+	// 现在，我们在这个已知能工作的默认配置上，进行“微创手术”
+	// 我们只调整加密算法(Ciphers)的顺序，把 chacha20 提到最前面
+	var newCiphers []string
+	newCiphers = append(newCiphers, "chacha20-poly1305@openssh.com")
 	
-	// --- 启动监听器 ---
+	// 把默认列表里除了 chacha20 之外的其他算法，都追加到新列表后面
+	for _, cipher := range sshCfg.Config.Ciphers {
+		if cipher != "chacha20-poly1305@openssh.com" {
+			newCiphers = append(newCiphers, cipher)
+		}
+	}
+	// 将调整好顺序的新列表，赋值回去
+	sshCfg.Config.Ciphers = newCiphers
+	// +++ MODIFIED END +++
+
+	_, priv, _ := ed25519.GenerateKey(rand.Reader)
+	key, _ := ssh.NewSignerFromKey(priv)
+	sshCfg.AddHostKey(key)
 
 	// 普通TCP监听器 (HTTP Upgrade)
 	sshListener, err := net.Listen("tcp", globalConfig.ListenAddr)
@@ -756,7 +939,7 @@ func main() {
 				log.Printf("System: SSH listener (HTTP Upgrade) stopped. %v", err)
 				return
 			}
-			go handleHttpUpgrade(conn, server)
+			go handleHttpUpgrade(conn, sshCfg)
 		}
 	}()
 
@@ -779,7 +962,7 @@ func main() {
 				log.Printf("System: Super TLS listener stopped. %v", err)
 				return
 			}
-			go dispatchConnection(conn, server)
+			go dispatchConnection(conn, sshCfg)
 		}
 	}()
 
@@ -791,13 +974,9 @@ func main() {
 	log.Println("         WSTunnel Service Shutting Down...")
 	log.Println("==================================================")
 
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
-	if err := server.Shutdown(ctx); err != nil { log.Printf("System: Error closing SSH server: %v", err) } else { log.Println("System: SSH server gracefully shut down.")}
-
 	if err := adminServer.Close(); err != nil { log.Printf("System: Error closing admin panel: %v", err) } else { log.Println("System: Admin panel gracefully shut down.") }
-	if err := sshListener.Close(); err != nil { log.Printf("System: Error closing SSH listener (HTTP Upgrade): %v", err) }
-	if err := tlsListener.Close(); err != nil { log.Printf("System: Error closing SSH listener (TLS): %v", err) }
+	if err := sshListener.Close(); err != nil { log.Printf("System: Error closing SSH listener (HTTP Upgrade): %v", err) } else { log.Println("System: SSH listener (HTTP Upgrade) gracefully shut down.") }
+	if err := tlsListener.Close(); err != nil { log.Printf("System: Error closing SSH listener (TLS): %v", err) } else { log.Println("System: SSH listener (TLS) gracefully shut down.") }
 	
 	log.Println("System: Performing final traffic data save...")
 	if err := saveTrafficData(); err != nil { log.Printf("System: Error during final traffic data save: %v", err) }
