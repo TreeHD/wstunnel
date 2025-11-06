@@ -1,4 +1,4 @@
-// main.go (重构为 charmbracelet/ssh 框架 - 已修正编译错误)
+// main.go (重构为 charmbracelet/ssh 框架 - 已修正)
 package main
 
 import (
@@ -31,13 +31,12 @@ import (
 	"time"
 
 	"github.com/charmbracelet/ssh"
-	"github.com/charmbracelet/wish"
 	"github.com/shirou/gopsutil/v3/cpu"
 	"github.com/shirou/gopsutil/v3/mem"
 	gossh "golang.org/x/crypto/ssh"
 )
 
-// --- 结构体及全局变量 (保持不变) ---
+// --- 结构体及全局变量 ---
 
 type AccountInfo struct {
 	Password     string  `json:"password"`
@@ -63,7 +62,7 @@ type Config struct {
 	DefaultExpiryDays           int                    `json:"default_expiry_days,omitempty"`
 	DefaultLimitGB              float64                `json:"default_limit_gb,omitempty"`
 	TrafficSaveIntervalSeconds  int                    `json:"traffic_save_interval_seconds,omitempty"`
-	lock                        sync.RWMex
+	lock                        sync.RWMutex
 }
 
 var globalConfig *Config
@@ -125,7 +124,7 @@ var sessions = make(map[string]Session)
 var sessionsLock sync.RWMutex
 var bufferPool sync.Pool
 
-// --- 辅助函数 (大部分保持不变) ---
+// --- 辅助函数 ---
 
 func createSession(username string) *http.Cookie {
 	sessionTokenBytes := make([]byte, 32)
@@ -258,9 +257,9 @@ func generateOrLoadTLSConfig() (*tls.Config, error) {
 	return &tls.Config{Certificates: []tls.Certificate{cert}, MinVersion: tls.VersionTLS12}, nil
 }
 
-// --- 核心数据转发逻辑 (重构) ---
+// --- 核心数据转发逻辑 ---
 
-// handshakeConn 保持不变，用于处理HTTP Upgrade后的连接
+// handshakeConn 保持不变
 type handshakeConn struct {
 	net.Conn
 	r io.Reader
@@ -268,93 +267,15 @@ type handshakeConn struct {
 
 func (hc *handshakeConn) Read(p []byte) (n int, err error) { return hc.r.Read(p) }
 
-// countingReader 是一个辅助类型，用于在io.Copy时统计流量
-type countingReader struct {
-	io.Reader
-	counter *uint64
-}
 
-func (r *countingReader) Read(p []byte) (n int, err error) {
-	n, err = r.Reader.Read(p)
-	atomic.AddUint64(r.counter, uint64(n))
-	return
-}
-
-// proxyData 是新的、更高效的数据转发函数
-func proxyData(dst io.Writer, src io.Reader, trafficCounter *uint64) {
-	bufPtr := bufferPool.Get().(*[]byte)
-	defer bufferPool.Put(bufPtr)
-	
-	readerWithCounter := &countingReader{Reader: src, counter: trafficCounter}
-	io.CopyBuffer(dst, readerWithCounter, *bufPtr)
-}
-
-// directTCPIPHandler 是新的处理 direct-tcpip 请求的函数
-func directTCPIPHandler(srv *ssh.Server, conn *gossh.ServerConn, newChan gossh.NewChannel, ctx ssh.Context) {
-	var payload struct {
-		Host string
-		Port uint32
-	}
-	if err := gossh.Unmarshal(newChan.ExtraData(), &payload); err != nil {
-		log.Printf("TCP Proxy: Failed to parse direct-tcpip payload: %v", err)
-		newChan.Reject(gossh.ConnectionFailed, "failed to parse payload")
-		return
-	}
-
-	destAddr := net.JoinHostPort(payload.Host, fmt.Sprintf("%d", payload.Port))
-	username := conn.User()
-
-	ch, reqs, err := newChan.Accept()
-	if err != nil {
-		log.Printf("TCP Proxy: Failed to accept channel for %s: %v", username, err)
-		return
-	}
-	go gossh.DiscardRequests(reqs)
-	defer ch.Close()
-
-	connectTimeout := time.Duration(globalConfig.TargetConnectTimeoutSeconds) * time.Second
-	destConn, err := net.DialTimeout("tcp", destAddr, connectTimeout)
-	if err != nil {
-		log.Printf("TCP Proxy: Failed to connect to %s for user %s: %v", destAddr, username, err)
-		return
-	}
-	defer destConn.Close()
-
-	val, _ := globalTraffic.LoadOrStore(username, &TrafficInfo{})
-	traffic := val.(*TrafficInfo)
-
-	var wg sync.WaitGroup
-	wg.Add(2)
-
-	go func() {
-		defer wg.Done()
-		proxyData(destConn, ch, &traffic.Sent)
-	}()
-	go func() {
-		defer wg.Done()
-		// 当另一方关闭连接时，确保本方也关闭写
-		if tcpConn, ok := destConn.(interface{ CloseWrite() error }); ok {
-			tcpConn.CloseWrite()
-		}
-		proxyData(ch, destConn, &traffic.Received)
-	}()
-
-	wg.Wait()
-}
-
-
-// --- SSH & HTTP 握手与连接管理 (外部逻辑保持不变) ---
+// --- SSH & HTTP 握手与连接管理 ---
 
 // dispatchConnection 和 handleHttpUpgrade 保持不变
-// 它们是外部的“剥壳”逻辑，最后将连接交给新的SSH框架处理
-
-// 443端口的智能分发器
 func dispatchConnection(c net.Conn, server *ssh.Server) {
 	defer func() {
 		if r := recover(); r != nil {
 			log.Printf("FATAL: Panic recovered during dispatch for %s: %v", c.RemoteAddr(), r)
 		}
-		// Close() is handled by server.Handle()
 	}()
 
 	tlsConn, ok := c.(*tls.Conn)
@@ -386,7 +307,7 @@ func dispatchConnection(c net.Conn, server *ssh.Server) {
 	if bytes.HasPrefix(peekedBytes, []byte("SSH-2.0")) {
 		log.Printf("System: Detected direct SSH connection via TLS for %s (SNI: %s)", c.RemoteAddr(), sni)
 		time.Sleep(500 * time.Millisecond)
-		server.Handle(c) // 交给 charm/ssh 框架处理
+		go server.Serve(c)
 	} else {
 		log.Printf("System: Detected HTTP-based connection via TLS for %s (SNI: %s), attempting Upgrade.", c.RemoteAddr(), sni)
 		
@@ -416,13 +337,11 @@ func dispatchConnection(c net.Conn, server *ssh.Server) {
 		time.Sleep(500 * time.Millisecond)
 		
 		wrappedConn := &handshakeConn{Conn: c, r: reader}
-		server.Handle(wrappedConn) // 交给 charm/ssh 框架处理
+		go server.Serve(wrappedConn)
 	}
 }
 
-// 80端口的HTTP Upgrade处理器
 func handleHttpUpgrade(c net.Conn, server *ssh.Server) {
-	// defer c.Close() is handled by server.Handle()
 	timeoutDuration := time.Duration(globalConfig.HandshakeTimeout) * time.Second
 	expectedUA := globalConfig.ConnectUA
 	reader := bufio.NewReader(c)
@@ -452,7 +371,7 @@ func handleHttpUpgrade(c net.Conn, server *ssh.Server) {
 	time.Sleep(500 * time.Millisecond)
 	
 	wrappedConn := &handshakeConn{Conn: c, r: reader}
-	server.Handle(wrappedConn) // 交给 charm/ssh 框架处理
+	go server.Serve(wrappedConn)
 }
 
 
@@ -608,7 +527,7 @@ func apiHandler(w http.ResponseWriter, r *http.Request) {
 		globalConfig.lock.Lock()
 		if globalConfig.AdminAccounts[user] == payload.OldPassword {
 			globalConfig.AdminAccounts[user] = payload.NewPassword
-			globalConfig.lock.Unlock(); safeSaveConfig(); sendJSON(w, http.StatusOK, map[string]string{"message": "密码更新成功"})
+			global.lock.Unlock(); safeSaveConfig(); sendJSON(w, http.StatusOK, map[string]string{"message": "密码更新成功"})
 		} else { globalConfig.lock.Unlock(); sendJSON(w, http.StatusForbidden, map[string]string{"message": "旧密码错误"}) }
 	case r.URL.Path == "/api/settings":
 		if r.Method == "GET" { 
@@ -627,11 +546,10 @@ func apiHandler(w http.ResponseWriter, r *http.Request) {
 			globalConfig.ConnectUA = newSettings.ConnectUA
 			globalConfig.BufferSizeKB = newSettings.BufferSizeKB
 			globalConfig.IdleTimeoutSeconds = newSettings.IdleTimeoutSeconds
-			// TolerantCopy settings are no longer used
 			globalConfig.TargetConnectTimeoutSeconds = newSettings.TargetConnectTimeoutSeconds
 			globalConfig.DefaultExpiryDays = newSettings.DefaultExpiryDays
 			globalConfig.DefaultLimitGB = newSettings.DefaultLimitGB
-			global.AllowedSNI = newSettings.AllowedSNI
+			globalConfig.AllowedSNI = newSettings.AllowedSNI
 			globalConfig.lock.Unlock()
 			if err := safeSaveConfig(); err != nil {
 				sendJSON(w, http.StatusInternalServerError, map[string]string{"message": "保存配置失败: " + err.Error()})
@@ -740,11 +658,9 @@ func main() {
 	
 	// --- 新的 charmbracelet/ssh 服务器设置 ---
 	
-	// 创建一个新的 ssh.Server 实例
 	server := &ssh.Server{
 		Version: "SSH-2.0-WSTunnel_Pro",
 
-		// 认证和前置检查
 		PasswordHandler: func(ctx ssh.Context, password string) bool {
 			user := ctx.User()
 			
@@ -791,16 +707,8 @@ func main() {
 			return false
 		},
 
-		// 连接生命周期 (上线/下线)
-		ConnectionFailedCallback: func(conn net.Conn, err error) {
-			// This callback is for pre-handshake errors
-		},
-
-		// 默认会话处理器
 		Handler: func(s ssh.Session) {
-			// 用户上线逻辑
 			user := s.User()
-			// charm/ssh has its own unique session ID, so we use it directly
 			connID := s.Context().SessionID()
 
 			if val, ok := userConnectionCount.Load(user); ok {
@@ -810,7 +718,6 @@ func main() {
 			onlineUsers.Store(onlineUser.ConnID, onlineUser)
 			log.Printf("Auth success for user '%s' from %s", user, s.RemoteAddr())
 
-			// 用户下线逻辑
 			defer func() {
 				if val, ok := userConnectionCount.Load(user); ok {
 					atomic.AddInt32(val.(*int32), -1)
@@ -819,28 +726,20 @@ func main() {
 				log.Printf("Session closed for user '%s' from %s", user, s.RemoteAddr())
 			}()
 			
-			// 保持会话打开，直到客户端关闭
 			<-s.Context().Done()
 		},
-
-		// 端口转发处理器
-		ReversePortForwardingCallback: ssh.ReversePortForwardingCallback(func(ctx ssh.Context, host string, port uint32) bool {
-			// We can disable this for now if not needed
-			return false
-		}),
 		
 		ChannelHandlers: map[string]ssh.ChannelHandler{
-			"direct-tcpip": ssh.DirectTCPIPHandler, // Use the built-in handler
 			"session":      ssh.DefaultSessionHandler,
+			"direct-tcpip": ssh.DirectTCPIPHandler,
 		},
 	}
 	
-	// 设置主机密钥
 	_, priv, _ := ed25519.GenerateKey(rand.Reader)
 	signer, _ := gossh.NewSignerFromKey(priv)
 	server.AddHostKey(signer)
-
-	// --- 启动监听器 (和旧代码逻辑一样) ---
+	
+	// --- 启动监听器 ---
 
 	// 普通TCP监听器 (HTTP Upgrade)
 	sshListener, err := net.Listen("tcp", globalConfig.ListenAddr)
@@ -892,7 +791,6 @@ func main() {
 	log.Println("         WSTunnel Service Shutting Down...")
 	log.Println("==================================================")
 
-	// 优雅关闭
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	if err := server.Shutdown(ctx); err != nil { log.Printf("System: Error closing SSH server: %v", err) } else { log.Println("System: SSH server gracefully shut down.")}
