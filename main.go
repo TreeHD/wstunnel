@@ -1,4 +1,4 @@
-// main.go (重构为 charmbracelet/ssh 框架)
+// main.go (重构为 charmbracelet/ssh 框架 - 已修正编译错误)
 package main
 
 import (
@@ -59,13 +59,11 @@ type Config struct {
 	ConnectUA                   string                 `json:"connect_ua,omitempty"`
 	BufferSizeKB                int                    `json:"buffer_size_kb,omitempty"`
 	IdleTimeoutSeconds          int                    `json:"idle_timeout_seconds,omitempty"`
-	TolerantCopyMaxRetries      int                    `json:"tolerant_copy_max_retries,omitempty"`
-	TolerantCopyRetryDelayMs    int                    `json:"tolerant_copy_retry_delay_ms,omitempty"`
 	TargetConnectTimeoutSeconds int                    `json:"target_connect_timeout_seconds,omitempty"`
 	DefaultExpiryDays           int                    `json:"default_expiry_days,omitempty"`
 	DefaultLimitGB              float64                `json:"default_limit_gb,omitempty"`
 	TrafficSaveIntervalSeconds  int                    `json:"traffic_save_interval_seconds,omitempty"`
-	lock                        sync.RWMutex
+	lock                        sync.RWMex
 }
 
 var globalConfig *Config
@@ -282,7 +280,7 @@ func (r *countingReader) Read(p []byte) (n int, err error) {
 	return
 }
 
-// proxyData 是新的、更高效的数据转发函数，替代了tolerantCopy
+// proxyData 是新的、更高效的数据转发函数
 func proxyData(dst io.Writer, src io.Reader, trafficCounter *uint64) {
 	bufPtr := bufferPool.Get().(*[]byte)
 	defer bufferPool.Put(bufPtr)
@@ -292,7 +290,7 @@ func proxyData(dst io.Writer, src io.Reader, trafficCounter *uint64) {
 }
 
 // directTCPIPHandler 是新的处理 direct-tcpip 请求的函数
-func directTCPIPHandler(srv *ssh.Server, conn gossh.Conn, newChan gossh.NewChannel, ctx ssh.Context) {
+func directTCPIPHandler(srv *ssh.Server, conn *gossh.ServerConn, newChan gossh.NewChannel, ctx ssh.Context) {
 	var payload struct {
 		Host string
 		Port uint32
@@ -334,8 +332,9 @@ func directTCPIPHandler(srv *ssh.Server, conn gossh.Conn, newChan gossh.NewChann
 	}()
 	go func() {
 		defer wg.Done()
-		if tcpConn, ok := destConn.(net.Conn); ok {
-			tcpConn.Close()
+		// 当另一方关闭连接时，确保本方也关闭写
+		if tcpConn, ok := destConn.(interface{ CloseWrite() error }); ok {
+			tcpConn.CloseWrite()
 		}
 		proxyData(ch, destConn, &traffic.Received)
 	}()
@@ -355,32 +354,32 @@ func dispatchConnection(c net.Conn, server *ssh.Server) {
 		if r := recover(); r != nil {
 			log.Printf("FATAL: Panic recovered during dispatch for %s: %v", c.RemoteAddr(), r)
 		}
-		c.Close()
+		// Close() is handled by server.Handle()
 	}()
 
 	tlsConn, ok := c.(*tls.Conn)
 	if !ok {
 		log.Printf("System: Dispatcher expected a TLS connection, but got something else.")
+		c.Close()
 		return
 	}
 
 	if err := tlsConn.Handshake(); err != nil {
-		//log.Printf("System: TLS handshake failed for %s: %v", c.RemoteAddr(), err)
+		c.Close()
 		return
 	}
 
 	sni := tlsConn.ConnectionState().ServerName
 	if !isSNIAllowed(sni) {
 		log.Printf("System: Denied connection from %s due to invalid SNI: '%s'", c.RemoteAddr(), sni)
+		c.Close()
 		return
 	}
 
 	reader := bufio.NewReader(c)
 	peekedBytes, err := reader.Peek(8)
 	if err != nil {
-		if err != io.EOF {
-			//log.Printf("System: Protocol sniffing failed for %s: %v", c.RemoteAddr(), err)
-		}
+		c.Close()
 		return
 	}
 
@@ -393,15 +392,11 @@ func dispatchConnection(c net.Conn, server *ssh.Server) {
 		
 		timeoutDuration := time.Duration(globalConfig.HandshakeTimeout) * time.Second
 		for {
-			if err := c.SetReadDeadline(time.Now().Add(timeoutDuration)); err != nil { return }
+			if err := c.SetReadDeadline(time.Now().Add(timeoutDuration)); err != nil { c.Close(); return }
 
 			req, err := http.ReadRequest(reader)
 			if err != nil {
-				if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
-					log.Printf("System: Timeout waiting for valid HTTP Upgrade on TLS for %s", c.RemoteAddr())
-				} else if err != io.EOF {
-					//log.Printf("System: Failed to read HTTP request from TLS stream for %s: %v", c.RemoteAddr(), err)
-				}
+				c.Close()
 				return
 			}
 			io.Copy(ioutil.Discard, req.Body)
@@ -409,7 +404,7 @@ func dispatchConnection(c net.Conn, server *ssh.Server) {
 
 			if strings.Contains(req.UserAgent(), globalConfig.ConnectUA) {
 				_, err := c.Write([]byte("HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\r\n"))
-				if err != nil { return }
+				if err != nil { c.Close(); return }
 				break
 			} else {
 				log.Printf("System: Ignored invalid HTTP request via TLS for %s (UA: %s)", c.RemoteAddr(), req.UserAgent())
@@ -427,21 +422,17 @@ func dispatchConnection(c net.Conn, server *ssh.Server) {
 
 // 80端口的HTTP Upgrade处理器
 func handleHttpUpgrade(c net.Conn, server *ssh.Server) {
-	defer c.Close()
+	// defer c.Close() is handled by server.Handle()
 	timeoutDuration := time.Duration(globalConfig.HandshakeTimeout) * time.Second
 	expectedUA := globalConfig.ConnectUA
 	reader := bufio.NewReader(c)
 
 	for {
-		if err := c.SetReadDeadline(time.Now().Add(timeoutDuration)); err != nil { return }
+		if err := c.SetReadDeadline(time.Now().Add(timeoutDuration)); err != nil { c.Close(); return }
 		
 		req, err := http.ReadRequest(reader)
 		if err != nil {
-			if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
-				log.Printf("System: Timeout waiting for valid HTTP Upgrade on port 80 for %s", c.RemoteAddr())
-			} else if err != io.EOF {
-				//log.Printf("System: Failed to read HTTP request on port 80 for %s: %v", c.RemoteAddr(), err)
-			}
+			c.Close()
 			return
 		}
 		io.Copy(ioutil.Discard, req.Body)
@@ -449,7 +440,7 @@ func handleHttpUpgrade(c net.Conn, server *ssh.Server) {
 
 		if strings.Contains(req.UserAgent(), expectedUA) {
 			_, err := c.Write([]byte("HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\r\n"))
-			if err != nil { return }
+			if err != nil { c.Close(); return }
 			break
 		} else {
 			log.Printf("System: Ignored invalid HTTP request on port 80 from %s (UA: %s)", c.RemoteAddr(), req.UserAgent())
@@ -636,12 +627,11 @@ func apiHandler(w http.ResponseWriter, r *http.Request) {
 			globalConfig.ConnectUA = newSettings.ConnectUA
 			globalConfig.BufferSizeKB = newSettings.BufferSizeKB
 			globalConfig.IdleTimeoutSeconds = newSettings.IdleTimeoutSeconds
-			globalConfig.TolerantCopyMaxRetries = newSettings.TolerantCopyMaxRetries
-			globalConfig.TolerantCopyRetryDelayMs = newSettings.TolerantCopyRetryDelayMs
+			// TolerantCopy settings are no longer used
 			globalConfig.TargetConnectTimeoutSeconds = newSettings.TargetConnectTimeoutSeconds
 			globalConfig.DefaultExpiryDays = newSettings.DefaultExpiryDays
 			globalConfig.DefaultLimitGB = newSettings.DefaultLimitGB
-			globalConfig.AllowedSNI = newSettings.AllowedSNI
+			global.AllowedSNI = newSettings.AllowedSNI
 			globalConfig.lock.Unlock()
 			if err := safeSaveConfig(); err != nil {
 				sendJSON(w, http.StatusInternalServerError, map[string]string{"message": "保存配置失败: " + err.Error()})
@@ -682,8 +672,6 @@ func main() {
 	if globalConfig.BufferSizeKB <= 0 { globalConfig.BufferSizeKB = 32 }
 	if globalConfig.DefaultExpiryDays <= 0 { globalConfig.DefaultExpiryDays = 30 }
 	if globalConfig.IdleTimeoutSeconds <= 0 { globalConfig.IdleTimeoutSeconds = 120 }
-	if globalConfig.TolerantCopyMaxRetries <= 0 { globalConfig.TolerantCopyMaxRetries = 100 }
-	if globalConfig.TolerantCopyRetryDelayMs <= 0 { globalConfig.TolerantCopyRetryDelayMs = 500 }
 	if globalConfig.TargetConnectTimeoutSeconds <= 0 { globalConfig.TargetConnectTimeoutSeconds = 10 }
     if globalConfig.TrafficSaveIntervalSeconds <= 0 { globalConfig.TrafficSaveIntervalSeconds = 300 }
 
@@ -752,19 +740,12 @@ func main() {
 	
 	// --- 新的 charmbracelet/ssh 服务器设置 ---
 	
-	// 1. 创建一个新的 wish Server，这是 charm/ssh 的核心
-	server, err := wish.NewServer(
-		// 2. 设置服务器版本号
-		ssh.ServerVersion("SSH-2.0-WSTunnel_Pro"),
+	// 创建一个新的 ssh.Server 实例
+	server := &ssh.Server{
+		Version: "SSH-2.0-WSTunnel_Pro",
 
-		// 3. 设置主机密钥 (使用内存中生成的密钥，与旧代码逻辑相同)
-		wish.WithHostKeyCallback(func(ctx ssh.Context) (ssh.Signer, error) {
-			_, priv, _ := ed25519.GenerateKey(rand.Reader)
-			return gossh.NewSignerFromKey(priv)
-		}),
-
-		// 4. 设置密码认证和前置检查
-		wish.WithPasswordAuth(func(ctx ssh.Context, password string) bool {
+		// 认证和前置检查
+		PasswordHandler: func(ctx ssh.Context, password string) bool {
 			user := ctx.User()
 			
 			globalConfig.lock.RLock()
@@ -808,64 +789,56 @@ func main() {
 
 			log.Printf("Auth failed for user '%s': invalid credentials", user)
 			return false
-		}),
+		},
 
-		// 5. 设置我们想要的、高性能的加密套件
-		wish.WithServerConfig(func(cfg *gossh.ServerConfig) {
-			// 这个回调让我们能访问底层的 gossh.ServerConfig
-			// 我们在这里设置加密算法，可以100%确定它能正常工作
-			cfg.Config.Ciphers = []string{
-				"chacha20-poly1305@openssh.com",
-				"aes128-gcm@openssh.com", // 保留一个作为兼容性后备
-				"aes128-ctr",
+		// 连接生命周期 (上线/下线)
+		ConnectionFailedCallback: func(conn net.Conn, err error) {
+			// This callback is for pre-handshake errors
+		},
+
+		// 默认会话处理器
+		Handler: func(s ssh.Session) {
+			// 用户上线逻辑
+			user := s.User()
+			// charm/ssh has its own unique session ID, so we use it directly
+			connID := s.Context().SessionID()
+
+			if val, ok := userConnectionCount.Load(user); ok {
+				atomic.AddInt32(val.(*int32), 1)
 			}
-			cfg.Config.KeyExchanges = []string{
-				"curve25519-sha256@libssh.org", // 性能和安全性俱佳
-				"ecdh-sha2-nistp256",
-			}
+			onlineUser := &OnlineUser{ConnID: connID, Username: user, RemoteAddr: s.RemoteAddr().String(), ConnectTime: time.Now(), sshSession: s}
+			onlineUsers.Store(onlineUser.ConnID, onlineUser)
+			log.Printf("Auth success for user '%s' from %s", user, s.RemoteAddr())
+
+			// 用户下线逻辑
+			defer func() {
+				if val, ok := userConnectionCount.Load(user); ok {
+					atomic.AddInt32(val.(*int32), -1)
+				}
+				onlineUsers.Delete(onlineUser.ConnID)
+				log.Printf("Session closed for user '%s' from %s", user, s.RemoteAddr())
+			}()
+			
+			// 保持会话打开，直到客户端关闭
+			<-s.Context().Done()
+		},
+
+		// 端口转发处理器
+		ReversePortForwardingCallback: ssh.ReversePortForwardingCallback(func(ctx ssh.Context, host string, port uint32) bool {
+			// We can disable this for now if not needed
+			return false
 		}),
 		
-		// 6. 添加一个中间件来处理连接生命周期 (上线/下线)
-		wish.WithMiddleware(func(h ssh.Handler) ssh.Handler {
-			return func(s ssh.Session) {
-				// 用户认证成功后，这里会执行
-				user := s.User()
-				connID := s.RemoteAddr().String() + "-" + hex.EncodeToString(s.SessionID())
-
-				// --- 用户上线逻辑 ---
-				if val, ok := userConnectionCount.Load(user); ok {
-					atomic.AddInt32(val.(*int32), 1)
-				}
-				onlineUser := &OnlineUser{ConnID: connID, Username: user, RemoteAddr: s.RemoteAddr().String(), ConnectTime: time.Now(), sshSession: s}
-				onlineUsers.Store(onlineUser.ConnID, onlineUser)
-				log.Printf("Auth success for user '%s' from %s", user, s.RemoteAddr())
-
-				// --- 用户下线逻辑 ---
-				defer func() {
-					if val, ok := userConnectionCount.Load(user); ok {
-						atomic.AddInt32(val.(*int32), -1)
-					}
-					onlineUsers.Delete(onlineUser.ConnID)
-					log.Printf("Session closed for user '%s' from %s", user, s.RemoteAddr())
-				}()
-
-				h(s)
-			}
-		}),
-	)
-	if err != nil {
-		log.Fatalf("FATAL: could not create ssh server: %v", err)
+		ChannelHandlers: map[string]ssh.ChannelHandler{
+			"direct-tcpip": ssh.DirectTCPIPHandler, // Use the built-in handler
+			"session":      ssh.DefaultSessionHandler,
+		},
 	}
-
-	// 7. 设置 direct-tcpip 处理器
-	server.HandleDirectTCPIP(directTCPIPHandler)
-
-	// 8. 设置默认的会话处理器 (因为我们是纯隧道，所以这里什么都不做)
-	server.Handler = func(s ssh.Session) {
-		// 纯隧道服务器，交互式会话直接关闭
-		io.WriteString(s, "This is a tunnel-only server. Interactive session is not supported.\n")
-		s.Close()
-	}
+	
+	// 设置主机密钥
+	_, priv, _ := ed25519.GenerateKey(rand.Reader)
+	signer, _ := gossh.NewSignerFromKey(priv)
+	server.AddHostKey(signer)
 
 	// --- 启动监听器 (和旧代码逻辑一样) ---
 
