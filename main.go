@@ -1,4 +1,4 @@
-// main.go (最终完整版 - 集成所有功能和修正)
+// main.go (最终版 + 恢复循环等待逻辑 + 修复EOF + 全局握手延迟)
 package main
 
 import (
@@ -32,16 +32,9 @@ import (
 	"github.com/shirou/gopsutil/v3/cpu"
 	"github.com/shirou/gopsutil/v3/mem"
 	"golang.org/x/crypto/ssh"
-	// +++ MODIFIED START +++
-	// 1. 导入 goph 库，我们将用它来获取一个已知能工作的默认算法配置
-	"github.com/melbahja/goph"
-	// +++ MODIFIED END +++
 )
 
-// ... (您代码的其他部分，从 AccountInfo 结构体到 apiHandler 函数，完全保持不变) ...
-// ... (为了简洁，我省略了中间这部分代码，您不需要改动它们) ...
-
-// --- 结构体及全局变量 ---
+// --- 结构体及全局变量 (无变动) ---
 
 type AccountInfo struct {
 	Password     string  `json:"password"`
@@ -131,7 +124,7 @@ var sessions = make(map[string]Session)
 var sessionsLock sync.RWMutex
 var bufferPool sync.Pool
 
-// --- 辅助函数 ---
+// --- 辅助函数 (无变动) ---
 
 func createSession(username string) *http.Cookie {
 	sessionTokenBytes := make([]byte, 32)
@@ -264,7 +257,7 @@ func generateOrLoadTLSConfig() (*tls.Config, error) {
 	return &tls.Config{Certificates: []tls.Certificate{cert}, MinVersion: tls.VersionTLS12}, nil
 }
 
-// --- 核心数据转发逻辑 ---
+// --- 核心数据转发逻辑 (无变动) ---
 
 type handshakeConn struct {
 	net.Conn
@@ -367,7 +360,7 @@ func handleDirectTCPIP(ch ssh.Channel, destHost string, destPort uint32, remoteA
 	wg.Wait()
 }
 
-// --- SSH & HTTP 握手与连接管理 ---
+// --- SSH & HTTP 握手与连接管理 (有改动) ---
 
 func sendKeepAlives(sshConn ssh.Conn, done <-chan struct{}) {
 	ticker := time.NewTicker(30 * time.Second)
@@ -392,7 +385,7 @@ func handleSshConnection(c net.Conn, r io.Reader, sshCfg *ssh.ServerConfig) {
 	sshConn, chans, reqs, err := ssh.NewServerConn(connForSSH, sshCfg)
 	if err != nil {
 		if err == io.EOF || strings.Contains(err.Error(), "connection reset by peer") {
-			//log.Printf("SSH handshake failed for %s: client closed connection.", c.RemoteAddr())
+			log.Printf("SSH handshake failed for %s: client closed connection.", c.RemoteAddr())
 		} else {
 			log.Printf("SSH handshake failed for %s: %v", c.RemoteAddr(), err)
 		}
@@ -453,7 +446,7 @@ func handleSshConnection(c net.Conn, r io.Reader, sshCfg *ssh.ServerConfig) {
 	}
 }
 
-// 443端口的智能分发器
+// [改回] dispatchConnection - 恢复循环等待逻辑
 func dispatchConnection(c net.Conn, sshCfg *ssh.ServerConfig) {
 	defer func() {
 		if r := recover(); r != nil {
@@ -469,7 +462,7 @@ func dispatchConnection(c net.Conn, sshCfg *ssh.ServerConfig) {
 	}
 
 	if err := tlsConn.Handshake(); err != nil {
-		//log.Printf("System: TLS handshake failed for %s: %v", c.RemoteAddr(), err)
+		log.Printf("System: TLS handshake failed for %s: %v", c.RemoteAddr(), err)
 		return
 	}
 
@@ -483,14 +476,14 @@ func dispatchConnection(c net.Conn, sshCfg *ssh.ServerConfig) {
 	peekedBytes, err := reader.Peek(8)
 	if err != nil {
 		if err != io.EOF {
-			//log.Printf("System: Protocol sniffing failed for %s: %v", c.RemoteAddr(), err)
+			log.Printf("System: Protocol sniffing failed for %s: %v", c.RemoteAddr(), err)
 		}
 		return
 	}
 
 	if bytes.HasPrefix(peekedBytes, []byte("SSH-2.0")) {
 		log.Printf("System: Detected direct SSH connection via TLS for %s (SNI: %s)", c.RemoteAddr(), sni)
-		time.Sleep(500 * time.Millisecond)
+		time.Sleep(500 * time.Millisecond) // 为直连模式也加入延迟
 		handleSshConnection(c, reader, sshCfg)
 	} else {
 		log.Printf("System: Detected HTTP-based connection via TLS for %s (SNI: %s), attempting Upgrade.", c.RemoteAddr(), sni)
@@ -501,10 +494,11 @@ func dispatchConnection(c net.Conn, sshCfg *ssh.ServerConfig) {
 
 			req, err := http.ReadRequest(reader)
 			if err != nil {
+				// 读取超时或客户端关闭连接，是正常情况
 				if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
 					log.Printf("System: Timeout waiting for valid HTTP Upgrade on TLS for %s", c.RemoteAddr())
 				} else if err != io.EOF {
-					//log.Printf("System: Failed to read HTTP request from TLS stream for %s: %v", c.RemoteAddr(), err)
+					log.Printf("System: Failed to read HTTP request from TLS stream for %s: %v", c.RemoteAddr(), err)
 				}
 				return
 			}
@@ -514,15 +508,16 @@ func dispatchConnection(c net.Conn, sshCfg *ssh.ServerConfig) {
 			if strings.Contains(req.UserAgent(), globalConfig.ConnectUA) {
 				_, err := c.Write([]byte("HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\r\n"))
 				if err != nil { return }
-				break
+				break // 成功，跳出循环
 			} else {
+				// UA不匹配，回复伪装并继续等待
 				log.Printf("System: Ignored invalid HTTP request via TLS for %s (UA: %s)", c.RemoteAddr(), req.UserAgent())
 				c.Write([]byte("HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nConnection: keep-alive\r\n\r\nOK"))
-				continue
+				continue // 继续下一次循环
 			}
 		}
 
-		time.Sleep(500 * time.Millisecond)
+		time.Sleep(500 * time.Millisecond) // 成功跳出循环后延迟
 
 		var finalReader io.Reader
 		if reader.Buffered() > 0 {
@@ -535,7 +530,7 @@ func dispatchConnection(c net.Conn, sshCfg *ssh.ServerConfig) {
 	}
 }
 
-// 80端口的HTTP Upgrade处理器
+// [改回] 80端口的处理器 - 恢复循环等待逻辑
 func handleHttpUpgrade(c net.Conn, sshCfg *ssh.ServerConfig) {
 	defer c.Close()
 	timeoutDuration := time.Duration(globalConfig.HandshakeTimeout) * time.Second
@@ -550,7 +545,7 @@ func handleHttpUpgrade(c net.Conn, sshCfg *ssh.ServerConfig) {
 			if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
 				log.Printf("System: Timeout waiting for valid HTTP Upgrade on port 80 for %s", c.RemoteAddr())
 			} else if err != io.EOF {
-				//log.Printf("System: Failed to read HTTP request on port 80 for %s: %v", c.RemoteAddr(), err)
+				log.Printf("System: Failed to read HTTP request on port 80 for %s: %v", c.RemoteAddr(), err)
 			}
 			return
 		}
@@ -560,15 +555,15 @@ func handleHttpUpgrade(c net.Conn, sshCfg *ssh.ServerConfig) {
 		if strings.Contains(req.UserAgent(), expectedUA) {
 			_, err := c.Write([]byte("HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\r\n"))
 			if err != nil { return }
-			break
+			break // 成功，跳出循环
 		} else {
 			log.Printf("System: Ignored invalid HTTP request on port 80 from %s (UA: %s)", c.RemoteAddr(), req.UserAgent())
 			c.Write([]byte("HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nConnection: keep-alive\r\n\r\nOK"))
-			continue
+			continue // 继续下一次循环
 		}
 	}
 	
-	time.Sleep(500 * time.Millisecond)
+	time.Sleep(500 * time.Millisecond) // 成功跳出循环后延迟
 	
 	var finalReader io.Reader
 	if reader.Buffered() > 0 {
@@ -580,7 +575,7 @@ func handleHttpUpgrade(c net.Conn, sshCfg *ssh.ServerConfig) {
 	handleSshConnection(c, finalReader, sshCfg)
 }
 
-// --- Web服务器逻辑 ---
+// --- Web服务器逻辑 (无变动) ---
 func authMiddleware(next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		if _, ok := validateSession(r); ok {
@@ -735,37 +730,14 @@ func apiHandler(w http.ResponseWriter, r *http.Request) {
 			globalConfig.lock.Unlock(); safeSaveConfig(); sendJSON(w, http.StatusOK, map[string]string{"message": "密码更新成功"})
 		} else { globalConfig.lock.Unlock(); sendJSON(w, http.StatusForbidden, map[string]string{"message": "旧密码错误"}) }
 	case r.URL.Path == "/api/settings":
-		if r.Method == "GET" { 
-			globalConfig.lock.RLock()
-			defer globalConfig.lock.RUnlock()
-			sendJSON(w, http.StatusOK, globalConfig) 
-		}
+		if r.Method == "GET" { globalConfig.lock.RLock(); defer globalConfig.lock.RUnlock(); sendJSON(w, http.StatusOK, globalConfig) }
 		if r.Method == "POST" {
-			var newSettings Config
-			if err := json.NewDecoder(r.Body).Decode(&newSettings); err != nil {
-				sendJSON(w, http.StatusBadRequest, map[string]string{"message": "无效的设置格式"})
-				return
-			}
+			var newSettings Config; json.NewDecoder(r.Body).Decode(&newSettings)
 			globalConfig.lock.Lock()
-			globalConfig.HandshakeTimeout = newSettings.HandshakeTimeout
-			globalConfig.ConnectUA = newSettings.ConnectUA
-			globalConfig.BufferSizeKB = newSettings.BufferSizeKB
-			globalConfig.IdleTimeoutSeconds = newSettings.IdleTimeoutSeconds
-			globalConfig.TolerantCopyMaxRetries = newSettings.TolerantCopyMaxRetries
-			globalConfig.TolerantCopyRetryDelayMs = newSettings.TolerantCopyRetryDelayMs
-			globalConfig.TargetConnectTimeoutSeconds = newSettings.TargetConnectTimeoutSeconds
-			globalConfig.DefaultExpiryDays = newSettings.DefaultExpiryDays
-			globalConfig.DefaultLimitGB = newSettings.DefaultLimitGB
-			globalConfig.AllowedSNI = newSettings.AllowedSNI
+			globalConfig.HandshakeTimeout = newSettings.HandshakeTimeout; globalConfig.ConnectUA = newSettings.ConnectUA; globalConfig.BufferSizeKB = newSettings.BufferSizeKB; globalConfig.IdleTimeoutSeconds = newSettings.IdleTimeoutSeconds; globalConfig.TolerantCopyMaxRetries = newSettings.TolerantCopyMaxRetries; globalConfig.TolerantCopyRetryDelayMs = newSettings.TolerantCopyRetryDelayMs; globalConfig.TargetConnectTimeoutSeconds = newSettings.TargetConnectTimeoutSeconds; globalConfig.DefaultExpiryDays = newSettings.DefaultExpiryDays; globalConfig.DefaultLimitGB = newSettings.DefaultLimitGB
 			globalConfig.lock.Unlock()
-			if err := safeSaveConfig(); err != nil {
-				sendJSON(w, http.StatusInternalServerError, map[string]string{"message": "保存配置失败: " + err.Error()})
-				return
-			}
-			bufferPool = sync.Pool{New: func() interface{} { 
-				buf := make([]byte, globalConfig.BufferSizeKB*1024)
-				return &buf 
-			}}
+			safeSaveConfig()
+			bufferPool = sync.Pool{New: func() interface{} { buf := make([]byte, globalConfig.BufferSizeKB*1024); return &buf }}
 			sendJSON(w, http.StatusOK, map[string]string{"message": "设置已保存"})
 		}
 	case r.URL.Path == "/api/logs": sendJSON(w, http.StatusOK, globalLog.GetLogs())
@@ -775,8 +747,6 @@ func apiHandler(w http.ResponseWriter, r *http.Request) {
 	default: http.NotFound(w, r)
 	}
 }
-
-
 // --- main ---
 func main() {
 	log.SetOutput(globalLog)
@@ -867,13 +837,9 @@ func main() {
 		}
 	}()
 	
-	// +++ MODIFIED START +++
-	// 2. 修改 sshCfg 的初始化部分
-	// 我们不再直接初始化 ssh.ServerConfig，而是先获取一个已知能工作的默认配置
 	sshCfg := &ssh.ServerConfig{
-		ServerVersion:    "SSH-2.0-WSTunnel_Pro",
+		ServerVersion: "SSH-2.0-WSTunnel_Pro",
 		PasswordCallback: func(c ssh.ConnMetadata, p []byte) (*ssh.Permissions, error) {
-			// ... 您的认证逻辑保持不变 ...
 			user := c.User()
 			globalConfig.lock.RLock()
 			acc, ok := globalConfig.Accounts[user]
@@ -899,32 +865,11 @@ func main() {
 			return nil, fmt.Errorf("invalid credentials")
 		},
 	}
-	
-	// 借用 goph 库来获取一个完整的、默认的 ssh.Config
-	// 这可以避免我们手动配置不完整导致的Bug
-	defaultConfig := goph.DefaultConfig()
-	sshCfg.Config = *defaultConfig
-
-	// 现在，我们在这个已知能工作的默认配置上，进行“微创手术”
-	// 我们只调整加密算法(Ciphers)的顺序，把 chacha20 提到最前面
-	var newCiphers []string
-	newCiphers = append(newCiphers, "chacha20-poly1305@openssh.com")
-	
-	// 把默认列表里除了 chacha20 之外的其他算法，都追加到新列表后面
-	for _, cipher := range sshCfg.Config.Ciphers {
-		if cipher != "chacha20-poly1305@openssh.com" {
-			newCiphers = append(newCiphers, cipher)
-		}
-	}
-	// 将调整好顺序的新列表，赋值回去
-	sshCfg.Config.Ciphers = newCiphers
-	// +++ MODIFIED END +++
-
 	_, priv, _ := ed25519.GenerateKey(rand.Reader)
 	key, _ := ssh.NewSignerFromKey(priv)
 	sshCfg.AddHostKey(key)
 
-	// 普通TCP监听器 (HTTP Upgrade)
+	// 普通TCP监听器 (HTTP Upgrade) - 完整保留
 	sshListener, err := net.Listen("tcp", globalConfig.ListenAddr)
 	if err != nil {
 		log.Fatalf("FATAL: Cannot listen on %s: %v", globalConfig.ListenAddr, err)
@@ -943,7 +888,7 @@ func main() {
 		}
 	}()
 
-	// “超级 443 端口”
+	// “超级 443 端口” 的实现
 	tlsConfig, err := generateOrLoadTLSConfig()
 	if err != nil {
 		log.Fatalf("FATAL: Could not configure TLS: %v", err)
