@@ -1,4 +1,4 @@
-// main.go (已修正所有编译错误并采用适配器模式)
+// main.go (已添加核心数据转发逻辑并集成流量统计)
 package main
 
 import (
@@ -124,16 +124,13 @@ var sessions = make(map[string]Session)
 var sessionsLock sync.RWMutex
 var bufferPool sync.Pool
 
-// --- [新增] singleConnListener 适配器 ---
-// singleConnListener 实现了 net.Listener 接口，但它只处理一个单一的 net.Conn。
-// 这使得我们可以将一个已经接受的连接 "喂" 给期望 Listener 的 ssh.Server.Serve 方法。
+// --- singleConnListener 适配器 ---
 type singleConnListener struct {
 	conn   net.Conn
 	once   sync.Once
 	closed chan struct{}
 }
 
-// newSingleConnListener 创建一个新的 singleConnListener 实例。
 func newSingleConnListener(conn net.Conn) net.Listener {
 	return &singleConnListener{
 		conn:   conn,
@@ -141,7 +138,6 @@ func newSingleConnListener(conn net.Conn) net.Listener {
 	}
 }
 
-// Accept 返回唯一的连接，且只返回一次。后续调用将阻塞直到 Close 被调用。
 func (l *singleConnListener) Accept() (net.Conn, error) {
 	var conn net.Conn
 	l.once.Do(func() {
@@ -154,22 +150,18 @@ func (l *singleConnListener) Accept() (net.Conn, error) {
 	return nil, io.EOF
 }
 
-// Close 关闭通道以解除 Accept 的阻塞，并关闭底层连接。
 func (l *singleConnListener) Close() error {
 	select {
 	case <-l.closed:
-		// 已经关闭
 	default:
 		close(l.closed)
 	}
 	return l.conn.Close()
 }
 
-// Addr 返回底层连接的本地地址。
 func (l *singleConnListener) Addr() net.Addr {
 	return l.conn.LocalAddr()
 }
-
 
 // --- 辅助函数 ---
 
@@ -352,9 +344,7 @@ func dispatchConnection(c net.Conn, server *ssh.Server) {
 	if bytes.HasPrefix(peekedBytes, []byte("SSH-2.0")) {
 		log.Printf("System: Detected direct SSH connection via TLS for %s (SNI: %s)", c.RemoteAddr(), sni)
 		time.Sleep(500 * time.Millisecond)
-		// *** FIX: Use the singleConnListener to wrap the connection ***
 		go func() {
-			// Serve will block until the single connection is closed.
 			err := server.Serve(newSingleConnListener(c))
 			if err != nil && err != io.EOF {
 				log.Printf("System: ssh.Serve (direct) failed for %s: %v", c.RemoteAddr(), err)
@@ -389,7 +379,6 @@ func dispatchConnection(c net.Conn, server *ssh.Server) {
 		time.Sleep(500 * time.Millisecond)
 		
 		wrappedConn := &handshakeConn{Conn: c, r: reader}
-		// *** FIX: Use the singleConnListener to wrap the connection ***
 		go func() {
 			err := server.Serve(newSingleConnListener(wrappedConn))
 			if err != nil && err != io.EOF {
@@ -429,7 +418,6 @@ func handleHttpUpgrade(c net.Conn, server *ssh.Server) {
 	time.Sleep(500 * time.Millisecond)
 	
 	wrappedConn := &handshakeConn{Conn: c, r: reader}
-	// *** FIX: Use the singleConnListener to wrap the connection ***
 	go func() {
 		err := server.Serve(newSingleConnListener(wrappedConn))
 		if err != nil && err != io.EOF {
@@ -439,7 +427,7 @@ func handleHttpUpgrade(c net.Conn, server *ssh.Server) {
 }
 
 
-// --- Web服务器逻辑 (重构为多个 Handler) ---
+// --- Web服务器逻辑 ---
 func authMiddleware(next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		if _, ok := validateSession(r); ok {
@@ -749,17 +737,14 @@ func main() {
 	go func() {
 		defer wg.Done()
 		mux := http.NewServeMux()
-		// Static files and authentication
 		mux.HandleFunc("/login.html", func(w http.ResponseWriter, r *http.Request) { http.ServeFile(w, r, "login.html") })
 		mux.HandleFunc("/login", loginHandler)
 		mux.HandleFunc("/logout", logoutHandler)
-		
-		// Registering individual API handlers
 		mux.HandleFunc("/api/server_status", authMiddleware(apiServerStatusHandler))
-		mux.HandleFunc("/api/connections", authMiddleware(apiConnectionsHandler)) // GET
-		mux.HandleFunc("/api/connections/", authMiddleware(apiConnectionsHandler)) // DELETE
-		mux.HandleFunc("/api/accounts", authMiddleware(apiAccountsHandler)) // GET
-		mux.HandleFunc("/api/accounts/", authMiddleware(apiAccountsHandler)) // POST, DELETE
+		mux.HandleFunc("/api/connections", authMiddleware(apiConnectionsHandler)) 
+		mux.HandleFunc("/api/connections/", authMiddleware(apiConnectionsHandler))
+		mux.HandleFunc("/api/accounts", authMiddleware(apiAccountsHandler)) 
+		mux.HandleFunc("/api/accounts/", authMiddleware(apiAccountsHandler))
 		mux.HandleFunc("/api/accounts/set_status", authMiddleware(apiAccountSetStatusHandler))
 		mux.HandleFunc("/api/accounts/reset-traffic", authMiddleware(apiAccountResetTrafficHandler))
 		mux.HandleFunc("/api/admin/update_password", authMiddleware(apiAdminUpdatePasswordHandler))
@@ -767,13 +752,10 @@ func main() {
 		mux.HandleFunc("/api/logs", authMiddleware(apiLogsHandler))
 		mux.HandleFunc("/api/traffic", authMiddleware(apiTrafficHandler))
 		mux.HandleFunc("/api/whoami", authMiddleware(apiWhoamiHandler))
-
-		// Main admin panel entry point
 		mux.HandleFunc("/", authMiddleware(func(w http.ResponseWriter, r *http.Request) {
 			if r.URL.Path == "/" { http.ServeFile(w, r, "admin.html"); return }
 			http.NotFound(w, r)
 		}))
-
 		adminServer.Handler = mux
 		log.Printf("System: Admin panel listening on http://%s", globalConfig.AdminAddr)
 		if err := adminServer.ListenAndServe(); err != http.ErrServerClosed {
@@ -781,84 +763,104 @@ func main() {
 		}
 	}()
 	
-	// --- 新的 charmbracelet/ssh 服务器设置 ---
+	// --- [核心修正] 自定义隧道处理器 ---
+	forwardHandler := &ssh.DirectTCPIPHandler{}
 	
+	// 这个自定义 Handler 是让隧道能够转发数据的关键
+	forwardHandler.Handler = func(ctx ssh.Context, conn net.Conn, newChan ssh.NewChannel) {
+		log.Printf("User '%s' from %s is creating a tunnel to %s", ctx.User(), ctx.RemoteAddr(), conn.RemoteAddr())
+		
+		// 接受客户端的通道
+		channel, reqs, err := newChan.Accept()
+		if err != nil {
+			log.Printf("User '%s' could not accept channel: %v", ctx.User(), err)
+			conn.Close()
+			return
+		}
+		
+		// 在后台丢弃所有带外请求
+		go ssh.DiscardRequests(reqs)
+		
+		// 启动双向数据拷贝
+		var wg sync.WaitGroup
+		wg.Add(2)
+
+		user := ctx.User()
+		traffic, _ := globalTraffic.LoadOrStore(user, &TrafficInfo{})
+		userTraffic := traffic.(*TrafficInfo)
+
+		// 客户端 -> 目标 (上传流量)
+		go func() {
+			defer wg.Done()
+			defer channel.Close()
+			defer conn.Close()
+			written, _ := io.Copy(conn, channel)
+			atomic.AddUint64(&userTraffic.Sent, uint64(written))
+		}()
+
+		// 目标 -> 客户端 (下载流量)
+		go func() {
+			defer wg.Done()
+			defer channel.Close()
+			defer conn.Close()
+			written, _ := io.Copy(channel, conn)
+			atomic.AddUint64(&userTraffic.Received, uint64(written))
+		}()
+
+		wg.Wait()
+		log.Printf("User '%s' tunnel to %s closed.", user, conn.RemoteAddr())
+	}
+	
+	// --- 新的 charmbracelet/ssh 服务器设置 ---
 	server := &ssh.Server{
 		Version: "SSH-2.0-WSTunnel_Pro",
 		IdleTimeout: time.Duration(globalConfig.IdleTimeoutSeconds) * time.Second,
-
 		PasswordHandler: func(ctx ssh.Context, password string) bool {
 			user := ctx.User()
-			
 			globalConfig.lock.RLock()
 			acc, ok := globalConfig.Accounts[user]
 			globalConfig.lock.RUnlock()
-
-			if !ok || !acc.Enabled {
-				log.Printf("Auth failed for user '%s': not found or disabled", user)
-				return false
-			}
-
+			if !ok || !acc.Enabled { log.Printf("Auth failed for user '%s': not found or disabled", user); return false }
 			if acc.ExpiryDate != "" {
 				exp, err := time.Parse("2006-01-02", acc.ExpiryDate)
-				if err != nil || time.Now().After(exp.Add(24*time.Hour)) {
-					log.Printf("Auth failed for user '%s': expired", user)
-					return false
-				}
+				if err != nil || time.Now().After(exp.Add(24*time.Hour)) { log.Printf("Auth failed for user '%s': expired", user); return false }
 			}
-
 			if acc.LimitGB > 0 {
 				v, _ := globalTraffic.LoadOrStore(user, &TrafficInfo{})
 				t := v.(*TrafficInfo)
-				if atomic.LoadUint64(&t.Sent)+atomic.LoadUint64(&t.Received) >= uint64(acc.LimitGB*1e9) {
-					log.Printf("Auth failed for user '%s': traffic limit exceeded", user)
-					return false
-				}
+				if atomic.LoadUint64(&t.Sent)+atomic.LoadUint64(&t.Received) >= uint64(acc.LimitGB*1e9) { log.Printf("Auth failed for user '%s': traffic limit exceeded", user); return false }
 			}
-
 			if acc.MaxSessions > 0 {
 				v, _ := userConnectionCount.LoadOrStore(user, new(int32))
 				countPtr := v.(*int32)
-				if atomic.LoadInt32(countPtr) >= int32(acc.MaxSessions) {
-					log.Printf("Auth failed for user '%s': max sessions exceeded", user)
-					return false
-				}
+				if atomic.LoadInt32(countPtr) >= int32(acc.MaxSessions) { log.Printf("Auth failed for user '%s': max sessions exceeded", user); return false }
 			}
-
-			if password == acc.Password {
-				return true
-			}
-
+			if password == acc.Password { return true }
 			log.Printf("Auth failed for user '%s': invalid credentials", user)
 			return false
 		},
-
 		Handler: func(s ssh.Session) {
 			user := s.User()
 			connID := s.Context().SessionID()
-
 			if val, ok := userConnectionCount.Load(user); ok {
 				atomic.AddInt32(val.(*int32), 1)
 			}
 			onlineUser := &OnlineUser{ConnID: connID, Username: user, RemoteAddr: s.RemoteAddr().String(), ConnectTime: time.Now(), sshSession: s}
 			onlineUsers.Store(onlineUser.ConnID, onlineUser)
-			log.Printf("Auth success for user '%s' from %s", user, s.RemoteAddr())
-
+			log.Printf("Auth success for user '%s' from %s (SessionID: %s)", user, s.RemoteAddr(), connID)
 			defer func() {
 				if val, ok := userConnectionCount.Load(user); ok {
 					atomic.AddInt32(val.(*int32), -1)
 				}
 				onlineUsers.Delete(onlineUser.ConnID)
-				log.Printf("Session closed for user '%s' from %s", user, s.RemoteAddr())
+				log.Printf("Session closed for user '%s' from %s (SessionID: %s)", user, s.RemoteAddr(), connID)
 			}()
-			
-			// 正确等待会话结束
 			<-s.Context().Done()
 		},
-		
 		ChannelHandlers: map[string]ssh.ChannelHandler{
 			"session":      ssh.DefaultSessionHandler,
-			"direct-tcpip": ssh.DirectTCPIPHandler,
+			// --- [核心修正] 使用我们自定义的带数据转发功能的处理器 ---
+			"direct-tcpip": forwardHandler.HandleChan,
 		},
 	}
 	
@@ -868,7 +870,6 @@ func main() {
 	
 	// --- 启动监听器 ---
 
-	// 普通TCP监听器 (HTTP Upgrade)
 	sshListener, err := net.Listen("tcp", globalConfig.ListenAddr)
 	if err != nil {
 		log.Fatalf("FATAL: Cannot listen on %s: %v", globalConfig.ListenAddr, err)
@@ -887,7 +888,6 @@ func main() {
 		}
 	}()
 
-	// “超级 443 端口”
 	tlsConfig, err := generateOrLoadTLSConfig()
 	if err != nil {
 		log.Fatalf("FATAL: Could not configure TLS: %v", err)
