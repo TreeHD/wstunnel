@@ -470,11 +470,7 @@ func handleSshConnection(c net.Conn, r io.Reader, sshCfg *ssh.ServerConfig) {
 			Port uint32
 		}
 		ssh.Unmarshal(newChan.ExtraData(), &payload)
-		if payload.Port == 7300 {
-			go handleUdpGw(ch, sshConn.RemoteAddr())
-		} else {
-			go handleDirectTCPIP(ch, payload.Host, payload.Port, sshConn.RemoteAddr(), username)
-		}
+		go handleDirectTCPIP(ch, payload.Host, payload.Port, sshConn.RemoteAddr(), username)
 	}
 }
 
