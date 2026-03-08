@@ -10,7 +10,7 @@ RUN CGO_ENABLED=0 GOOS=linux go build -ldflags "-s -w" -o wstunnel-go
 # 階段 2: 編譯 badvpn-udpgw
 FROM alpine:latest AS badvpn-builder
 RUN apk add --no-cache git cmake make gcc g++ musl-dev linux-headers
-RUN git clone https://github.com/ambrop72/badvpn.git /badvpn
+RUN git clone https://github.com/shadowsocks/badvpn /badvpn
 WORKDIR /badvpn/build
 RUN cmake .. -DBUILD_NOTHING_BY_DEFAULT=1 -DBUILD_UDPGW=1
 RUN make
