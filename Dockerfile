@@ -1,39 +1,40 @@
+# Stage 1: Go Builder
 FROM golang:1.24-alpine AS go-builder
 WORKDIR /app
 COPY . .
-# 如果 go.mod 不存在則初始化，並安裝 git 以便獲取相依模組
 RUN apk add --no-cache git
 RUN [ -f go.mod ] || go mod init wstunnel
 RUN go mod tidy
 RUN CGO_ENABLED=0 GOOS=linux go build -ldflags "-s -w" -o wstunnel-go
 
-# 階段 2: 編譯 badvpn-udpgw
-FROM alpine:latest AS badvpn-builder
-RUN apk add --no-cache git cmake make gcc g++ musl-dev linux-headers
-RUN git clone https://github.com/shadowsocks/badvpn /badvpn
-WORKDIR /badvpn/build
-RUN cmake .. -DBUILD_NOTHING_BY_DEFAULT=1 -DBUILD_UDPGW=1
-RUN make
+# Stage 2: UDPGW Downloader (Multi-arch)
+FROM alpine:latest AS udpgw-downloader
+ARG TARGETARCH
+RUN apk add --no-cache curl unzip
+RUN set -x && \
+    case "${TARGETARCH}" in \
+        "amd64") ARCH="x86_64" ;; \
+        "arm64") ARCH="aarch64" ;; \
+        *) ARCH="x86_64" ;; \
+    esac && \
+    URL="https://github.com/tun2proxy/tun2proxy/releases/latest/download/tun2proxy-${ARCH}-unknown-linux-musl.zip" && \
+    curl -L -o udpgw.zip "$URL" && \
+    unzip udpgw.zip udpgw-server && \
+    chmod +x udpgw-server
 
-# 階段 3: 最終運行環境
+# Stage 3: Final Runner
 FROM alpine:latest
-# 安裝必要的運行時套件 (tzdata)
 RUN apk add --no-cache tzdata
 WORKDIR /app
 
-# 複製編譯好的主程式與前端檔案
+# Copy binaries
 COPY --from=go-builder /app/wstunnel-go .
 COPY --from=go-builder /app/frontend ./frontend
+COPY --from=udpgw-downloader /udpgw-server /usr/local/bin/udpgw
 
-# 複製編譯好的 badvpn-udpgw 到系統路徑
-COPY --from=badvpn-builder /badvpn/build/udpgw/badvpn-udpgw /usr/local/bin/badvpn-udpgw
-
-# 複製並處理啟動腳本
+# Entrypoint setup
 COPY entrypoint.sh .
 RUN sed -i 's/\r$//' entrypoint.sh && chmod +x entrypoint.sh
 
-# 暴露必要的埠口
 EXPOSE 80 443 9090 1080 7300
-
-# 啟動腳本
 CMD ["./entrypoint.sh"]
