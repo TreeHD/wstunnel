@@ -20,7 +20,7 @@
 ```yaml
 services:
   wstunnel:
-    image: ghcr.io/treehd/xiyang110_n:latest
+    image: ghcr.io/treehd/wstunnel:latest
     container_name: wstunnel
     restart: always
     ports:
