@@ -40,7 +40,7 @@ services:
       - ./data:/app/data
     healthcheck:
       # 確認 HTTP Upgrade 入口 (port 80) 已就緒，DNSTT 需等此狀態才啟動
-      test: ["CMD-SHELL", "echo > /dev/tcp/127.0.0.1/80 2>/dev/null && echo ok || exit 1"]
+      test: ["CMD", "bash", "-c", "echo > /dev/tcp/127.0.0.1/80 2>/dev/null"]
       interval: 5s
       timeout: 3s
       retries: 10

@@ -77,11 +77,11 @@ curl -x http://帳號:密碼@您的伺服器IP:1080 http://ipinfo.io
 curl -x socks5://帳號:密碼@您的伺服器IP:1080 http://ipinfo.io
 ```
 
-## 🌐 DNS 隧道 (DNSTT) — 獨立容器部署
+## 🌐 DNS 隧道 (DNSTT)
 
 > **注意**：DNSTT 已從主容器中完全移除，改以獨立容器方式部署，避免干擾 TLS/SSH 的 DNS 解析。
 
-當 HTTP/TLS 埠口被封鎖時，可以透過 DNS 查詢建立隧道連線。本專案使用 [dnstt](https://www.bamsoftware.com/software/dnstt/) 實作，以獨立 Docker 容器搭配 `docker-compose.dnstt.yml` 部署。
+當 HTTP/TLS 埠口被封鎖時，可以透過 DNS 查詢建立隧道連線。本專案使用 [dnstt](https://www.bamsoftware.com/software/dnstt/) 實作，DNSTT 服務已整合於 `docker-compose.yml` 中，使用 Docker Compose `profiles` 選擇性啟動。
 
 ### 前置作業：DNS 記錄設定
 
@@ -94,13 +94,14 @@ curl -x socks5://帳號:密碼@您的伺服器IP:1080 http://ipinfo.io
 
 ### 伺服器端啟動
 
-編輯 `docker-compose.dnstt.yml`，填入您的域名後，連同主服務一起啟動：
+編輯 `docker-compose.yml`，在 dnstt service 的環境變數中填入您的域名後啟動：
 
 ```bash
-# 先克隆本專案以取得 docker-compose.dnstt.yml 與 Dockerfile.dnstt
-# 編輯 docker-compose.dnstt.yml，將 DNSTT_DOMAIN 改為您的實際域名
+# 編輯 docker-compose.yml，將 DNSTT_DOMAIN 改為您的實際域名
+# 例如: - DNSTT_DOMAIN=t.example.com
 
-docker compose -f docker-compose.yml -f docker-compose.dnstt.yml up -d
+# 啟動 wstunnel + DNSTT（使用 --profile dnstt）
+docker compose --profile dnstt up -d
 ```
 
 第一次啟動後，金鑰會自動生成並儲存於 `./data/dnstt/` 資料夾。請取得公鑰提供給客戶端：
