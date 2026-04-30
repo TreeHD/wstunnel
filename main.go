@@ -314,7 +314,10 @@ func loadOrGenerateSSHHostKey() ssh.Signer {
 		}
 	}
 
-	signer, _ := ssh.NewSignerFromKey(priv)
+	signer, err := ssh.NewSignerFromKey(priv)
+	if err != nil {
+		log.Fatalf("FATAL: Failed to create SSH signer from host key: %v", err)
+	}
 	return signer
 }
 
@@ -583,7 +586,10 @@ func dispatchConnection(c net.Conn, sshCfg *ssh.ServerConfig) {
 		var finalReader io.Reader
 		if n := reader.Buffered(); n > 0 {
 			preReadData := make([]byte, n)
-			io.ReadFull(reader, preReadData)
+			if _, err := io.ReadFull(reader, preReadData); err != nil {
+				log.Printf("System: Failed to drain buffered TLS data for %s: %v", c.RemoteAddr(), err)
+				return
+			}
 			finalReader = io.MultiReader(bytes.NewReader(preReadData), c)
 		} else {
 			finalReader = c
@@ -634,7 +640,10 @@ func handleHttpUpgrade(c net.Conn, sshCfg *ssh.ServerConfig) {
 	var finalReader io.Reader
 	if n := reader.Buffered(); n > 0 {
 		preReadData := make([]byte, n)
-		io.ReadFull(reader, preReadData)
+		if _, err := io.ReadFull(reader, preReadData); err != nil {
+			log.Printf("System: Failed to drain buffered HTTP data for %s: %v", c.RemoteAddr(), err)
+			return
+		}
 		finalReader = io.MultiReader(bytes.NewReader(preReadData), c)
 	} else {
 		finalReader = c
