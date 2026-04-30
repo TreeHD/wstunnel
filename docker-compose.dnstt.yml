@@ -36,8 +36,8 @@ services:
       - "53:5300/udp"   # 對外監聽 UDP 53，容器內使用 5300 避免需要 NET_ADMIN
     environment:
       # [必填] DNS 隧道域名，須與 DNS NS 記錄一致
-      # 範例: t.example.com
-      - DNSTT_DOMAIN=t.example.com
+      # 範例: t.example.com  請將此行替換為您的實際域名
+      - DNSTT_DOMAIN=
       # DNSTT 隧道流量轉發目標 (wstunnel HTTP 入口)
       - DNSTT_UPSTREAM=wstunnel:80
     volumes:

@@ -14,7 +14,12 @@ if [ -z "$DNSTT_DOMAIN" ]; then
     exit 1
 fi
 
-UPSTREAM="${DNSTT_UPSTREAM:-127.0.0.1:80}"
+UPSTREAM="${DNSTT_UPSTREAM}"
+if [ -z "$UPSTREAM" ]; then
+    echo "[dnstt] 錯誤: 環境變數 DNSTT_UPSTREAM 未設定。"
+    echo "[dnstt] 請在 docker-compose.dnstt.yml 中設定 DNSTT_UPSTREAM (例如: wstunnel:80)"
+    exit 1
+fi
 
 # 首次啟動自動產生金鑰對
 if [ ! -f "$DATA_DIR/server.key" ]; then
