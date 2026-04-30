@@ -287,6 +287,40 @@ func generateOrLoadTLSConfig() (*tls.Config, error) {
 
 // --- 核心数据转发逻辑 ---
 
+const sshHostKeyFile = "data/ssh_host_key"
+
+// loadOrGenerateSSHHostKey 從磁碟載入持久化的 SSH host key，若不存在則產生並儲存。
+// 持久化可避免每次重啟後客戶端出現「host key changed」警告。
+func loadOrGenerateSSHHostKey() ssh.Signer {
+	if data, err := os.ReadFile(sshHostKeyFile); err == nil {
+		if signer, err := ssh.ParsePrivateKey(data); err == nil {
+			log.Printf("System: Loaded SSH host key from %s", sshHostKeyFile)
+			return signer
+		}
+	}
+
+	_, priv, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		log.Fatalf("FATAL: Failed to generate SSH host key: %v", err)
+	}
+
+	if err := os.MkdirAll("data", 0755); err == nil {
+		privBytes, _ := x509.MarshalPKCS8PrivateKey(priv)
+		pemBlock := pem.EncodeToMemory(&pem.Block{Type: "PRIVATE KEY", Bytes: privBytes})
+		if err := os.WriteFile(sshHostKeyFile, pemBlock, 0600); err != nil {
+			log.Printf("System: Warning - Failed to save SSH host key: %v", err)
+		} else {
+			log.Printf("System: Generated and saved new SSH host key to %s", sshHostKeyFile)
+		}
+	}
+
+	signer, err := ssh.NewSignerFromKey(priv)
+	if err != nil {
+		log.Fatalf("FATAL: Failed to create SSH signer from host key: %v", err)
+	}
+	return signer
+}
+
 type handshakeConn struct {
 	net.Conn
 	r io.Reader
@@ -298,8 +332,10 @@ func tolerantCopy(dst io.Writer, src io.Reader, direction string, remoteAddr net
 	bufPtr := bufferPool.Get().(*[]byte)
 	defer bufferPool.Put(bufPtr)
 	buf := *bufPtr
+	globalConfig.lock.RLock()
 	maxRetries := globalConfig.TolerantCopyMaxRetries
 	retryDelay := time.Duration(globalConfig.TolerantCopyRetryDelayMs) * time.Millisecond
+	globalConfig.lock.RUnlock()
 	consecutiveTempErrors := 0
 	val, _ := globalTraffic.LoadOrStore(username, &TrafficInfo{})
 	traffic := val.(*TrafficInfo)
@@ -356,7 +392,9 @@ func handleDirectTCPIP(ch ssh.Channel, destHost string, destPort uint32, remoteA
 	} else {
 		destAddr = fmt.Sprintf("%s:%d", destHost, destPort)
 	}
+	globalConfig.lock.RLock()
 	connectTimeout := time.Duration(globalConfig.TargetConnectTimeoutSeconds) * time.Second
+	globalConfig.lock.RUnlock()
 	destConn, err := net.DialTimeout("tcp", destAddr, connectTimeout)
 	if err != nil {
 		log.Printf("TCP Proxy: Failed to connect to %s for user %s: %v", destAddr, username, err)
@@ -419,7 +457,9 @@ func handleSshConnection(c net.Conn, r io.Reader, sshCfg *ssh.ServerConfig) {
 		}
 		return
 	}
+	globalConfig.lock.RLock()
 	idleTimeout := time.Duration(globalConfig.IdleTimeoutSeconds) * time.Second
+	globalConfig.lock.RUnlock()
 	if idleTimeout > 0 {
 		c.SetReadDeadline(time.Time{})
 		doneDeadline := make(chan struct{})
@@ -516,7 +556,10 @@ func dispatchConnection(c net.Conn, sshCfg *ssh.ServerConfig) {
 	} else {
 		log.Printf("System: Detected HTTP-based connection via TLS for %s (SNI: %s), attempting Upgrade.", c.RemoteAddr(), sni)
 
+		globalConfig.lock.RLock()
 		timeoutDuration := time.Duration(globalConfig.HandshakeTimeout) * time.Second
+		expectedUA := globalConfig.ConnectUA
+		globalConfig.lock.RUnlock()
 		for {
 			if err := c.SetReadDeadline(time.Now().Add(timeoutDuration)); err != nil {
 				return
@@ -534,7 +577,7 @@ func dispatchConnection(c net.Conn, sshCfg *ssh.ServerConfig) {
 			io.Copy(ioutil.Discard, req.Body)
 			req.Body.Close()
 
-			if strings.Contains(req.UserAgent(), globalConfig.ConnectUA) {
+			if strings.Contains(req.UserAgent(), expectedUA) {
 				_, err := c.Write([]byte("HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\r\n"))
 				if err != nil {
 					return
@@ -550,8 +593,12 @@ func dispatchConnection(c net.Conn, sshCfg *ssh.ServerConfig) {
 		time.Sleep(500 * time.Millisecond)
 
 		var finalReader io.Reader
-		if reader.Buffered() > 0 {
-			preReadData, _ := ioutil.ReadAll(reader)
+		if n := reader.Buffered(); n > 0 {
+			preReadData := make([]byte, n)
+			if _, err := io.ReadFull(reader, preReadData); err != nil {
+				log.Printf("System: Failed to drain buffered TLS data for %s: %v", c.RemoteAddr(), err)
+				return
+			}
 			finalReader = io.MultiReader(bytes.NewReader(preReadData), c)
 		} else {
 			finalReader = c
@@ -563,8 +610,10 @@ func dispatchConnection(c net.Conn, sshCfg *ssh.ServerConfig) {
 // 80端口的HTTP Upgrade处理器
 func handleHttpUpgrade(c net.Conn, sshCfg *ssh.ServerConfig) {
 	defer c.Close()
+	globalConfig.lock.RLock()
 	timeoutDuration := time.Duration(globalConfig.HandshakeTimeout) * time.Second
 	expectedUA := globalConfig.ConnectUA
+	globalConfig.lock.RUnlock()
 	reader := bufio.NewReader(c)
 
 	for {
@@ -600,8 +649,12 @@ func handleHttpUpgrade(c net.Conn, sshCfg *ssh.ServerConfig) {
 	time.Sleep(500 * time.Millisecond)
 
 	var finalReader io.Reader
-	if reader.Buffered() > 0 {
-		preReadData, _ := ioutil.ReadAll(reader)
+	if n := reader.Buffered(); n > 0 {
+		preReadData := make([]byte, n)
+		if _, err := io.ReadFull(reader, preReadData); err != nil {
+			log.Printf("System: Failed to drain buffered HTTP data for %s: %v", c.RemoteAddr(), err)
+			return
+		}
 		finalReader = io.MultiReader(bytes.NewReader(preReadData), c)
 	} else {
 		finalReader = c
@@ -1081,12 +1134,14 @@ func main() {
 		}
 	}()
 
+	proxyListener, err := net.Listen("tcp", globalConfig.ProxyAddr)
+	if err != nil {
+		log.Fatalf("FATAL: Cannot listen on proxy addr %s: %v", globalConfig.ProxyAddr, err)
+	}
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
-		if err := handleProxyServer(globalConfig.ProxyAddr); err != nil {
-			log.Printf("System: Proxy server stopped: %v", err)
-		}
+		handleProxyServer(proxyListener)
 	}()
 
 	sshCfg := &ssh.ServerConfig{
@@ -1131,9 +1186,7 @@ func main() {
 			return nil, fmt.Errorf("invalid credentials")
 		},
 	}
-	_, priv, _ := ed25519.GenerateKey(rand.Reader)
-	key, _ := ssh.NewSignerFromKey(priv)
-	sshCfg.AddHostKey(key)
+	sshCfg.AddHostKey(loadOrGenerateSSHHostKey())
 
 	// 普通TCP监听器 (HTTP Upgrade)
 	sshListener, err := net.Listen("tcp", globalConfig.ListenAddr)
@@ -1199,6 +1252,11 @@ func main() {
 		log.Printf("System: Error closing SSH listener (TLS): %v", err)
 	} else {
 		log.Println("System: SSH listener (TLS) gracefully shut down.")
+	}
+	if err := proxyListener.Close(); err != nil {
+		log.Printf("System: Error closing proxy listener: %v", err)
+	} else {
+		log.Println("System: Proxy listener gracefully shut down.")
 	}
 
 	log.Println("System: Performing final traffic data save...")

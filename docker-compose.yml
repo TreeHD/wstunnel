@@ -1,3 +1,28 @@
+# ======================================================
+#  WSTunnel 整合部署設定 (含可選的 DNSTT DNS 隧道服務)
+#
+#  基本啟動 (僅 wstunnel):
+#    docker compose up -d
+#
+#  含 DNS 隧道啟動:
+#    docker compose --profile dnstt up -d
+#
+#  DNS 記錄設定 (在域名註冊商後台新增):
+#    A/AAAA  tns.example.com  →  您的伺服器 IP
+#    NS      t.example.com    →  tns.example.com
+#
+#  啟動 dnstt 後查看公鑰 (提供給客戶端):
+#    docker compose logs dnstt | grep -A1 "公鑰"
+#    cat ./data/dnstt/server.pub
+#
+#  客戶端連線範例 (使用 DoH):
+#    ./dnstt-client \
+#      -doh https://cloudflare-dns.com/dns-query \
+#      -pubkey-file server.pub \
+#      t.example.com 127.0.0.1:2222
+#    ssh -p 2222 帳號@127.0.0.1
+# ======================================================
+
 services:
   wstunnel:
     image: ghcr.io/treehd/wstunnel:latest
@@ -9,16 +34,43 @@ services:
       - "9090:9090"   # 管理後台
       - "1080:1080"   # SOCKS5 / HTTP Proxy 入口
       - "7300:7300"   # UDPGW (UDP Gateway)
-      - "53:53/udp"   # DNSTT DNS 隧道入口 (需搭配 DNSTT_DOMAIN)
-    # iptables 需要 NET_ADMIN 權限 (用於 DNSTT 的 UDP 53→5300 轉發)
-    cap_add:
-      - NET_ADMIN
-    environment:
-      # [選填] DNS 隧道域名。設定後容器會自動啟動 dnstt-server。
-      # 須先在域名註冊商設定好 NS + A 記錄，詳見 README.md。
-      # 範例: t.example.com
-      - DNSTT_DOMAIN=
     volumes:
-      # 持久化資料夾: 所有帳號設定、流量紀錄、DNSTT 金鑰都會儲存在此。
+      # 持久化資料夾: 所有帳號設定、流量紀錄都會儲存在此。
       # 第一次啟動時會自動產生預設的 config.json，請由此修改您的初始密碼與帳號設定。
       - ./data:/app/data
+    healthcheck:
+      # 確認 HTTP Upgrade 入口 (port 80) 已就緒，DNSTT 需等此狀態才啟動
+      test: ["CMD", "bash", "-c", "echo > /dev/tcp/127.0.0.1/80 2>/dev/null"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+      start_period: 5s
+
+  # ======================================================
+  #  DNSTT DNS 隧道服務 (可選)
+  #  使用方式: docker compose --profile dnstt up -d
+  # ======================================================
+  dnstt:
+    profiles:
+      - dnstt
+    build:
+      context: .
+      dockerfile: Dockerfile.dnstt
+    image: dnstt-server:local
+    container_name: dnstt
+    restart: always
+    ports:
+      - "53:5300/udp"   # 對外監聽 UDP 53，容器內使用 5300 避免需要 NET_ADMIN
+    environment:
+      # [必填] DNS 隧道域名，須與 DNS NS 記錄一致
+      # 範例: t.example.com  請將此行替換為您的實際域名
+      - DNSTT_DOMAIN=
+      # DNSTT 隧道流量轉發目標 (wstunnel HTTP 入口)
+      # 注意: ConnectUA 必須為空，或客戶端請求需包含設定的 User-Agent 字串
+      - DNSTT_UPSTREAM=wstunnel:80
+    volumes:
+      # 持久化 DNSTT 金鑰至 data/dnstt/ 資料夾
+      - ./data/dnstt:/data/dnstt
+    depends_on:
+      wstunnel:
+        condition: service_healthy

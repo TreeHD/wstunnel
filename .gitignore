@@ -26,5 +26,3 @@ config.json
 bin/
 pkg/
 vendor/
-go.sum
-go.mod

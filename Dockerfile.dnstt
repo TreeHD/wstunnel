@@ -1,0 +1,18 @@
+# ===== DNSTT 獨立容器映像檔 =====
+# 用於搭配 docker-compose.dnstt.yml 部署 DNS 隧道服務
+# 此映像與 wstunnel 主映像完全分離，可獨立升級
+
+FROM golang:1.24-alpine AS builder
+RUN apk add --no-cache git
+RUN git clone https://www.bamsoftware.com/git/dnstt.git /dnstt
+WORKDIR /dnstt/dnstt-server
+RUN CGO_ENABLED=0 go build -ldflags "-s -w" -o /dnstt-server
+
+FROM debian:bookworm-slim
+RUN apt-get update && apt-get install -y ca-certificates && rm -rf /var/lib/apt/lists/*
+COPY --from=builder /dnstt-server /usr/local/bin/dnstt-server
+COPY entrypoint.dnstt.sh /entrypoint.sh
+RUN sed -i 's/\r$//' /entrypoint.sh && chmod +x /entrypoint.sh
+
+EXPOSE 5300/udp
+CMD ["/entrypoint.sh"]
