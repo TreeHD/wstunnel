@@ -10,14 +10,14 @@ DATA_DIR="/data/dnstt"
 mkdir -p "$DATA_DIR"
 
 if [ -z "$DNSTT_DOMAIN" ]; then
-    echo "[dnstt] 錯誤: 環境變數 DNSTT_DOMAIN 未設定，請在 docker-compose.dnstt.yml 中填入您的 DNS 隧道域名。"
+    echo "[dnstt] 錯誤: 環境變數 DNSTT_DOMAIN 未設定，請在 docker-compose.yml 中填入您的 DNS 隧道域名。"
     exit 1
 fi
 
 UPSTREAM="${DNSTT_UPSTREAM}"
 if [ -z "$UPSTREAM" ]; then
     echo "[dnstt] 錯誤: 環境變數 DNSTT_UPSTREAM 未設定。"
-    echo "[dnstt] 請在 docker-compose.dnstt.yml 中設定 DNSTT_UPSTREAM (例如: wstunnel:80)"
+    echo "[dnstt] 請在 docker-compose.yml 中設定 DNSTT_UPSTREAM (例如: wstunnel:80)"
     exit 1
 fi
 

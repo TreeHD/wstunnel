@@ -1,49 +1,8 @@
 # ======================================================
-#  DNS 隧道 (DNSTT) 獨立容器部署
+#  [已廢棄] 此檔案已整合進 docker-compose.yml
 #
-#  此檔案作為 docker-compose.yml 的覆蓋層 (overlay)，
-#  用於在獨立容器中執行 DNS 隧道服務。
-#  DNSTT 隧道流量會被轉發至 wstunnel 的 HTTP 入口 (port 80)。
+#  請改用以下指令啟動 DNSTT DNS 隧道服務：
+#    docker compose --profile dnstt up -d
 #
-#  使用方式：
-#    docker compose -f docker-compose.yml -f docker-compose.dnstt.yml up -d
-#
-#  DNS 記錄設定 (在域名註冊商後台新增)：
-#    A/AAAA  tns.example.com  →  您的伺服器 IP
-#    NS      t.example.com    →  tns.example.com
-#
-#  啟動後查看公鑰 (提供給客戶端)：
-#    docker logs dnstt | grep -A1 "公鑰"
-#    cat ./data/dnstt/server.pub
-#
-#  客戶端連線範例：
-#    ./dnstt-client \
-#      -doh https://cloudflare-dns.com/dns-query \
-#      -pubkey-file server.pub \
-#      t.example.com 127.0.0.1:2222
-#    ssh -p 2222 帳號@127.0.0.1
+#  詳細說明請參閱 docker-compose.yml 檔案頂部的說明。
 # ======================================================
-
-services:
-  dnstt:
-    build:
-      context: .
-      dockerfile: Dockerfile.dnstt
-    image: dnstt-server:local
-    container_name: dnstt
-    restart: always
-    ports:
-      - "53:5300/udp"   # 對外監聽 UDP 53，容器內使用 5300 避免需要 NET_ADMIN
-    environment:
-      # [必填] DNS 隧道域名，須與 DNS NS 記錄一致
-      # 範例: t.example.com  請將此行替換為您的實際域名
-      - DNSTT_DOMAIN=
-      # DNSTT 隧道流量轉發目標 (wstunnel HTTP 入口)
-      - DNSTT_UPSTREAM=wstunnel:80
-    volumes:
-      # 持久化 DNSTT 金鑰至 data/dnstt/ 資料夾
-      - ./data/dnstt:/data/dnstt
-    depends_on:
-      - wstunnel
-    networks:
-      - default

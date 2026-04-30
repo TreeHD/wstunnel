@@ -332,8 +332,10 @@ func tolerantCopy(dst io.Writer, src io.Reader, direction string, remoteAddr net
 	bufPtr := bufferPool.Get().(*[]byte)
 	defer bufferPool.Put(bufPtr)
 	buf := *bufPtr
+	globalConfig.lock.RLock()
 	maxRetries := globalConfig.TolerantCopyMaxRetries
 	retryDelay := time.Duration(globalConfig.TolerantCopyRetryDelayMs) * time.Millisecond
+	globalConfig.lock.RUnlock()
 	consecutiveTempErrors := 0
 	val, _ := globalTraffic.LoadOrStore(username, &TrafficInfo{})
 	traffic := val.(*TrafficInfo)
@@ -390,7 +392,9 @@ func handleDirectTCPIP(ch ssh.Channel, destHost string, destPort uint32, remoteA
 	} else {
 		destAddr = fmt.Sprintf("%s:%d", destHost, destPort)
 	}
+	globalConfig.lock.RLock()
 	connectTimeout := time.Duration(globalConfig.TargetConnectTimeoutSeconds) * time.Second
+	globalConfig.lock.RUnlock()
 	destConn, err := net.DialTimeout("tcp", destAddr, connectTimeout)
 	if err != nil {
 		log.Printf("TCP Proxy: Failed to connect to %s for user %s: %v", destAddr, username, err)
@@ -453,7 +457,9 @@ func handleSshConnection(c net.Conn, r io.Reader, sshCfg *ssh.ServerConfig) {
 		}
 		return
 	}
+	globalConfig.lock.RLock()
 	idleTimeout := time.Duration(globalConfig.IdleTimeoutSeconds) * time.Second
+	globalConfig.lock.RUnlock()
 	if idleTimeout > 0 {
 		c.SetReadDeadline(time.Time{})
 		doneDeadline := make(chan struct{})
@@ -550,7 +556,10 @@ func dispatchConnection(c net.Conn, sshCfg *ssh.ServerConfig) {
 	} else {
 		log.Printf("System: Detected HTTP-based connection via TLS for %s (SNI: %s), attempting Upgrade.", c.RemoteAddr(), sni)
 
+		globalConfig.lock.RLock()
 		timeoutDuration := time.Duration(globalConfig.HandshakeTimeout) * time.Second
+		expectedUA := globalConfig.ConnectUA
+		globalConfig.lock.RUnlock()
 		for {
 			if err := c.SetReadDeadline(time.Now().Add(timeoutDuration)); err != nil {
 				return
@@ -568,7 +577,7 @@ func dispatchConnection(c net.Conn, sshCfg *ssh.ServerConfig) {
 			io.Copy(ioutil.Discard, req.Body)
 			req.Body.Close()
 
-			if strings.Contains(req.UserAgent(), globalConfig.ConnectUA) {
+			if strings.Contains(req.UserAgent(), expectedUA) {
 				_, err := c.Write([]byte("HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\r\n"))
 				if err != nil {
 					return
@@ -601,8 +610,10 @@ func dispatchConnection(c net.Conn, sshCfg *ssh.ServerConfig) {
 // 80端口的HTTP Upgrade处理器
 func handleHttpUpgrade(c net.Conn, sshCfg *ssh.ServerConfig) {
 	defer c.Close()
+	globalConfig.lock.RLock()
 	timeoutDuration := time.Duration(globalConfig.HandshakeTimeout) * time.Second
 	expectedUA := globalConfig.ConnectUA
+	globalConfig.lock.RUnlock()
 	reader := bufio.NewReader(c)
 
 	for {

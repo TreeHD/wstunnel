@@ -38,6 +38,13 @@ services:
       # 持久化資料夾: 所有帳號設定、流量紀錄都會儲存在此。
       # 第一次啟動時會自動產生預設的 config.json，請由此修改您的初始密碼與帳號設定。
       - ./data:/app/data
+    healthcheck:
+      # 確認 HTTP Upgrade 入口 (port 80) 已就緒，DNSTT 需等此狀態才啟動
+      test: ["CMD-SHELL", "echo > /dev/tcp/127.0.0.1/80 2>/dev/null && echo ok || exit 1"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+      start_period: 5s
 
   # ======================================================
   #  DNSTT DNS 隧道服務 (可選)
@@ -65,4 +72,5 @@ services:
       # 持久化 DNSTT 金鑰至 data/dnstt/ 資料夾
       - ./data/dnstt:/data/dnstt
     depends_on:
-      - wstunnel
+      wstunnel:
+        condition: service_healthy
