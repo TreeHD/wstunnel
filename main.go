@@ -287,6 +287,37 @@ func generateOrLoadTLSConfig() (*tls.Config, error) {
 
 // --- 核心数据转发逻辑 ---
 
+const sshHostKeyFile = "data/ssh_host_key"
+
+// loadOrGenerateSSHHostKey 從磁碟載入持久化的 SSH host key，若不存在則產生並儲存。
+// 持久化可避免每次重啟後客戶端出現「host key changed」警告。
+func loadOrGenerateSSHHostKey() ssh.Signer {
+	if data, err := os.ReadFile(sshHostKeyFile); err == nil {
+		if signer, err := ssh.ParsePrivateKey(data); err == nil {
+			log.Printf("System: Loaded SSH host key from %s", sshHostKeyFile)
+			return signer
+		}
+	}
+
+	_, priv, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		log.Fatalf("FATAL: Failed to generate SSH host key: %v", err)
+	}
+
+	if err := os.MkdirAll("data", 0755); err == nil {
+		privBytes, _ := x509.MarshalPKCS8PrivateKey(priv)
+		pemBlock := pem.EncodeToMemory(&pem.Block{Type: "PRIVATE KEY", Bytes: privBytes})
+		if err := os.WriteFile(sshHostKeyFile, pemBlock, 0600); err != nil {
+			log.Printf("System: Warning - Failed to save SSH host key: %v", err)
+		} else {
+			log.Printf("System: Generated and saved new SSH host key to %s", sshHostKeyFile)
+		}
+	}
+
+	signer, _ := ssh.NewSignerFromKey(priv)
+	return signer
+}
+
 type handshakeConn struct {
 	net.Conn
 	r io.Reader
@@ -550,8 +581,9 @@ func dispatchConnection(c net.Conn, sshCfg *ssh.ServerConfig) {
 		time.Sleep(500 * time.Millisecond)
 
 		var finalReader io.Reader
-		if reader.Buffered() > 0 {
-			preReadData, _ := ioutil.ReadAll(reader)
+		if n := reader.Buffered(); n > 0 {
+			preReadData := make([]byte, n)
+			io.ReadFull(reader, preReadData)
 			finalReader = io.MultiReader(bytes.NewReader(preReadData), c)
 		} else {
 			finalReader = c
@@ -600,8 +632,9 @@ func handleHttpUpgrade(c net.Conn, sshCfg *ssh.ServerConfig) {
 	time.Sleep(500 * time.Millisecond)
 
 	var finalReader io.Reader
-	if reader.Buffered() > 0 {
-		preReadData, _ := ioutil.ReadAll(reader)
+	if n := reader.Buffered(); n > 0 {
+		preReadData := make([]byte, n)
+		io.ReadFull(reader, preReadData)
 		finalReader = io.MultiReader(bytes.NewReader(preReadData), c)
 	} else {
 		finalReader = c
@@ -1081,12 +1114,14 @@ func main() {
 		}
 	}()
 
+	proxyListener, err := net.Listen("tcp", globalConfig.ProxyAddr)
+	if err != nil {
+		log.Fatalf("FATAL: Cannot listen on proxy addr %s: %v", globalConfig.ProxyAddr, err)
+	}
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
-		if err := handleProxyServer(globalConfig.ProxyAddr); err != nil {
-			log.Printf("System: Proxy server stopped: %v", err)
-		}
+		handleProxyServer(proxyListener)
 	}()
 
 	sshCfg := &ssh.ServerConfig{
@@ -1131,9 +1166,7 @@ func main() {
 			return nil, fmt.Errorf("invalid credentials")
 		},
 	}
-	_, priv, _ := ed25519.GenerateKey(rand.Reader)
-	key, _ := ssh.NewSignerFromKey(priv)
-	sshCfg.AddHostKey(key)
+	sshCfg.AddHostKey(loadOrGenerateSSHHostKey())
 
 	// 普通TCP监听器 (HTTP Upgrade)
 	sshListener, err := net.Listen("tcp", globalConfig.ListenAddr)
@@ -1199,6 +1232,11 @@ func main() {
 		log.Printf("System: Error closing SSH listener (TLS): %v", err)
 	} else {
 		log.Println("System: SSH listener (TLS) gracefully shut down.")
+	}
+	if err := proxyListener.Close(); err != nil {
+		log.Printf("System: Error closing proxy listener: %v", err)
+	} else {
+		log.Println("System: Proxy listener gracefully shut down.")
 	}
 
 	log.Println("System: Performing final traffic data save...")

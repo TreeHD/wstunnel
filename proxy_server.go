@@ -14,19 +14,14 @@ import (
 )
 
 // handleProxyServer starts the multiplexed HTTP / SOCKS5 proxy server
-func handleProxyServer(addr string) error {
-	listener, err := net.Listen("tcp", addr)
-	if err != nil {
-		return fmt.Errorf("failed to listen on proxy addr %s: %v", addr, err)
-	}
-
-	log.Printf("System: Mixed SOCKS5 / HTTP Proxy server listening on %s", addr)
+func handleProxyServer(listener net.Listener) {
+	log.Printf("System: Mixed SOCKS5 / HTTP Proxy server listening on %s", listener.Addr())
 
 	for {
 		conn, err := listener.Accept()
 		if err != nil {
-			log.Printf("Proxy Server: Error accepting connection: %v", err)
-			continue
+			log.Printf("Proxy Server: stopped: %v", err)
+			return
 		}
 		go handleProxyConnection(conn)
 	}
