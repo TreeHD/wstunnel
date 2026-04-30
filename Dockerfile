@@ -1,10 +1,9 @@
 # ===== Stage 1: Go Builder (wstunnel 主程式) =====
-FROM golang:1.24-alpine AS go-builder
+FROM golang:1.25-alpine AS go-builder
 WORKDIR /app
+COPY go.mod go.sum ./
+RUN go mod download
 COPY . .
-RUN apk add --no-cache git
-RUN [ -f go.mod ] || go mod init wstunnel
-RUN go mod tidy
 RUN CGO_ENABLED=0 GOOS=linux go build -ldflags "-s -w" -o wstunnel-go
 
 # ===== Stage 2: UDPGW Downloader (Multi-arch) =====
