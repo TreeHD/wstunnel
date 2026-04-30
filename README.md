@@ -15,7 +15,7 @@
 
 ### 1. 下載並執行 `docker-compose.yml`
 
-在您的伺服器上建立一個新資料夾並寫入 `docker-compose.yml` 檔案 (請將 `<您的GitHub帳號/專案名稱>` 替換為實際的路徑，例如 `treehd/xiyang110_n`):
+在您的伺服器上建立一個新資料夾並寫入 `docker-compose.yml` 檔案:
 
 ```yaml
 services:
@@ -29,11 +29,6 @@ services:
       - "9090:9090"   # 管理後台
       - "1080:1080"   # SOCKS5 / HTTP Proxy 入口
       - "7300:7300"   # UDPGW
-      - "53:53/udp"   # DNSTT DNS 隧道 (選填)
-    cap_add:
-      - NET_ADMIN     # DNSTT iptables 需要
-    environment:
-      - DNSTT_DOMAIN= # 填入您的 DNS 隧道域名，留空則停用 DNSTT
     volumes:
       - ./data:/app/data
 ```
@@ -82,11 +77,14 @@ curl -x http://帳號:密碼@您的伺服器IP:1080 http://ipinfo.io
 curl -x socks5://帳號:密碼@您的伺服器IP:1080 http://ipinfo.io
 ```
 
-## 🌐 DNS 隧道 (DNSTT)
+## 🌐 DNS 隧道 (DNSTT) — 獨立容器部署
 
-當 HTTP/TLS 埠口被封鎖時，可以透過 DNS 查詢建立隧道連線。本專案內建 [dnstt](https://www.bamsoftware.com/software/dnstt/) 支援。
+> **注意**：DNSTT 已從主容器中完全移除，改以獨立容器方式部署，避免干擾 TLS/SSH 的 DNS 解析。
+
+當 HTTP/TLS 埠口被封鎖時，可以透過 DNS 查詢建立隧道連線。本專案使用 [dnstt](https://www.bamsoftware.com/software/dnstt/) 實作，以獨立 Docker 容器搭配 `docker-compose.dnstt.yml` 部署。
 
 ### 前置作業：DNS 記錄設定
+
 您需要一個域名，並在域名註冊商新增以下記錄：
 
 | 類型 | 名稱 | 值 | 用途 |
@@ -94,21 +92,27 @@ curl -x socks5://帳號:密碼@您的伺服器IP:1080 http://ipinfo.io
 | A/AAAA | `tns.example.com` | `您的伺服器 IP` | 隧道伺服器位址 |
 | NS | `t.example.com` | `tns.example.com` | 將 DNS 查詢導向隧道伺服器 |
 
-### 伺服器端設定
-在 `docker-compose.yml` 中設定環境變數：
-```yaml
-environment:
-  - DNSTT_DOMAIN=t.example.com
+### 伺服器端啟動
+
+編輯 `docker-compose.dnstt.yml`，填入您的域名後，連同主服務一起啟動：
+
+```bash
+# 先克隆本專案以取得 docker-compose.dnstt.yml 與 Dockerfile.dnstt
+# 編輯 docker-compose.dnstt.yml，將 DNSTT_DOMAIN 改為您的實際域名
+
+docker compose -f docker-compose.yml -f docker-compose.dnstt.yml up -d
 ```
 
-第一次啟動後，金鑰會自動生成於 `data/dnstt/` 資料夾。請取得公鑰提供給客戶端：
+第一次啟動後，金鑰會自動生成並儲存於 `./data/dnstt/` 資料夾。請取得公鑰提供給客戶端：
+
 ```bash
-docker logs wstunnel | grep -A1 "公鑰"
+docker logs dnstt | grep -A1 "公鑰"
 # 或直接查看檔案
-cat data/dnstt/server.pub
+cat ./data/dnstt/server.pub
 ```
 
 ### 客戶端連線
+
 ```bash
 # 下載 dnstt-client
 git clone https://www.bamsoftware.com/git/dnstt.git
