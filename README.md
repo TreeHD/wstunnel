@@ -77,11 +77,11 @@ curl -x http://帳號:密碼@您的伺服器IP:1080 http://ipinfo.io
 curl -x socks5://帳號:密碼@您的伺服器IP:1080 http://ipinfo.io
 ```
 
-## 🌐 DNS 隧道 (DNSTT)
+## 🌐 DNS 隧道 (Slipstream)
 
-> **注意**：DNSTT 已從主容器中完全移除，改以獨立容器方式部署，避免干擾 TLS/SSH 的 DNS 解析。
+> **注意**：本專案已改用更高效的 [Slipstream (Rust)](https://github.com/Mygod/slipstream-rust) 實作 DNS 隧道。它內建了 SOCKS5 代理服務，無需額外設定轉發，且不再需要手動交換公鑰。
 
-當 HTTP/TLS 埠口被封鎖時，可以透過 DNS 查詢建立隧道連線。本專案使用 [dnstt](https://www.bamsoftware.com/software/dnstt/) 實作，DNSTT 服務已整合於 `docker-compose.yml` 中，使用 Docker Compose `profiles` 選擇性啟動。
+當 HTTP/TLS 埠口被封鎖時，可以透過 DNS 查詢建立隧道連線。服務已整合於 `docker-compose.yml` 中，使用 Docker Compose `profiles` 選擇性啟動。
 
 ### 前置作業：DNS 記錄設定
 
@@ -89,44 +89,34 @@ curl -x socks5://帳號:密碼@您的伺服器IP:1080 http://ipinfo.io
 
 | 類型 | 名稱 | 值 | 用途 |
 |------|------|-----|------|
-| A/AAAA | `tns.example.com` | `您的伺服器 IP` | 隧道伺服器位址 |
-| NS | `t.example.com` | `tns.example.com` | 將 DNS 查詢導向隧道伺服器 |
+| A | `ns.example.com` | `您的伺服器 IP` | 隧道伺服器位址 |
+| NS | `t.example.com` | `ns.example.com` | 將 DNS 查詢導向隧道伺服器 |
 
 ### 伺服器端啟動
 
-編輯 `docker-compose.yml`，在 dnstt service 的環境變數中填入您的域名後啟動：
+編輯 `docker-compose.yml`，在 `dnstt` 服務的環境變數中填入您的域名後啟動：
 
 ```bash
 # 編輯 docker-compose.yml，將 DNSTT_DOMAIN 改為您的實際域名
 # 例如: - DNSTT_DOMAIN=t.example.com
 
-# 啟動 wstunnel + DNSTT（使用 --profile dnstt）
+# 啟動 wstunnel + DNS 隧道（使用 --profile dnstt）
 docker compose --profile dnstt up -d
 ```
 
-第一次啟動後，金鑰會自動生成並儲存於 `./data/dnstt/` 資料夾。請取得公鑰提供給客戶端：
-
-```bash
-docker logs dnstt | grep -A1 "公鑰"
-# 或直接查看檔案
-cat ./data/dnstt/server.pub
-```
+啟動後，憑證與密鑰會自動生成在 `./data/dnstt/` 中。
 
 ### 客戶端連線
 
+使用 [slipstream-client](https://github.com/Mygod/slipstream-rust) 進行連線：
+
 ```bash
-# 下載 dnstt-client
-git clone https://www.bamsoftware.com/git/dnstt.git
-cd dnstt/dnstt-client && go build
+# 透過 slipstream-client 建立本地 SOCKS 轉發
+# 假設監聽在本地 7000 埠口
+./slipstream-client --tcp-listen-port 7000 --domain t.example.com
 
-# 透過 DoH 連線
-./dnstt-client \
-  -doh https://cloudflare-dns.com/dns-query \
-  -pubkey-file server.pub \
-  t.example.com 127.0.0.1:2222
-
-# 接著透過本地 2222 埠口連線 SSH
-ssh -p 2222 帳號@127.0.0.1
+# 接著即可透過本地 7000 埠口上網
+curl -x socks5h://127.0.0.1:7000 http://ifconfig.me
 ```
 
 ---
