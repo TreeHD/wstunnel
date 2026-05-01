@@ -1,73 +1,60 @@
-#!/bin/sh
-
-# ======================================================
-#  Slipstream + SOCKS 模式啟動腳本
-# ======================================================
+#!/bin/bash
 
 set -e
 
-DATA_DIR="/data/dnstt"
-mkdir -p "$DATA_DIR"
-
-# 1. 檢查必要變數
-if [ -z "$DNSTT_DOMAIN" ]; then
-    echo "[slipstream] 錯誤: 環境變數 DNSTT_DOMAIN 未設定，請在 docker-compose.yml 中填入您的 DNS 隧道域名。"
-    exit 1
+# 1. 檢查並生成 wgcf 配置 (Cloudflare WARP)
+# 這裡使用 wgcf 直接註冊並生成配置文件
+if [ ! -f "wgcf-account.toml" ]; then
+    echo "Registering Cloudflare WARP account..."
+    wgcf register --accept-tos
+    wgcf generate
 fi
 
-# 2. 自動產生憑證與金鑰 (如果不存在)
-# Slipstream 使用 TLS 憑證進行加密
-if [ ! -f "$DATA_DIR/cert.pem" ]; then
-    echo "[slipstream] 首次啟動，產生自我簽署憑證與重置種子..."
-    openssl req -x509 -newkey rsa:2048 \
-        -keyout "$DATA_DIR/key.pem" \
-        -out "$DATA_DIR/cert.pem" \
-        -days 3650 -nodes \
-        -subj "/CN=$DNSTT_DOMAIN"
+# 2. 生成 wireproxy 配置 (帶有帳密驗證)
+# 自動從 wgcf 生成的配置文件中提取密鑰
+if [ ! -f "wireproxy.conf" ]; then
+    echo "Configuring wireproxy with SOCKS5 Auth..."
+    PRIVATE_KEY=$(grep PrivateKey wgcf-profile.conf | awk '{print $3}')
+    PUBLIC_KEY=$(grep PublicKey wgcf-profile.conf | awk '{print $3}')
+    ENDPOINT=$(grep Endpoint wgcf-profile.conf | awk '{print $3}')
     
-    # 產生 32 bytes 的隨機種子
-    dd if=/dev/urandom bs=32 count=1 of="$DATA_DIR/reset-seed" 2>/dev/null
-    echo "[slipstream] 憑證與種子產生完成。"
-fi
+    cat <<EOF > wireproxy.conf
 
-# 3. 配置 Dante SOCKS 代理
-# 我們將 SOCKS 伺服器架設在 127.0.0.1:1080，僅供 Slipstream 內部轉發
-EXT_IP=$(ip -4 addr show scope global | awk '/inet /{print $2}' | cut -d/ -f1 | head -1)
-if [ -z "$EXT_IP" ]; then
-    # 如果無法透過 ip 指令獲取，嘗試外部 API
-    EXT_IP=$(curl -s --max-time 5 ifconfig.me || echo "0.0.0.0")
-fi
+WGConfig = ./wgcf-profile.conf
 
-echo "[dante] 偵測到外部 IP: $EXT_IP，配置 SOCKS5 代理在 127.0.0.1:1080..."
-cat > /etc/danted.conf <<EOF
-logoutput: stderr
-
-internal: 127.0.0.1 port = 1080
-external: $EXT_IP
-
-socksmethod: none
-clientmethod: none
-
-client pass {
-    from: 127.0.0.1/32 to: 0.0.0.0/0
-}
-
-socks pass {
-    from: 127.0.0.1/32 to: 0.0.0.0/0
-    protocol: tcp udp
-}
+[Socks5]
+BindAddress = 127.0.0.1:1080
 EOF
+fi
 
-# 4. 啟動 Dante (背景執行)
-danted -D
-echo "[dante] Dante SOCKS 代理已啟動。"
+# 3. 生成 DNS 隧道證書與種子
+if [ ! -f "cert.pem" ]; then
+    openssl req -x509 -newkey rsa:2048 -nodes -keyout key.pem -out cert.pem -days 3650 -subj "/CN=$DOMAIN"
+fi
+if [ ! -f "reset.seed" ]; then
+    openssl rand -hex 32 > reset.seed
+fi
 
-# 5. 啟動 Slipstream Server (轉發至本地 1080)
-echo "[slipstream] 啟動伺服器: $DNSTT_DOMAIN -> SOCKS:1080"
+# 4. 啟動 wireproxy (後台運行)
+wireproxy -c wireproxy.conf &
+
+# 5. 啟動 slipstream-server
+echo "=================================================="
+echo "WARP SOCKS5 Auth User: ${PROXY_USER:-admin}"
+echo "WARP SOCKS5 Auth Pass: ${PROXY_PASS:-password123}"
+echo "Slipstream Domain: $DOMAIN"
+echo "=================================================="
+
+# 2. 啟動 slipstream-server
+# --udp-bind: 監聽容器內的 5353 端口
+# --domain: 你的 NS 域名
+# --target: 流量轉發到本地的 SOCKS5
+# --cert/--key: 證書路徑
+echo "Starting Slipstream server on UDP 5353..."
 exec slipstream-server \
-    --dns-listen-port 5300 \
+    --dns-listen-port 5353 \
+    --domain "$DOMAIN" \
     --target-address 127.0.0.1:1080 \
-    --domain "$DNSTT_DOMAIN" \
-    --cert "$DATA_DIR/cert.pem" \
-    --key "$DATA_DIR/key.pem" \
-    --reset-seed "$DATA_DIR/reset-seed"
+    --cert cert.pem \
+    --key key.pem \
+     --reset-seed "$(cat reset.seed)"

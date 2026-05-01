@@ -1,60 +1,32 @@
-# ===== Slipstream (Rust) + SOCKS 模式伺服器 =====
-# 此映像包含了 slipstream-server 與 dante-server (SOCKS Proxy)
-# 提供一站式的 DNS 隧道 SOCKS 服務
-
-# --- 階段 1: 編譯器 ---
-FROM rust:alpine AS builder
-
-# 安裝編譯所需工具
-RUN apk add --no-cache \
-    musl-dev \
-    git \
-    cmake \
-    make \
-    g++ \
-    pkgconfig \
-    openssl-dev \
-    bash \
-    perl \
-    linux-headers \
-    autoconf \
-    automake \
-    libtool \
-    openssl-libs-static
-
-# 複製或複製原始碼
-RUN git clone https://github.com/Mygod/slipstream-rust.git /app
+# 第一階段：編譯 slipstream-server
+FROM rustlang/rust:nightly-bookworm-slim AS builder
+RUN apt-get update && apt-get install -y git cmake pkg-config libssl-dev python3 build-essential && rm -rf /var/lib/apt/lists/*
 WORKDIR /app
-
-# 初始化子模組並編譯
-RUN git submodule update --init --recursive
-ENV OPENSSL_STATIC=1
+RUN git clone --recursive https://github.com/Mygod/slipstream-rust.git .
 RUN cargo build --release -p slipstream-server
 
-# --- 階段 2: 執行環境 ---
-FROM alpine:latest
+# 第二階段：運行環境
+FROM debian:bookworm-slim
+RUN apt-get update && apt-get install -y curl openssl ca-certificates jq wget && rm -rf /var/lib/apt/lists/*
 
-# 安裝執行所需套件
-# dante-server: SOCKS 代理伺服器
-# openssl: 用於產生自我簽署憑證
-RUN apk add --no-cache \
-    dante-server \
-    openssl \
-    ca-certificates \
-    iproute2 \
-    curl
+# 1. 安裝 wgcf (自動識別 amd64/arm64)
+RUN curl -fsSL https://raw.githubusercontent.com/P3TERX/script/master/wgcf.sh | bash
 
-# 從編譯階段複製執行檔
+# 2. 安裝 wireproxy (手動指定最新穩定版 v1.0.9，避開 API 轉向問題)
+RUN CASE_ARCH="$(uname -m)" && \
+    if [ "$CASE_ARCH" = "x86_64" ]; then W_ARCH="amd64"; \
+    elif [ "$CASE_ARCH" = "aarch64" ]; then W_ARCH="arm64"; \
+    else echo "Unsupported architecture: $CASE_ARCH"; exit 1; fi && \
+    echo "Downloading wireproxy v1.0.9 for ${W_ARCH}..." && \
+    curl -L -f -o /tmp/wireproxy.tar.gz "https://github.com/windtf/wireproxy/releases/download/v1.1.2/wireproxy_linux_${W_ARCH}.tar.gz" && \
+    tar -xzf /tmp/wireproxy.tar.gz -C /usr/local/bin/ wireproxy && \
+    chmod +x /usr/local/bin/wireproxy && rm /tmp/wireproxy.tar.gz
+
+# 3. 複製編譯好的服務
 COPY --from=builder /app/target/release/slipstream-server /usr/local/bin/
 
-# 複製啟動腳本
 COPY entrypoint.dnstt.sh /entrypoint.sh
 RUN chmod +x /entrypoint.sh
 
-# 5300/udp: DNS 隧道入口 (由 docker-compose 轉發 53 -> 5300)
-EXPOSE 5300/udp
-
-# 數據持久化路徑
-VOLUME ["/data/dnstt"]
-
+WORKDIR /data
 ENTRYPOINT ["/entrypoint.sh"]
