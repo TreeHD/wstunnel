@@ -42,7 +42,7 @@ wireproxy -c wireproxy.conf &
 echo "=================================================="
 echo "WARP SOCKS5 Auth User: ${PROXY_USER:-admin}"
 echo "WARP SOCKS5 Auth Pass: ${PROXY_PASS:-password123}"
-echo "Slipstream Domain: $DOMAIN"
+echo "Slipstream Domain: $DNSTT_DOMAIN"
 echo "=================================================="
 
 # 2. 啟動 slipstream-server
@@ -53,7 +53,7 @@ echo "=================================================="
 echo "Starting Slipstream server on UDP 5353..."
 exec slipstream-server \
     --dns-listen-port 5353 \
-    --domain "$DOMAIN" \
+    --domain "$DNSTT_DOMAIN" \
     --target-address 127.0.0.1:1080 \
     --cert cert.pem \
     --key key.pem \

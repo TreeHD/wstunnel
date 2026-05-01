@@ -52,12 +52,8 @@ services:
     container_name: dnstt
     restart: always
     ports:
-      - "53:5300/udp"   # 對外監聽 UDP 53，容器內使用 5300 避免需要 NET_ADMIN
+      - "53:5353/udp"   # 對外監聽 UDP 53，容器內使用 5353 避免需要 NET_ADMIN
     environment:
       # [必填] DNS 隧道域名，須與 DNS NS 記錄一致
       # 範例: t.example.com  請將此行替換為您的實際域名
       - DNSTT_DOMAIN=
-    volumes:
-      # 持久化 DNSTT 金鑰與憑證至 data/dnstt/ 資料夾
-      - ./data/dnstt:/data/dnstt
-    # 注意: Slipstream 現在內建 SOCKS5 代理，不再需要轉發至 wstunnel
