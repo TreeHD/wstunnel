@@ -40,8 +40,6 @@ wireproxy -c wireproxy.conf &
 
 # 5. 啟動 slipstream-server
 echo "=================================================="
-echo "WARP SOCKS5 Auth User: ${PROXY_USER:-admin}"
-echo "WARP SOCKS5 Auth Pass: ${PROXY_PASS:-password123}"
 echo "Slipstream Domain: $DNSTT_DOMAIN"
 echo "=================================================="
 
