@@ -53,9 +53,10 @@ docker-compose up -d
 第一次啟動後，系統會自動在 `./data` 資料夾內生成 `config.json` 與 `traffic.json`。
 後台所有的修改（新增帳號、限流設定、SNI 白名單等）都會即時寫入 `data/` 資料夾，升級或重啟 Docker 都不會導致資料遺失。
 
-## 🛠 進階：自行編譯 (不推薦，建議使用 Docker)
+## 🛠 進階：自行編譯 (不推薦，建議使用 Docker) 
 
 如果您真的需要直接在本地編譯執行，請確保安裝了 Go 1.24+：
+
 
 ```bash
 go mod tidy
