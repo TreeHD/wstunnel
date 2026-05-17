@@ -2,6 +2,7 @@ package main
 
 import (
 	"bufio"
+	"context"
 	"encoding/base64"
 	"fmt"
 	"io"
@@ -131,7 +132,7 @@ func sendProxyAuthenticateChallenge(conn net.Conn) {
 }
 
 func handleHttpConnectMethod(client net.Conn, req *http.Request, username string) {
-	destConn, err := net.DialTimeout("tcp", req.Host, 10*time.Second)
+	destConn, err := newDialer(10 * time.Second).DialContext(context.Background(), "tcp", req.Host)
 	if err != nil {
 		client.Write([]byte("HTTP/1.1 502 Bad Gateway\r\n\r\n"))
 		return
@@ -144,7 +145,7 @@ func handleStandardHttpProxyRequest(client net.Conn, req *http.Request, username
 	req.Header.Del("Proxy-Authorization")
 	req.Header.Del("Proxy-Connection")
 
-	destConn, err := net.DialTimeout("tcp", req.Host, 10*time.Second)
+	destConn, err := newDialer(10 * time.Second).DialContext(context.Background(), "tcp", req.Host)
 	if err != nil {
 		client.Write([]byte("HTTP/1.1 502 Bad Gateway\r\n\r\n"))
 		return
@@ -277,7 +278,7 @@ func handleSocks5Proxy(conn net.Conn, reader *bufio.Reader) {
 		destAddr = fmt.Sprintf("%s:%d", destHost, destPort)
 	}
 
-	destConn, err := net.DialTimeout("tcp", destAddr, 10*time.Second)
+	destConn, err := newDialer(10 * time.Second).DialContext(context.Background(), "tcp", destAddr)
 	if err != nil {
 		conn.Write([]byte{0x05, 0x04, 0x00, 0x01, 0, 0, 0, 0, 0, 0}) // Host unreachable
 		return

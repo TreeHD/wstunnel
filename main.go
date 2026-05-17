@@ -4,6 +4,7 @@ package main
 import (
 	"bufio"
 	"bytes"
+	"context"
 	"crypto/ecdsa"
 	"crypto/ed25519"
 	"crypto/elliptic"
@@ -65,11 +66,50 @@ type Config struct {
 	DefaultLimitGB              float64                `json:"default_limit_gb,omitempty"`
 	TrafficSaveIntervalSeconds  int                    `json:"traffic_save_interval_seconds,omitempty"`
 	ProxyAddr                   string                 `json:"proxy_addr,omitempty"`
+	// DNSServer 指定代理出站時使用的 DNS 伺服器，格式為 "ip:port"。
+	// 留空則使用容器預設 DNS（/etc/resolv.conf）。
+	// 範例: "8.8.8.8:53" 或 "1.1.1.1:53"
+	DNSServer                   string                 `json:"dns_server,omitempty"`
 	lock                        sync.RWMutex
 }
 
 var globalConfig *Config
 var serverStartTime = time.Now()
+
+// newResolver 根據 globalConfig.DNSServer 建立 DNS resolver。
+// 強制使用 Go 純 Go DNS (PreferGo:true)，確保 CGO_ENABLED=0 環境下能正常解析域名。
+// 若 DNSServer 有設定，則向指定的 DNS 伺服器查詢（不受 /etc/resolv.conf 影響）。
+func newResolver() *net.Resolver {
+	globalConfig.lock.RLock()
+	dnsServer := globalConfig.DNSServer
+	globalConfig.lock.RUnlock()
+
+	if dnsServer == "" {
+		// 使用容器預設 DNS，但強制 Go pure-Go 解析器
+		return &net.Resolver{PreferGo: true}
+	}
+	// 確保有 port（如果只填 IP 自動補 :53）
+	if _, _, err := net.SplitHostPort(dnsServer); err != nil {
+		dnsServer = dnsServer + ":53"
+	}
+	addr := dnsServer
+	return &net.Resolver{
+		PreferGo: true,
+		Dial: func(ctx context.Context, network, address string) (net.Conn, error) {
+			// 忽略傳入的 address，固定使用我們指定的 DNS 伺服器
+			d := net.Dialer{Timeout: 5 * time.Second}
+			return d.DialContext(ctx, "udp", addr)
+		},
+	}
+}
+
+// newDialer 建立一個帶有正確 DNS resolver 的 net.Dialer。
+func newDialer(timeout time.Duration) *net.Dialer {
+	return &net.Dialer{
+		Timeout:  timeout,
+		Resolver: newResolver(),
+	}
+}
 
 type OnlineUser struct {
 	ConnID      string    `json:"conn_id"`
@@ -395,7 +435,7 @@ func handleDirectTCPIP(ch ssh.Channel, destHost string, destPort uint32, remoteA
 	globalConfig.lock.RLock()
 	connectTimeout := time.Duration(globalConfig.TargetConnectTimeoutSeconds) * time.Second
 	globalConfig.lock.RUnlock()
-	destConn, err := net.DialTimeout("tcp", destAddr, connectTimeout)
+	destConn, err := newDialer(connectTimeout).DialContext(context.Background(), "tcp", destAddr)
 	if err != nil {
 		log.Printf("TCP Proxy: Failed to connect to %s for user %s: %v", destAddr, username, err)
 		ch.Close()
@@ -503,9 +543,12 @@ func handleSshConnection(c net.Conn, r io.Reader, sshCfg *ssh.ServerConfig) {
 			if err != nil {
 				continue
 			}
+			// RFC 4254 Section 7.2: direct-tcpip ExtraData 包含 4 個欄位
 			var payload struct {
-				Host string
-				Port uint32
+				Host           string
+				Port           uint32
+				OriginatorIP   string
+				OriginatorPort uint32
 			}
 			ssh.Unmarshal(newChan.ExtraData(), &payload)
 			go handleDirectTCPIP(ch, payload.Host, payload.Port, sshConn.RemoteAddr(), username)
@@ -920,6 +963,7 @@ func apiHandler(w http.ResponseWriter, r *http.Request) {
 			globalConfig.DefaultExpiryDays = newSettings.DefaultExpiryDays
 			globalConfig.DefaultLimitGB = newSettings.DefaultLimitGB
 			globalConfig.AllowedSNI = newSettings.AllowedSNI
+			globalConfig.DNSServer = newSettings.DNSServer
 			globalConfig.lock.Unlock()
 			if err := safeSaveConfig(); err != nil {
 				sendJSON(w, http.StatusInternalServerError, map[string]string{"message": "保存配置失败: " + err.Error()})
@@ -985,6 +1029,7 @@ func main() {
 			AdminAddr:                   os.Getenv("ADMIN_ADDR"),
 			ProxyAddr:                   os.Getenv("PROXY_ADDR"),
 			ConnectUA:                   os.Getenv("CONNECT_UA"),
+			DNSServer:                   os.Getenv("DNS_SERVER"),
 			HandshakeTimeout:            envToInt("HANDSHAKE_TIMEOUT", 5),
 			BufferSizeKB:                envToInt("BUFFER_SIZE_KB", 32),
 			IdleTimeoutSeconds:          envToInt("IDLE_TIMEOUT_SECONDS", 120),
@@ -1080,6 +1125,11 @@ func main() {
 	log.Printf("  Proxy Server Addr (SOCKS5/HTTP): %s", globalConfig.ProxyAddr)
 	log.Printf("  Allowed SNI Hosts: %v", globalConfig.AllowedSNI)
 	log.Printf("  Admin Panel Addr: %s", globalConfig.AdminAddr)
+	if globalConfig.DNSServer != "" {
+		log.Printf("  DNS Server (custom): %s", globalConfig.DNSServer)
+	} else {
+		log.Printf("  DNS Server: (using container default, /etc/resolv.conf)")
+	}
 	log.Println("------------------ Behaviors ---------------------")
 	log.Printf("  Handshake Timeout: %d seconds", globalConfig.HandshakeTimeout)
 	log.Printf("  Required User-Agent: %s", globalConfig.ConnectUA)
