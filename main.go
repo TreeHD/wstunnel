@@ -497,20 +497,27 @@ func handleSshConnection(c net.Conn, r io.Reader, sshCfg *ssh.ServerConfig) {
 	defer onlineUsers.Delete(onlineUser.ConnID)
 	go ssh.DiscardRequests(reqs)
 	for newChan := range chans {
-		if newChan.ChannelType() != "direct-tcpip" {
+		switch newChan.ChannelType() {
+		case "direct-tcpip":
+			ch, _, err := newChan.Accept()
+			if err != nil {
+				continue
+			}
+			var payload struct {
+				Host string
+				Port uint32
+			}
+			ssh.Unmarshal(newChan.ExtraData(), &payload)
+			go handleDirectTCPIP(ch, payload.Host, payload.Port, sshConn.RemoteAddr(), username)
+		case "tun-tcpip", "ip-tunnel":
+			ch, _, err := newChan.Accept()
+			if err != nil {
+				continue
+			}
+			go handleIPTunnel(ch, sshConn.RemoteAddr())
+		default:
 			newChan.Reject(ssh.UnknownChannelType, "unsupported")
-			continue
 		}
-		ch, _, err := newChan.Accept()
-		if err != nil {
-			continue
-		}
-		var payload struct {
-			Host string
-			Port uint32
-		}
-		ssh.Unmarshal(newChan.ExtraData(), &payload)
-		go handleDirectTCPIP(ch, payload.Host, payload.Port, sshConn.RemoteAddr(), username)
 	}
 }
 
@@ -1090,6 +1097,12 @@ func main() {
 	log.Println("==================================================")
 
 	loadTrafficData()
+
+	if err := createTunDevice(); err != nil {
+		log.Printf("System: Warning - IP Tunnel feature disabled (%v)", err)
+	} else {
+		go readFromTunAndDistribute()
+	}
 
 	go func() {
 		saveInterval := time.Duration(globalConfig.TrafficSaveIntervalSeconds) * time.Second
