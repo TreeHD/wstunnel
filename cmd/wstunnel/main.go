@@ -24,6 +24,7 @@ import (
 	"golang.org/x/crypto/ssh"
 
 	"wstunnel/internal/adminapi"
+	"wstunnel/internal/cluster"
 	"wstunnel/internal/config"
 	"wstunnel/internal/dispatcher"
 	"wstunnel/internal/dnsx"
@@ -68,9 +69,21 @@ func main() {
 
 	sshsrv.InitBufferPool()
 
+	// 叢集 hooks(僅 Slave 模式會用,但安全起見一律註冊)
+	cluster.RegisterSlaveHooks(cluster.SlaveHooks{
+		KickConnID:    sshsrv.KickByConnID,
+		ListOnline:    onlineSnapshotForCluster,
+		ApplySettings: func(_ cluster.SharedSettings) { sshsrv.InitBufferPool() },
+	})
+
 	adminServer := adminapi.Start(&wg)
 	sshCfg := sshsrv.BuildServerConfig()
 	tlsListener, sshListener := startTunnelListeners(&wg, sshCfg)
+
+	// Slave 模式:啟動心跳 loop(設定不全會自行記錄並退出)
+	if cluster.IsSlave() {
+		cluster.StartSlave(&wg)
+	}
 
 	// 等中斷訊號
 	quit := make(chan os.Signal, 1)
@@ -78,6 +91,21 @@ func main() {
 	<-quit
 
 	gracefulShutdown(adminServer, tlsListener, sshListener, &wg)
+}
+
+// onlineSnapshotForCluster 把 sshsrv 的線上連線轉成 cluster.OnlineSnapshot 給心跳上報用。
+func onlineSnapshotForCluster() []cluster.OnlineSnapshot {
+	var out []cluster.OnlineSnapshot
+	sshsrv.OnlineRange(func(u *sshsrv.OnlineUser) bool {
+		out = append(out, cluster.OnlineSnapshot{
+			ConnID:      u.ConnID,
+			Username:    u.Username,
+			RemoteAddr:  u.RemoteAddr,
+			ConnectTime: u.ConnectTime.Unix(),
+		})
+		return true
+	})
+	return out
 }
 
 // startTunnelListeners 啟動 80 (HTTP Upgrade) 與 443 (TLS multiplexer) 兩個入口。
@@ -180,6 +208,14 @@ func printStartupBanner() {
 		log.Printf("  Upstream Proxy: ENABLED (%s)", proxy.RedactURL(c.UpstreamProxyURL))
 	} else {
 		log.Printf("  Upstream Proxy: disabled (direct dial)")
+	}
+	switch c.ClusterRole {
+	case "master":
+		log.Printf("  Cluster Role: MASTER (registered slaves: %d)", len(c.Slaves))
+	case "slave":
+		log.Printf("  Cluster Role: SLAVE (master=%s, node=%s)", c.MasterURL, c.NodeID)
+	default:
+		log.Printf("  Cluster Role: standalone")
 	}
 	log.Println("------------------ Behaviors ---------------------")
 	log.Printf("  Handshake Timeout: %d seconds", c.HandshakeTimeout)

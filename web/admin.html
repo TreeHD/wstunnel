@@ -559,6 +559,7 @@
             <a href="#/account">安全設定</a>
             <a href="#/settings">系統設定</a>
             <a href="#/logs">系統日誌</a>
+            <a href="#/cluster" id="nav-cluster" style="display:none">節點管理</a>
             <a style="margin-left:auto;background:#ff6b6b;color:#fff;border-radius:6px;padding:8px 12px;text-decoration:none"
                 href="/logout">登出</a>
         </nav>
@@ -778,6 +779,142 @@
         function renderLogsPage() {
             contentArea.innerHTML = `<div class="card"><h2>系統日誌 (最新 200 筆)</h2><div id="log-viewer"></div></div>`;
             renderLogs();
+        }
+
+        function renderClusterPage() {
+            contentArea.innerHTML = `
+            <div class="page-grid">
+                <div class="card">
+                    <div style="display:flex;justify-content:space-between;align-items:center;">
+                        <h2 style="margin:0;">節點清單</h2>
+                        <button class="btn primary" onclick="clusterAddNodePrompt()">新增節點</button>
+                    </div>
+                    <p style="color:#64748b;font-size:13px;margin-top:8px;">
+                        Master 模式下,所有節點會定期向本機回報心跳。新增後請複製產生的 docker-compose.yml 到目標機器啟動。
+                    </p>
+                    <div class="table-container" style="margin-top:12px;">
+                        <table>
+                            <thead><tr><th>狀態</th><th>名稱 / Node ID</th><th>對外位址</th><th>線上連線</th><th>CPU / 記憶體</th><th>最後心跳</th><th>操作</th></tr></thead>
+                            <tbody id="cluster-slaves-body"></tbody>
+                        </table>
+                    </div>
+                </div>
+                <div class="right-panel-wrapper">
+                    <div class="card">
+                        <h3 style="margin-top:0;">跨節點線上連線</h3>
+                        <div class="table-container" style="max-height:300px;">
+                            <table>
+                                <thead><tr><th>節點</th><th>帳號</th><th>IP</th><th>連線時間</th></tr></thead>
+                                <tbody id="cluster-online-body"></tbody>
+                            </table>
+                        </div>
+                    </div>
+                    <div class="card" id="cluster-detail" style="display:none">
+                        <h3 style="margin-top:0;">節點詳情</h3>
+                        <div id="cluster-detail-body"></div>
+                    </div>
+                </div>
+            </div>`;
+            refreshClusterPage();
+        }
+
+        async function refreshClusterPage() {
+            const slaves = await apiRequest('/api/cluster/slaves');
+            const online = await apiRequest('/api/cluster/online');
+            const tbody = gid('cluster-slaves-body');
+            if (tbody) {
+                tbody.innerHTML = (slaves || []).map(s => {
+                    const status = s.online
+                        ? '<span class="status-pill status-活躍">線上</span>'
+                        : '<span class="status-pill" style="background:#94a3b8;color:#fff">離線</span>';
+                    const lastSeen = s.last_seen_ago_sec === 0 && !s.online ? '從未連線'
+                        : `${s.last_seen_ago_sec}s 前`;
+                    const cpuMem = s.online ? `${(s.cpu_percent || 0).toFixed(1)}% / ${(s.mem_percent || 0).toFixed(1)}%` : '-';
+                    return `<tr>
+                        <td>${status}</td>
+                        <td><strong>${escapeHtml(s.node_name)}</strong><br><small style="color:#64748b">${s.node_id}</small></td>
+                        <td>${escapeHtml(s.public_addr || '-')}</td>
+                        <td>${s.active_conns || 0}</td>
+                        <td>${cpuMem}</td>
+                        <td>${lastSeen}</td>
+                        <td>
+                            <button class="btn info btn-sm" onclick="clusterShowCompose('${s.node_id}','${escapeAttr(s.node_name)}')">部署檔</button>
+                            <button class="btn secondary btn-sm" onclick="clusterShowLogs('${s.node_id}','${escapeAttr(s.node_name)}')">日誌</button>
+                            <button class="btn danger btn-sm" onclick="clusterRemoveNode('${s.node_id}','${escapeAttr(s.node_name)}')">移除</button>
+                        </td>
+                    </tr>`;
+                }).join('') || '<tr><td colspan="7" style="text-align:center;">尚未註冊任何節點</td></tr>';
+            }
+            const ob = gid('cluster-online-body');
+            if (ob) {
+                ob.innerHTML = (online || []).map(o => `<tr>
+                    <td>${escapeHtml(o.node_name || o.node_id)}</td>
+                    <td>${escapeHtml(o.username)}</td>
+                    <td>${escapeHtml(o.remote_addr)}</td>
+                    <td>${o.connect_time ? new Date(o.connect_time * 1000).toLocaleString() : '-'}</td>
+                </tr>`).join('') || '<tr><td colspan="4" style="text-align:center;">無</td></tr>';
+            }
+        }
+
+        function escapeHtml(s) { return (s || '').replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c])); }
+        function escapeAttr(s) { return (s || '').replace(/['"\\]/g, '\\$&'); }
+
+        async function clusterAddNodePrompt() {
+            const name = prompt('節點名稱(例: 東京-A):');
+            if (!name) return;
+            const notes = prompt('備註(可空白):', '') || '';
+            const rec = await apiRequest('/api/cluster/slaves', {
+                method: 'POST', body: JSON.stringify({ name, notes })
+            });
+            if (rec) {
+                showToast(`已建立節點 ${rec.node_id}`);
+                refreshClusterPage();
+                clusterShowCompose(rec.node_id, rec.node_name);
+            }
+        }
+
+        async function clusterRemoveNode(id, name) {
+            showConfirm('移除節點', `確定要移除「${name}」?該節點的 token 立即失效,既有部署將無法再上報。`, async () => {
+                const r = await apiRequest('/api/cluster/slaves/' + encodeURIComponent(id), { method: 'DELETE' });
+                if (r) { showToast('已移除'); refreshClusterPage(); }
+            });
+        }
+
+        async function clusterShowCompose(id, name) {
+            const masterURL = prompt('Master 對外網址(例: https://master.example.com:9090):', window.location.origin);
+            if (!masterURL) return;
+            const publicAddr = prompt(`Slave「${name}」的對外連線位址(用戶會連的網址,例: tunnel-jp.example.com:443):`, '') || '';
+            const skipTLS = !masterURL.startsWith('https://');
+            const r = await apiRequest('/api/cluster/slaves/' + encodeURIComponent(id) + '/compose', {
+                method: 'POST',
+                body: JSON.stringify({
+                    master_url: masterURL,
+                    public_addr: publicAddr,
+                    skip_tls_verify: skipTLS,
+                    heartbeat_sec: 30
+                })
+            });
+            if (!r) return;
+            const detail = gid('cluster-detail');
+            const body = gid('cluster-detail-body');
+            detail.style.display = '';
+            body.innerHTML = `
+                <p style="font-size:13px;color:#64748b">複製下方 YAML 到目標機器存成 <code>docker-compose.yml</code>,執行 <code>docker compose up -d</code> 即可。</p>
+                <textarea readonly style="width:100%;height:320px;font-family:monospace;font-size:12px;">${escapeHtml(r.yaml)}</textarea>
+                <div style="display:flex;gap:8px;margin-top:8px;">
+                    <button class="btn primary" onclick="navigator.clipboard.writeText(this.previousElementSibling.previousElementSibling.value);showToast('已複製到剪貼簿')">複製</button>
+                </div>`;
+        }
+
+        async function clusterShowLogs(id, name) {
+            const logs = await apiRequest('/api/cluster/slaves/' + encodeURIComponent(id) + '/logs');
+            const detail = gid('cluster-detail');
+            const body = gid('cluster-detail-body');
+            detail.style.display = '';
+            const lines = (logs || []).map(e => `[${escapeHtml(e.timestamp)}] ${escapeHtml(e.message)}`).join('\n') || '(尚無日誌)';
+            body.innerHTML = `
+                <h4 style="margin:0 0 8px">節點「${escapeHtml(name)}」日誌</h4>
+                <pre style="background:#0f172a;color:#f8fafc;padding:12px;border-radius:6px;max-height:380px;overflow:auto;font-size:12px;">${lines}</pre>`;
         }
 
         // --- 表格與內容更新 ---
@@ -1018,7 +1155,7 @@
         }
 
         // --- 路由與初始化 ---
-        const routes = { '#/status': renderStatusPage, '#/device': renderDevicePage, '#/account': renderAccountPage, '#/settings': renderSettingsPage, '#/logs': renderLogsPage };
+        const routes = { '#/status': renderStatusPage, '#/device': renderDevicePage, '#/account': renderAccountPage, '#/settings': renderSettingsPage, '#/logs': renderLogsPage, '#/cluster': renderClusterPage };
         async function router() {
             clearInterval(refreshInterval);
             const path = window.location.hash || '#/status';
@@ -1054,6 +1191,14 @@
             appState.status = status || {};
             appState.settings = settings;
             appState.currentUser = whoami?.username || 'admin';
+
+            // 顯示節點管理頁籤(僅 Master 模式)
+            const role = await apiRequest('/api/cluster/role');
+            if (role && role.role === 'master') {
+                const nav = gid('nav-cluster');
+                if (nav) nav.style.display = '';
+            }
+
             if (!window.location.hash) window.location.hash = '#/status';
             await router();
         }

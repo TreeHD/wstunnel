@@ -106,6 +106,16 @@ func KickByUsername(username string) {
 	}
 }
 
+// KickByConnID 關閉特定 conn_id 的連線。回傳是否找到並關閉。
+func KickByConnID(connID string) bool {
+	v, ok := online.Load(connID)
+	if !ok {
+		return false
+	}
+	v.(*OnlineUser).SSHConn.Close()
+	return true
+}
+
 // LoadOrGenerateHostKey 從磁碟載入持久化的 SSH host key,若不存在則產生並儲存。
 func LoadOrGenerateHostKey() ssh.Signer {
 	if data, err := os.ReadFile(sshHostKeyFile); err == nil {

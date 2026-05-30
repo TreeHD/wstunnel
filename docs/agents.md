@@ -21,6 +21,7 @@
     * `sshsrv`: SSH 握手、tolerantCopy、direct-tcpip
     * `dispatcher`: 80/443 入口分流 + HTTP Upgrade 偽裝
     * `adminapi`: 9090 後台所有 HTTP handler
+    * `cluster`: Master/Slaves 多機部署(types/HMAC、master registry、slave heartbeat、compose 產生器)
   * `web/`: 控制面板的網頁前端 (HTML)
   * `build/`: Docker 相關檔案
     * `Dockerfile`, `Dockerfile.dnstt`: 主程式與 DNSTT 隧道映像建置
@@ -35,6 +36,13 @@
 * **DNS 隧道 (DNSTT)**:內建 [Slipstream-rust](https://github.com/Mygod/slipstream-rust) 支援,獨立 image。
 * **流量統計**:`internal/traffic` 用 sync.Map + atomic 累加,定期存盤。
 * **Port 複用**:`443` 入口在 `internal/dispatcher` 做 Peek 判斷 SSH-direct vs HTTP-Upgrade 偽裝。**修改這一塊時請特別注意不要破壞原有的 Peek 邏輯。**
+* **叢集模式 (Master/Slaves)**:`internal/cluster` 提供 Pull-mode 心跳協定。
+  * 角色由 `cluster_role` (config) 或 `CLUSTER_ROLE` (env) 決定,值為 `standalone`/`master`/`slave`。
+  * Master 在 `/api/cluster/heartbeat` 接收 Slave 心跳(token + HMAC-SHA256 雙重認證,**不走 admin cookie**)。
+  * Slave 啟動後在 main 註冊 `cluster.SlaveHooks`,定期上報 traffic delta、線上連線、log tail,並套用 Master 下發的帳號/共用設定/踢除指令。
+  * 「節點登錄」資料持久化在 `config.Slaves` (NodeID → Token);runtime 狀態(LastSeen 等)在記憶體。
+  * UI 會在登入後查 `/api/cluster/role`,僅 Master 顯示「節點管理」頁籤。Slave 端 admin 仍可獨立登入但管理面是唯讀屬性。
+  * 上游帳號/SNI/握手等共享設定由 Master 強制覆寫,**ListenAddr/AdminAddr/DNSServer/UDPGWPort 等本機資源欄位刻意不下發**,讓節點可獨立調整。
 
 
 ## 2. 開發習慣與指導原則

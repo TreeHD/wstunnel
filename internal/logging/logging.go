@@ -25,11 +25,15 @@ type Collector struct {
 	mu     sync.RWMutex
 	logs   []string
 	maxCap int
+	// nextSeq 是下一行寫入時要分配的序號(從 1 開始)。
+	// 配合 baseSeq 可推算「目前緩衝中第 i 個 log 的全域序號」。
+	nextSeq  int64
+	baseSeq  int64 // 緩衝中第 0 個 log 對應的全域序號
 }
 
 // NewCollector 建立一個容量為 maxCap 的 Collector。
 func NewCollector(maxCap int) *Collector {
-	return &Collector{maxCap: maxCap}
+	return &Collector{maxCap: maxCap, nextSeq: 1, baseSeq: 1}
 }
 
 func (lc *Collector) Write(p []byte) (n int, err error) {
@@ -37,8 +41,11 @@ func (lc *Collector) Write(p []byte) (n int, err error) {
 	defer lc.mu.Unlock()
 	logLine := time.Now().Format("2006/01/02 15:04:05 ") + string(p)
 	lc.logs = append(lc.logs, logLine)
+	lc.nextSeq++
 	if len(lc.logs) > lc.maxCap {
-		lc.logs = lc.logs[len(lc.logs)-lc.maxCap:]
+		drop := len(lc.logs) - lc.maxCap
+		lc.logs = lc.logs[drop:]
+		lc.baseSeq += int64(drop)
 	}
 	fmt.Fprint(os.Stderr, logLine)
 	return len(p), nil
@@ -51,6 +58,33 @@ func (lc *Collector) GetLogs() []string {
 	out := make([]string, len(lc.logs))
 	copy(out, lc.logs)
 	return out
+}
+
+// GetLogsSince 取得序號 >= sinceSeq 的 log,並回傳下次該用的 sinceSeq。
+//
+// 用法(Slave heartbeat):
+//	lines, next := logging.Default.GetLogsSince(state.lastLogSeq)
+//	state.lastLogSeq = next
+//
+// 注意:若 sinceSeq 早於目前緩衝最舊那筆,會自動 catch-up 到緩衝起點(漏掉的 log
+// 視為丟失,不影響 cursor 推進),避免 Slave 重啟後第一次 sync 把 200 行老 log 全送過去。
+// 傳 0 視為「從目前最新開始」(初次心跳)。
+func (lc *Collector) GetLogsSince(sinceSeq int64) (lines []string, nextSeq int64) {
+	lc.mu.RLock()
+	defer lc.mu.RUnlock()
+	if sinceSeq <= 0 {
+		return nil, lc.nextSeq
+	}
+	if sinceSeq < lc.baseSeq {
+		sinceSeq = lc.baseSeq
+	}
+	startIdx := int(sinceSeq - lc.baseSeq)
+	if startIdx >= len(lc.logs) {
+		return nil, lc.nextSeq
+	}
+	out := make([]string, len(lc.logs)-startIdx)
+	copy(out, lc.logs[startIdx:])
+	return out, lc.nextSeq
 }
 
 // Default 是程式全域共用的 Collector,容量 200 行。

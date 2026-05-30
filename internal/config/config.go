@@ -26,6 +26,18 @@ type AccountInfo struct {
 	FriendlyName string  `json:"friendly_name"`
 }
 
+// SlaveRecord 是 Master 端為每一個註冊過的 Slave 節點保存的「持久化」資料。
+//
+// LastSeen / 即時狀態欄位放在 cluster runtime store,本結構只保留
+// 「重啟後仍須記得」的東西,以維持後台管理的連續性。
+type SlaveRecord struct {
+	NodeID    string `json:"node_id"`
+	NodeName  string `json:"node_name"`
+	Token     string `json:"token"`
+	CreatedAt int64  `json:"created_at"` // unix sec,後台顯示用
+	Notes     string `json:"notes,omitempty"`
+}
+
 // Config 是 data/config.json 的 schema,同時對應後台 /api/settings。
 type Config struct {
 	ListenAddr                  string                 `json:"listen_addr"`
@@ -54,6 +66,31 @@ type Config struct {
 	UpstreamProxyEnabled bool `json:"upstream_proxy_enabled,omitempty"`
 	// UpstreamProxyURL 形如 socks5://user:pass@host:1080 或 http://user:pass@host:8080
 	UpstreamProxyURL string `json:"upstream_proxy_url,omitempty"`
+
+	// ===== Cluster (Master/Slaves) =====
+	// ClusterRole 為 "standalone" / "master" / "slave"。空值或未識別值一律視為 standalone。
+	ClusterRole string `json:"cluster_role,omitempty"`
+
+	// === Slave 模式才會用到 ===
+	// MasterURL Slave 心跳目的地,例:https://master.example.com:9090
+	MasterURL string `json:"master_url,omitempty"`
+	// MasterToken Slave 認證用 token(在 Master 端建立節點時取得)
+	MasterToken string `json:"master_token,omitempty"`
+	// NodeID 本 Slave 節點的唯一識別,由 Master 端建立節點時產生
+	NodeID string `json:"node_id,omitempty"`
+	// NodeName 後台顯示用的友善名稱(可由 Master 下發或本機自填)
+	NodeName string `json:"node_name,omitempty"`
+	// PublicAddr 給使用者連的對外位址,例:tunnel.example.com:443(僅顯示用)
+	PublicAddr string `json:"public_addr,omitempty"`
+	// HeartbeatIntervalSec 心跳間隔(秒),預設 30,Master 可在 response 動態調整
+	HeartbeatIntervalSec int `json:"heartbeat_interval_sec,omitempty"`
+	// SkipMasterTLSVerify 連 Master 時略過 TLS 憑證驗證(自簽憑證情境)
+	SkipMasterTLSVerify bool `json:"skip_master_tls_verify,omitempty"`
+
+	// === Master 模式才會用到 ===
+	// Slaves 是 Master 端持久化的 NodeID → SlaveRecord 對映。
+	// 即時狀態(LastSeen 等)由 cluster runtime 維護,不存盤。
+	Slaves map[string]SlaveRecord `json:"slaves,omitempty"`
 
 	Lock sync.RWMutex `json:"-"`
 }
@@ -156,6 +193,14 @@ func buildFromEnv() {
 		UDPGWPort:                   EnvInt("UDPGW_PORT", 0),
 		UpstreamProxyURL:            os.Getenv("UPSTREAM_PROXY_URL"),
 		UpstreamProxyEnabled:        os.Getenv("UPSTREAM_PROXY_ENABLED") == "1" || os.Getenv("UPSTREAM_PROXY_ENABLED") == "true",
+		ClusterRole:                 os.Getenv("CLUSTER_ROLE"),
+		MasterURL:                   os.Getenv("MASTER_URL"),
+		MasterToken:                 os.Getenv("MASTER_TOKEN"),
+		NodeID:                      os.Getenv("NODE_ID"),
+		NodeName:                    os.Getenv("NODE_NAME"),
+		PublicAddr:                  os.Getenv("PUBLIC_ADDR"),
+		HeartbeatIntervalSec:        EnvInt("HEARTBEAT_INTERVAL_SEC", 30),
+		SkipMasterTLSVerify:         os.Getenv("SKIP_MASTER_TLS_VERIFY") == "1" || os.Getenv("SKIP_MASTER_TLS_VERIFY") == "true",
 	}
 
 	current.Accounts = make(map[string]AccountInfo)
@@ -223,5 +268,18 @@ func applyDefaults() {
 	}
 	if current.TrafficSaveIntervalSeconds <= 0 {
 		current.TrafficSaveIntervalSeconds = 300
+	}
+	// Cluster:正規化 Role,把空字串或不認得的值通通收斂成 "standalone"
+	switch current.ClusterRole {
+	case "master", "slave", "standalone":
+		// ok
+	default:
+		current.ClusterRole = "standalone"
+	}
+	if current.HeartbeatIntervalSec <= 0 {
+		current.HeartbeatIntervalSec = 30
+	}
+	if current.Slaves == nil {
+		current.Slaves = make(map[string]SlaveRecord)
 	}
 }

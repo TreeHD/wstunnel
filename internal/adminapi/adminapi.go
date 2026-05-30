@@ -21,6 +21,7 @@ import (
 	"github.com/shirou/gopsutil/v3/cpu"
 	"github.com/shirou/gopsutil/v3/mem"
 
+	"wstunnel/internal/cluster"
 	"wstunnel/internal/config"
 	"wstunnel/internal/dnsx"
 	"wstunnel/internal/logging"
@@ -119,6 +120,8 @@ func apiHandler(w http.ResponseWriter, r *http.Request) {
 		session.SendJSON(w, http.StatusOK, udpgw.Stats())
 	case r.URL.Path == "/api/upstream/test" && r.Method == "POST":
 		apiUpstreamTest(w, r)
+	case strings.HasPrefix(r.URL.Path, "/api/cluster/"):
+		clusterAPIHandler(w, r)
 	default:
 		http.NotFound(w, r)
 	}
@@ -443,6 +446,8 @@ func Start(wg *sync.WaitGroup) *http.Server {
 		})
 		mux.HandleFunc("/login", loginHandler)
 		mux.HandleFunc("/logout", logoutHandler)
+		// Slave 心跳:用 token + HMAC 自證,故意不走 AuthMiddleware
+		mux.HandleFunc("/api/cluster/heartbeat", cluster.HandleHeartbeat)
 		mux.HandleFunc("/api/", AuthMiddleware(apiHandler))
 		mux.HandleFunc("/", AuthMiddleware(func(w http.ResponseWriter, r *http.Request) {
 			if r.URL.Path == "/" {
