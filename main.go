@@ -76,40 +76,7 @@ type Config struct {
 var globalConfig *Config
 var serverStartTime = time.Now()
 
-// newResolver 根據 globalConfig.DNSServer 建立 DNS resolver。
-// 強制使用 Go 純 Go DNS (PreferGo:true)，確保 CGO_ENABLED=0 環境下能正常解析域名。
-// 若 DNSServer 有設定，則向指定的 DNS 伺服器查詢（不受 /etc/resolv.conf 影響）。
-func newResolver() *net.Resolver {
-	globalConfig.lock.RLock()
-	dnsServer := globalConfig.DNSServer
-	globalConfig.lock.RUnlock()
-
-	if dnsServer == "" {
-		// 使用容器預設 DNS，但強制 Go pure-Go 解析器
-		return &net.Resolver{PreferGo: true}
-	}
-	// 確保有 port（如果只填 IP 自動補 :53）
-	if _, _, err := net.SplitHostPort(dnsServer); err != nil {
-		dnsServer = dnsServer + ":53"
-	}
-	addr := dnsServer
-	return &net.Resolver{
-		PreferGo: true,
-		Dial: func(ctx context.Context, network, address string) (net.Conn, error) {
-			// 忽略傳入的 address，固定使用我們指定的 DNS 伺服器
-			d := net.Dialer{Timeout: 5 * time.Second}
-			return d.DialContext(ctx, "udp", addr)
-		},
-	}
-}
-
-// newDialer 建立一個帶有正確 DNS resolver 的 net.Dialer。
-func newDialer(timeout time.Duration) *net.Dialer {
-	return &net.Dialer{
-		Timeout:  timeout,
-		Resolver: newResolver(),
-	}
-}
+// 注意：newDialer / resolver 等 DNS 邏輯已移至 dns.go
 
 type OnlineUser struct {
 	ConnID      string    `json:"conn_id"`
@@ -435,9 +402,16 @@ func handleDirectTCPIP(ch ssh.Channel, destHost string, destPort uint32, remoteA
 	globalConfig.lock.RLock()
 	connectTimeout := time.Duration(globalConfig.TargetConnectTimeoutSeconds) * time.Second
 	globalConfig.lock.RUnlock()
-	destConn, err := newDialer(connectTimeout).DialContext(context.Background(), "tcp", destAddr)
+	destConn, err := dialContextSmart(context.Background(), destAddr, connectTimeout)
 	if err != nil {
-		log.Printf("TCP Proxy: Failed to connect to %s for user %s: %v", destAddr, username, err)
+		// 把 DNS 失敗 vs TCP 失敗區分開來，方便排查
+		// 例如使用者抱怨「IP 直連通、域名都 NXDOMAIN」時，這條 log 立刻揭露問題
+		if kind, hint := classifyDNSError(err); kind != "" && kind != "OTHER" {
+			log.Printf("TCP Proxy: dial %s for user '%s' FAILED [%s] — %s | err=%v",
+				destAddr, username, kind, hint, err)
+		} else {
+			log.Printf("TCP Proxy: dial %s for user '%s' FAILED — %v", destAddr, username, err)
+		}
 		ch.Close()
 		return
 	}
@@ -965,6 +939,8 @@ func apiHandler(w http.ResponseWriter, r *http.Request) {
 			globalConfig.AllowedSNI = newSettings.AllowedSNI
 			globalConfig.DNSServer = newSettings.DNSServer
 			globalConfig.lock.Unlock()
+			// DNS server 可能已變更，重建 resolver（dns.go）
+			rebuildResolver()
 			if err := safeSaveConfig(); err != nil {
 				sendJSON(w, http.StatusInternalServerError, map[string]string{"message": "保存配置失败: " + err.Error()})
 				return
@@ -1147,6 +1123,14 @@ func main() {
 	log.Println("==================================================")
 
 	loadTrafficData()
+
+	// 初始化 DNS 子系統並啟動健檢（dns.go）
+	initDNS()
+	go func() {
+		// 延遲一下讓 listener 先就緒，再做健檢；不阻塞主流程
+		time.Sleep(2 * time.Second)
+		dnsHealthCheck()
+	}()
 
 	if err := createTunDevice(); err != nil {
 		log.Printf("System: Warning - IP Tunnel feature disabled (%v)", err)

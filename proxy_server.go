@@ -4,11 +4,11 @@ import (
 	"bufio"
 	"context"
 	"encoding/base64"
-	"fmt"
 	"io"
 	"log"
 	"net"
 	"net/http"
+	"strconv"
 	"strings"
 	"sync/atomic"
 	"time"
@@ -132,8 +132,10 @@ func sendProxyAuthenticateChallenge(conn net.Conn) {
 }
 
 func handleHttpConnectMethod(client net.Conn, req *http.Request, username string) {
-	destConn, err := newDialer(10 * time.Second).DialContext(context.Background(), "tcp", req.Host)
+	timeout := proxyDialTimeout()
+	destConn, err := dialContextSmart(context.Background(), req.Host, timeout)
 	if err != nil {
+		logProxyDialFailure("HTTP CONNECT", req.Host, username, err)
 		client.Write([]byte("HTTP/1.1 502 Bad Gateway\r\n\r\n"))
 		return
 	}
@@ -145,8 +147,16 @@ func handleStandardHttpProxyRequest(client net.Conn, req *http.Request, username
 	req.Header.Del("Proxy-Authorization")
 	req.Header.Del("Proxy-Connection")
 
-	destConn, err := newDialer(10 * time.Second).DialContext(context.Background(), "tcp", req.Host)
+	host := req.Host
+	if !strings.Contains(host, ":") {
+		// 標準 HTTP proxy 請求若 Host 未帶 port，預設 80
+		host = host + ":80"
+	}
+
+	timeout := proxyDialTimeout()
+	destConn, err := dialContextSmart(context.Background(), host, timeout)
 	if err != nil {
+		logProxyDialFailure("HTTP", host, username, err)
 		client.Write([]byte("HTTP/1.1 502 Bad Gateway\r\n\r\n"))
 		return
 	}
@@ -156,6 +166,27 @@ func handleStandardHttpProxyRequest(client net.Conn, req *http.Request, username
 		return
 	}
 	proxyCopy(client, destConn, username)
+}
+
+// proxyDialTimeout 從 globalConfig 取得撥號逾時，與 SSH 路徑保持一致
+func proxyDialTimeout() time.Duration {
+	globalConfig.lock.RLock()
+	t := globalConfig.TargetConnectTimeoutSeconds
+	globalConfig.lock.RUnlock()
+	if t <= 0 {
+		t = 10
+	}
+	return time.Duration(t) * time.Second
+}
+
+// logProxyDialFailure 印出帶 DNS 失敗分類的錯誤訊息
+func logProxyDialFailure(proto, addr, user string, err error) {
+	if kind, hint := classifyDNSError(err); kind != "" && kind != "OTHER" {
+		log.Printf("%s Proxy: dial %s for '%s' FAILED [%s] — %s | err=%v",
+			proto, addr, user, kind, hint, err)
+	} else {
+		log.Printf("%s Proxy: dial %s for '%s' FAILED — %v", proto, addr, user, err)
+	}
 }
 
 func handleSocks5Proxy(conn net.Conn, reader *bufio.Reader) {
@@ -260,7 +291,7 @@ func handleSocks5Proxy(conn net.Conn, reader *bufio.Reader) {
 		if _, err := io.ReadFull(reader, buf); err != nil {
 			return
 		}
-		destHost = fmt.Sprintf("[%s]", net.IP(buf).String())
+		destHost = net.IP(buf).String() // 不在這裡加方括號，下方用 net.JoinHostPort 處理
 	default:
 		conn.Write([]byte{0x05, 0x08, 0x00, 0x01, 0, 0, 0, 0, 0, 0}) // Address type not supported
 		return
@@ -271,15 +302,12 @@ func handleSocks5Proxy(conn net.Conn, reader *bufio.Reader) {
 		return
 	}
 	destPort := (int(portBuf[0]) << 8) | int(portBuf[1])
-	var destAddr string
-	if strings.Contains(destHost, ":") {
-		destAddr = fmt.Sprintf("[%s]:%d", destHost, destPort)
-	} else {
-		destAddr = fmt.Sprintf("%s:%d", destHost, destPort)
-	}
+	destAddr := net.JoinHostPort(destHost, strconv.Itoa(destPort))
 
-	destConn, err := newDialer(10 * time.Second).DialContext(context.Background(), "tcp", destAddr)
+	timeout := proxyDialTimeout()
+	destConn, err := dialContextSmart(context.Background(), destAddr, timeout)
 	if err != nil {
+		logProxyDialFailure("SOCKS5", destAddr, username, err)
 		conn.Write([]byte{0x05, 0x04, 0x00, 0x01, 0, 0, 0, 0, 0, 0}) // Host unreachable
 		return
 	}
