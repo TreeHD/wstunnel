@@ -6,8 +6,11 @@
 # ======================================================
 
 # --- 1. UDPGW (tun2proxy) ---
-echo "[entrypoint] 啟動 udpgw-server on 0.0.0.0:7300..."
-udpgw -l 0.0.0.0:7300 --daemonize
+# 故意只綁 127.0.0.1,避免被當成匿名 UDP 出口代理。
+# wstunnel 主程式會接管 SSH direct-tcpip 對 127.0.0.1:7300 的連線,
+# 進入 udpgw.go 攔截 DNS 並把其餘 UDP 轉發給此進程。
+echo "[entrypoint] 啟動 udpgw-server on 127.0.0.1:7300..."
+udpgw -l 127.0.0.1:7300 --daemonize
 sleep 1
 
 # --- 2. 主程式 (wstunnel-go) ---

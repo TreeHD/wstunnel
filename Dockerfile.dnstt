@@ -7,7 +7,7 @@ RUN cargo build --release -p slipstream-server
 
 # 第二階段：運行環境
 FROM debian:bookworm-slim
-RUN apt-get update && apt-get install -y curl openssl ca-certificates jq wget && rm -rf /var/lib/apt/lists/*
+RUN apt-get update && apt-get install -y curl openssl ca-certificates jq wget iptables xxd && rm -rf /var/lib/apt/lists/*
 
 # 1. 安裝 wgcf (自動識別 amd64/arm64)
 RUN curl -fsSL https://raw.githubusercontent.com/P3TERX/script/master/wgcf.sh | bash

@@ -27,7 +27,9 @@ services:
       - "80:80"       # HTTP Upgrade 入口 (Payload 模式)
       - "443:443"     # TLS Multiplexer (加密入口)
       - "9090:9090"   # 管理後台
-      - "7300:7300"   # UDPGW (UDP Gateway)
+      # 注意:UDPGW (7300) 故意不對外公開,只在容器內部由 SSH Tunnel 存取。
+      # 對外公開會讓任何人都能把伺服器當匿名 UDP 出口代理,被濫用做 UDP-based
+      # 攻擊中繼或反射放大,並汙染伺服器 IP reputation。
     # -------------------------------------------------------
     # DNS 設定：讓容器本身的 OS 層 DNS 使用指定伺服器
     # 若不指定，容器會繼承宿主機的 /etc/resolv.conf
@@ -60,6 +62,34 @@ services:
   # ======================================================
   #  DNSTT DNS 隧道服務 (Slipstream + SOCKS 模式)
   #  使用方式: docker compose --profile dnstt up -d
+  #
+  #  ⚠️  安全須知 (請務必閱讀)
+  #  --------------------------------------------------
+  #  本服務必須對外公開 UDP/53 才能運作,有以下風險:
+  #
+  #  1. DNS 反射放大 (Amplification):
+  #     攻擊者可偽造受害者 IP 對你的 53 發查詢,讓 Slipstream
+  #     的回應(即使是 REFUSED)打到受害者。Slipstream 設計上只
+  #     回應隧道協定的查詢,放大倍率有限,但仍會消耗你的頻寬
+  #     並汙染你的 IP reputation。
+  #
+  #  2. Open Resolver 濫用:
+  #     若 Slipstream 對非協定查詢回應大封包,會被列入
+  #     openresolverproject.org 黑名單。
+  #
+  #  建議緩解 (在宿主機執行,Docker 預設 forwarding 仍會經過):
+  #    # 限制單一來源 IP 每秒最多 10 個 UDP/53 查詢
+  #    iptables -I DOCKER-USER -p udp --dport 53 \
+  #      -m hashlimit --hashlimit-name dns53 --hashlimit-above 10/sec \
+  #      --hashlimit-mode srcip --hashlimit-burst 30 -j DROP
+  #
+  #    # 或丟棄超過 512 byte 的查詢(正常 DNS 查詢都遠小於此)
+  #    iptables -I DOCKER-USER -p udp --dport 53 \
+  #      -m length --length 512:65535 -j DROP
+  #
+  #  並監控:
+  #    - 出站 UDP/53 流量是否異常(正常隧道流量應遠小於放大攻擊)
+  #    - 你的 IP 是否上 abuseipdb / spamhaus
   # ======================================================
   dnstt:
     profiles:
@@ -67,9 +97,13 @@ services:
     image: ghcr.io/treehd/wstunnel-dnstt:latest
     container_name: dnstt
     restart: always
+    # NET_ADMIN 用於在容器內加 iptables 規則,鎖死 UDP/53 只回應
+    # 查詢 DNSTT_DOMAIN 或其 subdomain 的封包,消除反射放大攻擊面
+    cap_add:
+      - NET_ADMIN
     ports:
-      - "53:5353/udp"   # 對外監聽 UDP 53，容器內使用 5353 避免需要 NET_ADMIN
+      - "53:5353/udp"   # 對外監聽 UDP 53,容器內使用 5353 避免需要 NET_ADMIN 設定
     environment:
-      # [必填] DNS 隧道域名，須與 DNS NS 記錄一致
+      # [必填] DNS 隧道域名,須與 DNS NS 記錄一致
       # 範例: t.example.com  請將此行替換為您的實際域名
       - DNSTT_DOMAIN=

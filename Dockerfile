@@ -35,5 +35,6 @@ COPY --from=udpgw-downloader /udpgw-server /usr/local/bin/udpgw
 COPY entrypoint.sh .
 RUN sed -i 's/\r$//' entrypoint.sh && chmod +x entrypoint.sh
 
-EXPOSE 80 443 9090 7300
+# 7300 (UDPGW) 只供容器內部 SSH Tunnel 存取,故意不 EXPOSE
+EXPOSE 80 443 9090
 CMD ["./entrypoint.sh"]
