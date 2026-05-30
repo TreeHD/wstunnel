@@ -180,7 +180,11 @@ func proxyDialTimeout() time.Duration {
 }
 
 // logProxyDialFailure 印出帶 DNS 失敗分類的錯誤訊息
+// 對「客戶端正常斷線」這類雜訊則靜默,避免洗版
 func logProxyDialFailure(proto, addr, user string, err error) {
+	if isBenignNetError(err) {
+		return
+	}
 	if kind, hint := classifyDNSError(err); kind != "" && kind != "OTHER" {
 		log.Printf("%s Proxy: dial %s for '%s' FAILED [%s] — %s | err=%v",
 			proto, addr, user, kind, hint, err)

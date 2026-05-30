@@ -353,15 +353,32 @@ func interceptDNSFrame(f *udpgwFrame, chWriter *safeChannelWriter, username stri
 		payload: respPayload,
 	}
 	if err := writeUDPGWFrame(chWriter, resp); err != nil {
-		log.Printf("UDPGW DNS: write reply failed for user='%s': %v", username, err)
+		if !isBenignNetError(err) {
+			log.Printf("UDPGW DNS: write reply failed for user='%s': %v", username, err)
+		}
 		return
 	}
 
-	// 第一次成功時 log,之後採 sample log 避免洗版
-	if udpgwDNSSuccess.Load()%50 == 1 {
-		log.Printf("UDPGW DNS: ✅ intercepted via %s — total success=%d failed=%d",
-			source, udpgwDNSSuccess.Load(), udpgwDNSFailed.Load())
+	logUDPGWDNSSuccess(source)
+}
+
+// logUDPGWDNSSuccess 以時間視窗節流(預設 30 秒一次)印出成功統計,避免洗版
+var (
+	lastUDPGWDNSLog atomic.Int64
+)
+
+func logUDPGWDNSSuccess(source string) {
+	const windowSec = 30
+	now := time.Now().Unix()
+	last := lastUDPGWDNSLog.Load()
+	if now-last < windowSec {
+		return
 	}
+	if !lastUDPGWDNSLog.CompareAndSwap(last, now) {
+		return // 其他 goroutine 剛印過
+	}
+	log.Printf("UDPGW DNS: ✅ working via %s — total success=%d failed=%d (last %ds window)",
+		source, udpgwDNSSuccess.Load(), udpgwDNSFailed.Load(), windowSec)
 }
 
 // dnsForwardOriginal 試著把 DNS 查詢 forward 給 client 指定的 server
