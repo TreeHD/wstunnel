@@ -32,7 +32,7 @@
 - **行動裝置免流連線**:整合多種偽裝協定(HTTP Upgrade、TLS+Payload、WebSocket)
   繞過運營商的計費識別,搭配 NPV Tunnel、HTTP Custom、HTTP Injector 等客戶端
 - **受限網路出口**:443 埠口透過 SNI 與 User-Agent 偽裝成正常 HTTPS,難以被 DPI 識別
-- **多協定統一接入**:單一二進位提供 SOCKS5/HTTP Proxy、SSH Tunnel、UDPGW、IP-over-SSH
+- **多協定統一接入**:單一二進位提供 SSH Tunnel、UDPGW、IP-over-SSH
 - **不依賴外部組件解析 DNS**:伺服器內建 UDPGW 攔截器,即使機房 UDP/53 被擋仍能正常解析
 
 整體目標是讓部署者只需 `docker compose up`,客戶端只需填 IP 與帳密,即可在
@@ -43,7 +43,7 @@
 ## 核心特性
 
 ### 連線層
-- **多入口偽裝**:80 (HTTP Upgrade)、443 (TLS Multiplexer)、1080 (SOCKS5/HTTP Proxy)
+- **多入口偽裝**:80 (HTTP Upgrade)、443 (TLS Multiplexer)
 - **SNI 白名單**:443 入口可限制只接受特定 SNI 的連線,過濾掃描器
 - **User-Agent 校驗**:HTTP Upgrade 階段比對自訂 UA,不相符回 200 OK 維持假象
 - **Payload 容錯**:`tolerantCopy` 對行動網路抖動具備指數退避重試,4G/Wi-Fi 切換不中斷
@@ -58,7 +58,7 @@
 ### 帳號與計費
 - 帳號層級可設定:啟用狀態、到期日、流量上限 (GB)、最大連線數
 - 流量統計每 5 分鐘自動存盤,優雅關閉時也會強制存檔
-- SSH/SOCKS5/HTTP Proxy 流量統一計入,可即時於後台查看
+- SSH/UDPGW 流量統一計入,可即時於後台查看
 
 ### 部署與維運
 - 多階段 Docker build,跨 amd64 / arm64
@@ -74,14 +74,14 @@
 ### 流量分流圖
 
 ```
-                    手機/客戶端 (NPV Tunnel / HTTP Injector / curl)
+                    手機/客戶端 (NPV Tunnel / HTTP Injector)
                               │
-            ┌─────────────────┼─────────────────┐
-            │                 │                 │
-        Port 80           Port 443          Port 1080
-     (HTTP Upgrade)   (TLS Multiplexer)  (SOCKS5/HTTP Proxy)
-            │                 │                 │
-            ▼                 ▼                 ▼
+            ┌─────────────────┴─────────────────┐
+            │                                   │
+        Port 80                             Port 443
+     (HTTP Upgrade)                     (TLS Multiplexer)
+            │                                   │
+            ▼                                   ▼
      ┌──────────────────────────────────────────────────┐
      │              wstunnel-go (Go Binary)             │
      │                                                  │
@@ -125,7 +125,6 @@
 | `api.go` | Admin 後台 HTTP API |
 | `dns.go` | DNS 解析子系統(多 server、UDP→TCP fallback) |
 | `udpgw.go` | UDPGW 協定攔截、DNS 短路 |
-| `proxy_server.go` | SOCKS5 / HTTP Proxy |
 | `ip_tunnel.go` | IP-over-SSH 隧道(可選) |
 | `nat_setup.go` | iptables NAT 與 IP forward |
 
@@ -137,7 +136,7 @@
 
 - Linux (amd64 / arm64)
 - Docker 20.10+ 與 Docker Compose v2
-- 對外開放 port: 80, 443, 9090 (後台), 1080 (Proxy), 7300 (UDPGW)
+- 對外開放 port: 80, 443, 9090 (後台), 7300 (UDPGW)
 
 ### Docker Compose 部署 (推薦)
 
@@ -153,7 +152,6 @@ services:
       - "80:80"
       - "443:443"
       - "9090:9090"
-      - "1080:1080"
       - "7300:7300"
     dns:
       - 8.8.8.8
@@ -204,7 +202,6 @@ http://<伺服器IP>:9090/login.html
 | **HTTP Payload** | 80 | 走 HTTP Upgrade 偽裝,適合 80 埠口被劫持時 |
 | **Direct TLS** | 443 | 純 TLS 加密 SSH,SNI 可任意指定 |
 | **TLS + Payload** | 443 | TLS 後再做 HTTP Upgrade 偽裝(NPV Tunnel 預設) |
-| **SOCKS5 / HTTP Proxy** | 1080 | 一般 App 直接設定代理伺服器 |
 
 ### 客戶端設定範例 (NPV Tunnel)
 
@@ -218,15 +215,15 @@ http://<伺服器IP>:9090/login.html
 | SSH 帳密 | 後台 `accounts` 中設定的帳密 |
 | UDPGW | 啟用,Address: `127.0.0.1:7300` |
 
-### 客戶端設定範例 (curl 測試 SOCKS5/HTTP)
+### 客戶端設定範例 (HTTP Injector / HTTP Custom)
 
-```bash
-# HTTP Proxy
-curl -x http://USER:PASS@SERVER_IP:1080 https://ipinfo.io
-
-# SOCKS5
-curl -x socks5h://USER:PASS@SERVER_IP:1080 https://ipinfo.io
-```
+| 欄位 | 值 |
+|------|-----|
+| Connection Type | SSH + Payload + SSL/TLS |
+| Server | `<伺服器 IP>:443` |
+| SNI / SSL Host | `www.cloudflare.com` |
+| Payload | `GET / HTTP/1.1[crlf]Host: [host_port][crlf]User-Agent: <CONNECT_UA>[crlf]Upgrade: websocket[crlf][crlf]` |
+| SSH 帳密 | 後台 `accounts` 中設定的帳密 |
 
 ---
 
@@ -290,7 +287,6 @@ UDPGW DNS: ✅ working via 8.8.8.8:53 — total success=312 failed=0 (last 30s w
 | `listen_addr` | `LISTEN_ADDR` | `0.0.0.0:80` | HTTP Upgrade 入口 |
 | `listen_tls_addr` | `LISTEN_TLS_ADDR` | `0.0.0.0:443` | TLS Multiplexer 入口 |
 | `admin_addr` | `ADMIN_ADDR` | `0.0.0.0:9090` | 管理後台 |
-| `proxy_addr` | `PROXY_ADDR` | `:1080` | SOCKS5/HTTP Proxy |
 | `dns_server` | `DNS_SERVER` | (空) | DNS 上游,支援逗號分隔多筆 |
 | `udpgw_port` | `UDPGW_PORT` | `7300` | 本機 udpgw 進程 port |
 | `connect_ua` | `CONNECT_UA` | (空) | HTTP Upgrade 必要 UA |
@@ -386,7 +382,7 @@ API 端點(需 cookie 認證):
 ### 容器無法啟動
 
 - 先用 `docker logs wstunnel` 看 FATAL 訊息
-- 若是 port 衝突:檢查宿主機 80/443/1080/7300 是否已被佔用
+- 若是 port 衝突:檢查宿主機 80/443/9090/7300 是否已被佔用
 - 若是 config.json 無法解析:刪除 `data/config.json` 讓系統重建
 
 ---
@@ -410,7 +406,7 @@ CGO_ENABLED=0 go build -ldflags "-s -w" -o wstunnel-go
 ```bash
 docker build -t wstunnel-local .
 docker run -d \
-  -p 80:80 -p 443:443 -p 9090:9090 -p 1080:1080 -p 7300:7300 \
+  -p 80:80 -p 443:443 -p 9090:9090 -p 7300:7300 \
   -v $(pwd)/data:/app/data \
   -e DNS_SERVER=8.8.8.8 \
   --name wstunnel wstunnel-local

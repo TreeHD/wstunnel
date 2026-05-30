@@ -153,7 +153,7 @@ func handleDirectTCPIP(ch ssh.Channel, destHost string, destPort uint32, remoteA
 	connectTimeout := time.Duration(globalConfig.TargetConnectTimeoutSeconds) * time.Second
 	globalConfig.lock.RUnlock()
 
-	destConn, err := dialContextSmart(context.Background(), destAddr, connectTimeout)
+	destConn, err := dialTarget(context.Background(), destAddr, connectTimeout)
 	if err != nil {
 		if kind, hint := classifyDNSError(err); kind != "" && kind != "OTHER" {
 			log.Printf("TCP Proxy: dial %s for user '%s' FAILED [%s] — %s | err=%v",

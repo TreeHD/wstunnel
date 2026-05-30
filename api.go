@@ -9,11 +9,13 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"fmt"
 	"io/ioutil"
 	"log"
 	"net/http"
+	"net/url"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -111,6 +113,8 @@ func apiHandler(w http.ResponseWriter, r *http.Request) {
 		}
 	case r.URL.Path == "/api/udpgw/status":
 		sendJSON(w, http.StatusOK, udpgwStatsSnapshot())
+	case r.URL.Path == "/api/upstream/test" && r.Method == "POST":
+		apiUpstreamTest(w, r)
 	default:
 		http.NotFound(w, r)
 	}
@@ -365,6 +369,8 @@ func apiSettings(w http.ResponseWriter, r *http.Request) {
 		globalConfig.AllowedSNI = newSettings.AllowedSNI
 		globalConfig.DNSServer = newSettings.DNSServer
 		globalConfig.UDPGWPort = newSettings.UDPGWPort
+		globalConfig.UpstreamProxyEnabled = newSettings.UpstreamProxyEnabled
+		globalConfig.UpstreamProxyURL = strings.TrimSpace(newSettings.UpstreamProxyURL)
 		globalConfig.lock.Unlock()
 		// DNS server 可能已變更,重建 resolver(dns.go)
 		rebuildResolver()
@@ -378,6 +384,69 @@ func apiSettings(w http.ResponseWriter, r *http.Request) {
 		}}
 		sendJSON(w, http.StatusOK, map[string]string{"message": "设置已保存"})
 	}
+}
+
+// apiUpstreamTest 對當前(或 body 提供的)上游 proxy 做一次端到端測試
+//
+// 測試方式:透過 dialTarget 連到 example.com:80 後,讀回幾個 byte 確認雙向暢通
+// body 可選:{"url":"socks5://...", "enabled":true} → 不影響 globalConfig,只測試這組
+func apiUpstreamTest(w http.ResponseWriter, r *http.Request) {
+	var override struct {
+		URL     string `json:"url"`
+		Enabled bool   `json:"enabled"`
+	}
+	_ = json.NewDecoder(r.Body).Decode(&override)
+
+	cfg := getUpstreamConfig()
+	if override.URL != "" {
+		// 暫時用使用者送來的設定試一次,不修改 globalConfig
+		u, err := url.Parse(strings.TrimSpace(override.URL))
+		if err != nil || u.Host == "" {
+			sendJSON(w, http.StatusBadRequest, map[string]interface{}{
+				"ok": false, "error": "invalid url",
+			})
+			return
+		}
+		cfg = upstreamConfig{enabled: true, rawURL: override.URL, parsed: u}
+		if u.User != nil {
+			cfg.username = u.User.Username()
+			cfg.password, _ = u.User.Password()
+		}
+	}
+
+	if !cfg.enabled {
+		sendJSON(w, http.StatusOK, map[string]interface{}{
+			"ok": true, "mode": "direct", "message": "上游未啟用,目前走直連",
+		})
+		return
+	}
+
+	// 用 example.com:80 當測試標的,只做 TCP 連線不發 HTTP 請求避免延遲
+	const probe = "example.com:80"
+	ctx, cancel := context.WithTimeout(r.Context(), 10*time.Second)
+	defer cancel()
+
+	start := time.Now()
+	conn, err := dialViaUpstream(ctx, cfg, probe, 8*time.Second)
+	elapsed := time.Since(start)
+
+	resp := map[string]interface{}{
+		"mode":      strings.ToLower(cfg.parsed.Scheme),
+		"proxy":     redactProxyURL(cfg.rawURL),
+		"target":    probe,
+		"elapsed":   elapsed.String(),
+		"timestamp": time.Now().Unix(),
+	}
+	if err != nil {
+		resp["ok"] = false
+		resp["error"] = err.Error()
+		sendJSON(w, http.StatusOK, resp)
+		return
+	}
+	conn.Close()
+	resp["ok"] = true
+	resp["message"] = "成功透過上游 proxy 連到 " + probe
+	sendJSON(w, http.StatusOK, resp)
 }
 
 // startAdminServer 啟動後台 HTTP server,回傳 *http.Server 供主流程做 graceful shutdown

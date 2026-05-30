@@ -45,14 +45,19 @@ type Config struct {
 	DefaultExpiryDays           int                    `json:"default_expiry_days,omitempty"`
 	DefaultLimitGB              float64                `json:"default_limit_gb,omitempty"`
 	TrafficSaveIntervalSeconds  int                    `json:"traffic_save_interval_seconds,omitempty"`
-	ProxyAddr                   string                 `json:"proxy_addr,omitempty"`
 	// DNSServer 指定代理出站時使用的 DNS 伺服器,格式為 "ip:port"。
 	// 留空則使用容器預設 DNS(/etc/resolv.conf)。
 	// 支援多伺服器逗號分隔,例如 "8.8.8.8, 1.1.1.1:53"。
 	DNSServer string `json:"dns_server,omitempty"`
 	// UDPGWPort 指定本機 udpgw 進程監聽的 port,留空則用預設 7300
 	UDPGWPort int `json:"udpgw_port,omitempty"`
-	lock      sync.RWMutex
+	// UpstreamProxyEnabled 啟用後,所有從 SSH Tunnel 內走出來的 TCP 流量
+	// 都會再經過下方設定的上游 SOCKS5/HTTP Proxy(支援 Auth)
+	UpstreamProxyEnabled bool `json:"upstream_proxy_enabled,omitempty"`
+	// UpstreamProxyURL 形如 socks5://user:pass@host:1080 或 http://user:pass@host:8080
+	// 留空 / Enabled=false 時走直連
+	UpstreamProxyURL string `json:"upstream_proxy_url,omitempty"`
+	lock             sync.RWMutex
 }
 
 type OnlineUser struct {
@@ -139,7 +144,6 @@ func buildDefaultConfigFromEnv() {
 		ListenAddr:                  os.Getenv("LISTEN_ADDR"),
 		ListenTLSAddr:               os.Getenv("LISTEN_TLS_ADDR"),
 		AdminAddr:                   os.Getenv("ADMIN_ADDR"),
-		ProxyAddr:                   os.Getenv("PROXY_ADDR"),
 		ConnectUA:                   os.Getenv("CONNECT_UA"),
 		DNSServer:                   os.Getenv("DNS_SERVER"),
 		HandshakeTimeout:            envToInt("HANDSHAKE_TIMEOUT", 5),
@@ -152,6 +156,8 @@ func buildDefaultConfigFromEnv() {
 		DefaultLimitGB:              envToFloat64("DEFAULT_LIMIT_GB", 0.0),
 		TrafficSaveIntervalSeconds:  envToInt("TRAFFIC_SAVE_INTERVAL_SECONDS", 300),
 		UDPGWPort:                   envToInt("UDPGW_PORT", 0),
+		UpstreamProxyURL:            os.Getenv("UPSTREAM_PROXY_URL"),
+		UpstreamProxyEnabled:        os.Getenv("UPSTREAM_PROXY_ENABLED") == "1" || os.Getenv("UPSTREAM_PROXY_ENABLED") == "true",
 	}
 
 	globalConfig.Accounts = make(map[string]AccountInfo)
@@ -220,9 +226,6 @@ func applyConfigDefaults() {
 	if globalConfig.TrafficSaveIntervalSeconds <= 0 {
 		globalConfig.TrafficSaveIntervalSeconds = 300
 	}
-	if globalConfig.ProxyAddr == "" {
-		globalConfig.ProxyAddr = ":1080"
-	}
 }
 
 // printStartupBanner 啟動時把當前生效設定 dump 出來
@@ -232,13 +235,17 @@ func printStartupBanner() {
 	log.Println("==================================================")
 	log.Printf("  Listen Addr (HTTP Upgrade): %s", globalConfig.ListenAddr)
 	log.Printf("  Listen Addr (TLS Multiplexer): %s  <-- SUPER PORT", globalConfig.ListenTLSAddr)
-	log.Printf("  Proxy Server Addr (SOCKS5/HTTP): %s", globalConfig.ProxyAddr)
 	log.Printf("  Allowed SNI Hosts: %v", globalConfig.AllowedSNI)
 	log.Printf("  Admin Panel Addr: %s", globalConfig.AdminAddr)
 	if globalConfig.DNSServer != "" {
 		log.Printf("  DNS Server (custom): %s", globalConfig.DNSServer)
 	} else {
 		log.Printf("  DNS Server: (using container default, /etc/resolv.conf)")
+	}
+	if globalConfig.UpstreamProxyEnabled && globalConfig.UpstreamProxyURL != "" {
+		log.Printf("  Upstream Proxy: ENABLED (%s)", redactProxyURL(globalConfig.UpstreamProxyURL))
+	} else {
+		log.Printf("  Upstream Proxy: disabled (direct dial)")
 	}
 	log.Println("------------------ Behaviors ---------------------")
 	log.Printf("  Handshake Timeout: %d seconds", globalConfig.HandshakeTimeout)

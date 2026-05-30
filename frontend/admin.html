@@ -706,8 +706,74 @@
         function renderSettingsPage() {
             const s = appState.settings;
             if (!s) { contentArea.innerHTML = `<div class="card">正在載入設定...</div>`; return; }
-            contentArea.innerHTML = `<div class="card"><h2>系統設定</h2><p style="font-size:13px;color:#64748b;">修改這些設定後將儲存到 config.json。部分設定可能需要重新啟動程式才能完全生效。</p><div class="settings-grid"><div class="settings-group"><h3>握手與連線</h3><div class="form-row"><label>HTTP 握手逾時 (秒):</label><input id="s_handshake_timeout" type="number" value="${s.handshake_timeout}"></div><div class="form-row"><label>連線 User-Agent:</label><input id="s_connect_ua" type="text" value="${s.connect_ua}"></div><div class="form-row"><label>連線閒置逾時 (秒):</label><input id="s_idle_timeout_seconds" type="number" value="${s.idle_timeout_seconds}"></div><div class="form-row"><label>目標連線逾時 (秒):</label><input id="s_target_connect_timeout_seconds" type="number" value="${s.target_connect_timeout_seconds}"></div></div><div class="settings-group"><h3>效能與轉發</h3><div class="form-row"><label>緩衝區大小 (KB):</label><input id="s_buffer_size_kb" type="number" value="${s.buffer_size_kb}"></div><div class="form-row"><label>網路錯誤重試次數:</label><input id="s_tolerant_copy_max_retries" type="number" value="${s.tolerant_copy_max_retries}"></div><div class="form-row"><label>錯誤重試延遲 (毫秒):</label><input id="s_tolerant_copy_retry_delay_ms" type="number" value="${s.tolerant_copy_retry_delay_ms}"></div></div><div class="settings-group"><h3>新使用者預設值</h3><div class="form-row"><label>預設有效期 (天):</label><input id="s_default_expiry_days" type="number" value="${s.default_expiry_days}"></div><div class="form-row"><label>預設流量 (GB):</label><input id="s_default_limit_gb" type="number" value="${s.default_limit_gb}"></div></div></div><div class="action-buttons" style="justify-content: center; margin-top: 20px;"><button class="btn warning" onclick="saveSettings()">儲存所有設定</button></div></div>`;
+            const upEnabled = s.upstream_proxy_enabled ? 'checked' : '';
+            const upUrl = s.upstream_proxy_url || '';
+            const dnsServer = s.dns_server || '';
+            const udpgwPort = s.udpgw_port || 7300;
+            contentArea.innerHTML = `
+            <div class="card">
+                <h2>系統設定</h2>
+                <p style="font-size:13px;color:#64748b;">修改這些設定後將儲存到 config.json。部分設定可能需要重新啟動程式才能完全生效。</p>
+                <div class="settings-grid">
+                    <div class="settings-group">
+                        <h3>握手與連線</h3>
+                        <div class="form-row"><label>HTTP 握手逾時 (秒):</label><input id="s_handshake_timeout" type="number" value="${s.handshake_timeout}"></div>
+                        <div class="form-row"><label>連線 User-Agent:</label><input id="s_connect_ua" type="text" value="${s.connect_ua || ''}"></div>
+                        <div class="form-row"><label>連線閒置逾時 (秒):</label><input id="s_idle_timeout_seconds" type="number" value="${s.idle_timeout_seconds}"></div>
+                        <div class="form-row"><label>目標連線逾時 (秒):</label><input id="s_target_connect_timeout_seconds" type="number" value="${s.target_connect_timeout_seconds}"></div>
+                    </div>
+                    <div class="settings-group">
+                        <h3>效能與轉發</h3>
+                        <div class="form-row"><label>緩衝區大小 (KB):</label><input id="s_buffer_size_kb" type="number" value="${s.buffer_size_kb}"></div>
+                        <div class="form-row"><label>網路錯誤重試次數:</label><input id="s_tolerant_copy_max_retries" type="number" value="${s.tolerant_copy_max_retries}"></div>
+                        <div class="form-row"><label>錯誤重試延遲 (毫秒):</label><input id="s_tolerant_copy_retry_delay_ms" type="number" value="${s.tolerant_copy_retry_delay_ms}"></div>
+                    </div>
+                    <div class="settings-group">
+                        <h3>新使用者預設值</h3>
+                        <div class="form-row"><label>預設有效期 (天):</label><input id="s_default_expiry_days" type="number" value="${s.default_expiry_days}"></div>
+                        <div class="form-row"><label>預設流量 (GB):</label><input id="s_default_limit_gb" type="number" value="${s.default_limit_gb}"></div>
+                    </div>
+                    <div class="settings-group">
+                        <h3>DNS / UDPGW</h3>
+                        <div class="form-row"><label>DNS 伺服器:</label><input id="s_dns_server" type="text" placeholder="留空走容器預設;支援 8.8.8.8, 1.1.1.1:53" value="${dnsServer}"></div>
+                        <div class="form-row"><label>UDPGW Port:</label><input id="s_udpgw_port" type="number" value="${udpgwPort}"></div>
+                    </div>
+                    <div class="settings-group" style="grid-column: 1 / -1;">
+                        <h3>上游 Proxy 鏈接 (可選)</h3>
+                        <p style="font-size:12px;color:#64748b;margin:0 0 10px;">啟用後,所有從 SSH Tunnel 內走出來的 TCP 流量會再經過下方的 SOCKS5/HTTP Proxy。支援帳密驗證。</p>
+                        <div class="form-row"><label>啟用上游 Proxy:</label><input id="s_upstream_proxy_enabled" type="checkbox" ${upEnabled} style="width:auto;height:18px;"></div>
+                        <div class="form-row"><label>Proxy URL:</label><input id="s_upstream_proxy_url" type="text" placeholder="socks5://user:pass@proxy.example.com:1080 或 http://user:pass@host:8080" value="${upUrl}"></div>
+                        <div class="form-row" style="margin-top:8px;">
+                            <label></label>
+                            <button class="btn" onclick="testUpstream()" type="button" style="width:auto;padding:6px 14px;">測試連線</button>
+                            <span id="upstream-test-result" style="margin-left:12px;font-size:13px;"></span>
+                        </div>
+                    </div>
+                </div>
+                <div class="action-buttons" style="justify-content: center; margin-top: 20px;"><button class="btn warning" onclick="saveSettings()">儲存所有設定</button></div>
+            </div>`;
         }
+
+        async function testUpstream() {
+            const out = gid('upstream-test-result');
+            out.textContent = '測試中...';
+            out.style.color = '#64748b';
+            const url = gid('s_upstream_proxy_url').value.trim();
+            const enabled = gid('s_upstream_proxy_enabled').checked;
+            const res = await apiRequest('/api/upstream/test', {
+                method: 'POST',
+                body: JSON.stringify({ url, enabled })
+            });
+            if (!res) { out.textContent = '請求失敗'; out.style.color = '#ef4444'; return; }
+            if (res.ok) {
+                out.textContent = `✅ ${res.message} (耗時 ${res.elapsed})`;
+                out.style.color = '#16a34a';
+            } else {
+                out.textContent = `❌ ${res.error || '失敗'}`;
+                out.style.color = '#ef4444';
+            }
+        }
+
 
         function renderLogsPage() {
             contentArea.innerHTML = `<div class="card"><h2>系統日誌 (最新 200 筆)</h2><div id="log-viewer"></div></div>`;
@@ -910,6 +976,10 @@
                 payload.target_connect_timeout_seconds = parseInt(gid('s_target_connect_timeout_seconds').value, 10);
                 payload.default_expiry_days = parseInt(gid('s_default_expiry_days').value, 10);
                 payload.default_limit_gb = parseFloat(gid('s_default_limit_gb').value);
+                payload.dns_server = gid('s_dns_server').value.trim();
+                payload.udpgw_port = parseInt(gid('s_udpgw_port').value, 10) || 0;
+                payload.upstream_proxy_enabled = gid('s_upstream_proxy_enabled').checked;
+                payload.upstream_proxy_url = gid('s_upstream_proxy_url').value.trim();
             }
 
             const res = await apiRequest('/api/settings', { method: 'POST', body: JSON.stringify(payload) });

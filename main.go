@@ -14,10 +14,8 @@
 //   * logging.go     — log 收集器與降噪
 //   * ssh_server.go  — SSH 握手、direct-tcpip、tolerantCopy
 //   * dispatcher.go  — 80/443 入口分流
-//   * api.go         — admin 後台 HTTP API
 //   * dns.go         — DNS 解析子系統
-//   * udpgw.go       — UDPGW 攔截、DNS 短路
-//   * proxy_server.go — SOCKS5 / HTTP Proxy
+//   * upstream.go    — 上游 Proxy 鏈接(SOCKS5/HTTP with Auth)
 //   * ip_tunnel.go   — IP-over-SSH 隧道
 //   * nat_setup.go   — IP 轉發 / iptables NAT
 //   * session_manager.go — 隧道 client session 註冊表
@@ -56,6 +54,7 @@ func main() {
 		dnsHealthCheck()
 		time.Sleep(1 * time.Second)
 		udpgwHealthCheck()
+		upstreamHealthCheck()
 	}()
 
 	// IP 隧道功能(若 TUN 不可用則安靜降級,不影響其他功能)
@@ -75,7 +74,6 @@ func main() {
 	var wg sync.WaitGroup
 
 	adminServer := startAdminServer(&wg)
-	proxyListener := startProxyServer(&wg)
 
 	sshCfg := buildSSHServerConfig()
 	tlsListener, sshListener := startTunnelListeners(&wg, sshCfg)
@@ -85,7 +83,7 @@ func main() {
 	signal.Notify(quit, syscall.SIGINT, syscall.SIGTERM)
 	<-quit
 
-	gracefulShutdown(adminServer, proxyListener, tlsListener, sshListener, &wg)
+	gracefulShutdown(adminServer, tlsListener, sshListener, &wg)
 }
 
 // buildSSHServerConfig 組出 SSH server config,包含密碼認證 callback
@@ -139,20 +137,6 @@ func passwordCallback(c ssh.ConnMetadata, p []byte) (*ssh.Permissions, error) {
 	return nil, fmt.Errorf("invalid credentials")
 }
 
-// startProxyServer 啟動 SOCKS5/HTTP 多工 proxy
-func startProxyServer(wg *sync.WaitGroup) net.Listener {
-	listener, err := net.Listen("tcp", globalConfig.ProxyAddr)
-	if err != nil {
-		log.Fatalf("FATAL: Cannot listen on proxy addr %s: %v", globalConfig.ProxyAddr, err)
-	}
-	wg.Add(1)
-	go func() {
-		defer wg.Done()
-		handleProxyServer(listener)
-	}()
-	return listener
-}
-
 // startTunnelListeners 啟動 80 (HTTP Upgrade) 與 443 (TLS multiplexer) 兩個入口
 func startTunnelListeners(wg *sync.WaitGroup, sshCfg *ssh.ServerConfig) (net.Listener, net.Listener) {
 	// 80: HTTP Upgrade
@@ -201,7 +185,7 @@ func startTunnelListeners(wg *sync.WaitGroup, sshCfg *ssh.ServerConfig) (net.Lis
 }
 
 // gracefulShutdown 對所有 server 做有序關閉,並做最後一次流量存盤
-func gracefulShutdown(adminServer *http.Server, proxyL, tlsL, sshL net.Listener, wg *sync.WaitGroup) {
+func gracefulShutdown(adminServer *http.Server, tlsL, sshL net.Listener, wg *sync.WaitGroup) {
 	log.Println("==================================================")
 	log.Println("         WSTunnel Service Shutting Down...")
 	log.Println("==================================================")
@@ -216,7 +200,6 @@ func gracefulShutdown(adminServer *http.Server, proxyL, tlsL, sshL net.Listener,
 	}
 	closeListener(sshL, "SSH listener (HTTP Upgrade)")
 	closeListener(tlsL, "SSH listener (TLS)")
-	closeListener(proxyL, "Proxy listener")
 
 	log.Println("System: Performing final traffic data save...")
 	if err := saveTrafficData(); err != nil {

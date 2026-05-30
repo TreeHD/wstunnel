@@ -35,5 +35,5 @@ COPY --from=udpgw-downloader /udpgw-server /usr/local/bin/udpgw
 COPY entrypoint.sh .
 RUN sed -i 's/\r$//' entrypoint.sh && chmod +x entrypoint.sh
 
-EXPOSE 80 443 9090 1080 7300
+EXPOSE 80 443 9090 7300
 CMD ["./entrypoint.sh"]

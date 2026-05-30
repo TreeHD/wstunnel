@@ -24,10 +24,9 @@ services:
     container_name: wstunnel
     restart: always
     ports:
-      - "80:80"       # HTTP Proxy (免流入口)
+      - "80:80"       # HTTP Upgrade 入口 (Payload 模式)
       - "443:443"     # TLS Multiplexer (加密入口)
       - "9090:9090"   # 管理後台
-      - "1080:1080"   # SOCKS5 / HTTP Proxy 入口
       - "7300:7300"   # UDPGW (UDP Gateway)
     # -------------------------------------------------------
     # DNS 設定：讓容器本身的 OS 層 DNS 使用指定伺服器
@@ -39,12 +38,12 @@ services:
       # - 1.1.1.1      # Cloudflare (可替換)
     environment:
       # -------------------------------------------------------
-      # DNS_SERVER: 讓 wstunnel 代理出站連線時使用指定的 DNS 伺服器
-      # 格式: "ip" 或 "ip:port"，留空則使用上方 dns: 的設定
-      # 此設定會覆蓋容器的 /etc/resolv.conf，確保代理流量走正確的 DNS
+      # DNS_SERVER: 讓 wstunnel 出站解析時使用指定的 DNS 伺服器
+      # 格式: "ip" 或 "ip:port"，支援逗號分隔多筆 (failover)
+      # 範例: "8.8.8.8, 1.1.1.1:53"
+      # 留空則使用上方 dns: 的設定
       # -------------------------------------------------------
-      - DNS_SERVER=8.8.8.8:53
-      # - DNS_SERVER=1.1.1.1:53
+      - DNS_SERVER=8.8.8.8, 1.1.1.1:53
     volumes:
       # 持久化資料夾: 所有帳號設定、流量紀錄都會儲存在此。
       # 第一次啟動時會自動產生預設的 config.json，請由此修改您的初始密碼與帳號設定。
