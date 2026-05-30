@@ -5,14 +5,14 @@ on:
     branches: [ "main" ]
     tags: [ 'v*.*.*' ]
     paths:
-      - 'Dockerfile.dnstt'
-      - 'entrypoint.dnstt.sh'
+      - 'build/Dockerfile.dnstt'
+      - 'build/entrypoint.dnstt.sh'
       - '.github/workflows/dnstt-publish.yml'
   pull_request:
     branches: [ "main" ]
     paths:
-      - 'Dockerfile.dnstt'
-      - 'entrypoint.dnstt.sh'
+      - 'build/Dockerfile.dnstt'
+      - 'build/entrypoint.dnstt.sh'
       - '.github/workflows/dnstt-publish.yml'
   workflow_dispatch:    # 允許手動觸發（需要強制重 build 時用）
 
@@ -63,7 +63,7 @@ jobs:
         uses: docker/build-push-action@v5
         with:
           context: .
-          file: Dockerfile.dnstt
+          file: build/Dockerfile.dnstt
           platforms: ${{ matrix.platform }}
           provenance: false
           outputs: type=image,name=${{ env.REGISTRY }}/${{ env.IMAGE_NAME }},push-by-digest=true,name-canonical=true,push=${{ github.event_name != 'pull_request' }}

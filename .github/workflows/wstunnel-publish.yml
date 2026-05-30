@@ -8,9 +8,9 @@ on:
       - '**/*.go'
       - 'go.mod'
       - 'go.sum'
-      - 'frontend/**'
-      - 'Dockerfile'
-      - 'entrypoint.sh'
+      - 'web/**'
+      - 'build/Dockerfile'
+      - 'build/entrypoint.sh'
       - '.github/workflows/wstunnel-publish.yml'
   pull_request:
     branches: [ "main" ]
@@ -18,9 +18,9 @@ on:
       - '**/*.go'
       - 'go.mod'
       - 'go.sum'
-      - 'frontend/**'
-      - 'Dockerfile'
-      - 'entrypoint.sh'
+      - 'web/**'
+      - 'build/Dockerfile'
+      - 'build/entrypoint.sh'
       - '.github/workflows/wstunnel-publish.yml'
   workflow_dispatch:
 
@@ -71,7 +71,7 @@ jobs:
         uses: docker/build-push-action@v5
         with:
           context: .
-          file: Dockerfile
+          file: build/Dockerfile
           platforms: ${{ matrix.platform }}
           provenance: false
           outputs: type=image,name=${{ env.REGISTRY }}/${{ env.IMAGE_NAME }},push-by-digest=true,name-canonical=true,push=${{ github.event_name != 'pull_request' }}

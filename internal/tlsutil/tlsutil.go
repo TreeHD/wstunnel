@@ -1,10 +1,5 @@
-// tls.go — TLS 自簽憑證生成 + SNI 白名單
-//
-// 職責：
-//   * 第一次啟動時自動產生 self-signed 憑證
-//   * 載入既有憑證
-//   * SNI 白名單比對
-package main
+// Package tlsutil 處理 TLS 自簽憑證與 SNI 白名單。
+package tlsutil
 
 import (
 	"crypto/ecdsa"
@@ -20,6 +15,8 @@ import (
 	"os"
 	"strings"
 	"time"
+
+	"wstunnel/internal/config"
 )
 
 const (
@@ -27,8 +24,9 @@ const (
 	keyFile  = "key.pem"
 )
 
-// generateOrLoadTLSConfig 產生或載入伺服器端 TLS 憑證
-func generateOrLoadTLSConfig() (*tls.Config, error) {
+// LoadOrGenerate 產生或載入伺服器端 TLS 憑證。
+// 第一次啟動時會自動產生 self-signed,寫入 cert.pem / key.pem。
+func LoadOrGenerate() (*tls.Config, error) {
 	if _, err := os.Stat(certFile); os.IsNotExist(err) {
 		log.Printf("System: TLS certificate not found. Generating a new self-signed certificate...")
 		priv, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
@@ -80,15 +78,15 @@ func generateOrLoadTLSConfig() (*tls.Config, error) {
 	}, nil
 }
 
-// isSNIAllowed 比對 SNI 是否在白名單
-// 空白名單代表全部放行
-func isSNIAllowed(sni string) bool {
-	globalConfig.lock.RLock()
-	defer globalConfig.lock.RUnlock()
-	if len(globalConfig.AllowedSNI) == 0 {
+// SNIAllowed 比對 SNI 是否在白名單。空白名單代表全部放行。
+func SNIAllowed(sni string) bool {
+	c := config.Get()
+	c.Lock.RLock()
+	defer c.Lock.RUnlock()
+	if len(c.AllowedSNI) == 0 {
 		return true
 	}
-	for _, allowed := range globalConfig.AllowedSNI {
+	for _, allowed := range c.AllowedSNI {
 		if strings.EqualFold(allowed, sni) {
 			return true
 		}

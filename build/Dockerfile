@@ -4,7 +4,7 @@ WORKDIR /app
 COPY go.mod go.sum ./
 RUN go mod download
 COPY . .
-RUN CGO_ENABLED=0 GOOS=linux go build -ldflags "-s -w" -o wstunnel-go
+RUN CGO_ENABLED=0 GOOS=linux go build -ldflags "-s -w" -o wstunnel-go ./cmd/wstunnel
 
 # ===== Stage 2: UDPGW Downloader (Multi-arch) =====
 FROM debian:bookworm-slim AS udpgw-downloader
@@ -28,11 +28,11 @@ WORKDIR /app
 
 # 複製所有二進位檔
 COPY --from=go-builder /app/wstunnel-go .
-COPY --from=go-builder /app/frontend ./frontend
+COPY --from=go-builder /app/web ./web
 COPY --from=udpgw-downloader /udpgw-server /usr/local/bin/udpgw
 
-# 啟動腳本
-COPY entrypoint.sh .
+# 啟動腳本(從 repo root 的 build/ 目錄複製)
+COPY build/entrypoint.sh .
 RUN sed -i 's/\r$//' entrypoint.sh && chmod +x entrypoint.sh
 
 # 7300 (UDPGW) 只供容器內部 SSH Tunnel 存取,故意不 EXPOSE

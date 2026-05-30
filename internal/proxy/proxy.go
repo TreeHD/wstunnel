@@ -1,17 +1,8 @@
-// upstream.go — 上游 SOCKS5 / HTTP Proxy 鏈接
+// Package proxy 提供上游 SOCKS5 / HTTP CONNECT 鏈接。
 //
-// 職責：
-//   * 讓 wstunnel 把所有 SSH Tunnel 內走出來的 TCP 流量
-//     再轉發給一個帶 Auth 的上游 SOCKS5 或 HTTP Proxy
-//   * dialTarget 是統一的出口:upstream 啟用走代理,未啟用 fallback 直連
-//   * 解析 host 的責任:啟用 upstream 時交給上游(remote DNS resolution),
-//     未啟用時走本地 dns.go 的 resolver chain
-//
-// 為什麼不走 golang.org/x/net/proxy?
-//   * 該套件對 HTTP CONNECT proxy 沒有原生支援,要自己包
-//   * 我們需要對 timeout / Basic Auth header / SOCKS5 USER-PASS 子協商有完整控制
-//   * 直接手刻 ~150 行可避免新增依賴
-package main
+// 對外只暴露 DialTarget,呼叫者不需要關心 upstream 是否啟用、
+// 走哪種協定。upstream 啟用時走代理,否則 fallback 直連(dnsx.DialContextSmart)。
+package proxy
 
 import (
 	"context"
@@ -25,71 +16,72 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"wstunnel/internal/config"
+	"wstunnel/internal/dnsx"
 )
 
-// upstreamConfig 是當前上游代理設定的快照(避免每次 dial 都拿鎖)
-type upstreamConfig struct {
-	enabled  bool
-	rawURL   string
-	parsed   *url.URL
-	username string
-	password string
+// Settings 是當前上游代理設定的快照(避免每次 dial 都拿鎖)。
+type Settings struct {
+	Enabled  bool
+	RawURL   string
+	Parsed   *url.URL
+	Username string
+	Password string
 }
 
-// getUpstreamConfig 讀取目前生效的 upstream 設定
-func getUpstreamConfig() upstreamConfig {
-	globalConfig.lock.RLock()
-	enabled := globalConfig.UpstreamProxyEnabled
-	raw := strings.TrimSpace(globalConfig.UpstreamProxyURL)
-	globalConfig.lock.RUnlock()
+// CurrentSettings 從 config singleton 讀取目前生效的上游設定。
+func CurrentSettings() Settings {
+	c := config.Get()
+	c.Lock.RLock()
+	enabled := c.UpstreamProxyEnabled
+	raw := strings.TrimSpace(c.UpstreamProxyURL)
+	c.Lock.RUnlock()
 
 	if !enabled || raw == "" {
-		return upstreamConfig{enabled: false}
+		return Settings{Enabled: false}
 	}
-
 	u, err := url.Parse(raw)
 	if err != nil || u.Host == "" {
-		return upstreamConfig{enabled: false}
+		return Settings{Enabled: false}
 	}
-
-	cfg := upstreamConfig{enabled: true, rawURL: raw, parsed: u}
+	s := Settings{Enabled: true, RawURL: raw, Parsed: u}
 	if u.User != nil {
-		cfg.username = u.User.Username()
-		cfg.password, _ = u.User.Password()
+		s.Username = u.User.Username()
+		s.Password, _ = u.User.Password()
 	}
-	return cfg
+	return s
 }
 
-// dialTarget 是所有出站 TCP 連線的統一入口
-// 啟用 upstream 時把連線委託給代理(由代理負責 DNS 與實際撥號);否則走 dns.go 直連。
-func dialTarget(ctx context.Context, addr string, timeout time.Duration) (net.Conn, error) {
-	cfg := getUpstreamConfig()
-	if !cfg.enabled {
-		return dialContextSmart(ctx, addr, timeout)
+// DialTarget 是所有出站 TCP 連線的統一入口。
+// 啟用 upstream 時把連線委託給代理(由代理負責 DNS 與實際撥號);
+// 否則走 dnsx.DialContextSmart 直連。
+func DialTarget(ctx context.Context, addr string, timeout time.Duration) (net.Conn, error) {
+	s := CurrentSettings()
+	if !s.Enabled {
+		return dnsx.DialContextSmart(ctx, addr, timeout)
 	}
-	return dialViaUpstream(ctx, cfg, addr, timeout)
+	return DialVia(ctx, s, addr, timeout)
 }
 
-// dialViaUpstream 依據 scheme 分派到 SOCKS5 或 HTTP CONNECT
-func dialViaUpstream(ctx context.Context, cfg upstreamConfig, target string, timeout time.Duration) (net.Conn, error) {
-	scheme := strings.ToLower(cfg.parsed.Scheme)
+// DialVia 依據 scheme 分派到 SOCKS5 或 HTTP CONNECT(供測試 endpoint 用)。
+func DialVia(ctx context.Context, s Settings, target string, timeout time.Duration) (net.Conn, error) {
+	scheme := strings.ToLower(s.Parsed.Scheme)
 	switch scheme {
 	case "socks5", "socks5h":
-		return dialViaSOCKS5(ctx, cfg, target, timeout)
+		return dialSOCKS5(ctx, s, target, timeout)
 	case "http":
-		return dialViaHTTP(ctx, cfg, target, timeout, false)
+		return dialHTTP(ctx, s, target, timeout, false)
 	case "https":
-		// TLS 至代理本身,目前未實作(罕用)
 		return nil, fmt.Errorf("upstream scheme %q not supported (try http or socks5)", scheme)
 	default:
 		return nil, fmt.Errorf("unknown upstream proxy scheme: %q", scheme)
 	}
 }
 
-// dialViaSOCKS5 連到 SOCKS5 proxy 並使用 USER/PASS(0x02) 或無認證(0x00)
-//
+// dialSOCKS5 連到 SOCKS5 proxy 並使用 USER/PASS(0x02) 或無認證(0x00)。
 // 把 hostname 用 atyp=0x03 (FQDN) 帶過去,讓上游解析,避免本地 DNS 干擾。
-func dialViaSOCKS5(ctx context.Context, cfg upstreamConfig, target string, timeout time.Duration) (net.Conn, error) {
+func dialSOCKS5(ctx context.Context, s Settings, target string, timeout time.Duration) (net.Conn, error) {
 	host, portStr, err := net.SplitHostPort(target)
 	if err != nil {
 		return nil, fmt.Errorf("upstream socks5: invalid target %q: %w", target, err)
@@ -100,18 +92,17 @@ func dialViaSOCKS5(ctx context.Context, cfg upstreamConfig, target string, timeo
 	}
 
 	d := net.Dialer{Timeout: timeout}
-	conn, err := d.DialContext(ctx, "tcp", cfg.parsed.Host)
+	conn, err := d.DialContext(ctx, "tcp", s.Parsed.Host)
 	if err != nil {
-		return nil, fmt.Errorf("upstream socks5: dial %s: %w", cfg.parsed.Host, err)
+		return nil, fmt.Errorf("upstream socks5: dial %s: %w", s.Parsed.Host, err)
 	}
 	conn.SetDeadline(time.Now().Add(timeout))
 
-	authMethods := []byte{0x00} // 預設 no-auth
-	if cfg.username != "" || cfg.password != "" {
-		authMethods = []byte{0x02, 0x00} // 優先 USER/PASS,允許退到 no-auth
+	authMethods := []byte{0x00}
+	if s.Username != "" || s.Password != "" {
+		authMethods = []byte{0x02, 0x00}
 	}
 
-	// 階段 1:method negotiation
 	hello := []byte{0x05, byte(len(authMethods))}
 	hello = append(hello, authMethods...)
 	if _, err := conn.Write(hello); err != nil {
@@ -131,7 +122,7 @@ func dialViaSOCKS5(ctx context.Context, cfg upstreamConfig, target string, timeo
 	case 0x00:
 		// no-auth ok
 	case 0x02:
-		if err := socks5UserPass(conn, cfg.username, cfg.password); err != nil {
+		if err := socks5UserPass(conn, s.Username, s.Password); err != nil {
 			conn.Close()
 			return nil, err
 		}
@@ -143,7 +134,6 @@ func dialViaSOCKS5(ctx context.Context, cfg upstreamConfig, target string, timeo
 		return nil, fmt.Errorf("upstream socks5: unsupported method 0x%02X", resp[1])
 	}
 
-	// 階段 2:CONNECT 請求(用 FQDN atyp=0x03)
 	if len(host) > 255 {
 		conn.Close()
 		return nil, fmt.Errorf("upstream socks5: hostname too long")
@@ -156,7 +146,6 @@ func dialViaSOCKS5(ctx context.Context, cfg upstreamConfig, target string, timeo
 		return nil, fmt.Errorf("upstream socks5: connect write: %w", err)
 	}
 
-	// 讀 4 byte header,再依 atyp 讀後面位址
 	head := make([]byte, 4)
 	if _, err := io.ReadFull(conn, head); err != nil {
 		conn.Close()
@@ -166,15 +155,14 @@ func dialViaSOCKS5(ctx context.Context, cfg upstreamConfig, target string, timeo
 		conn.Close()
 		return nil, fmt.Errorf("upstream socks5: connect failed, REP=0x%02X (%s)", head[1], socks5RepText(head[1]))
 	}
-	// 把回應後面剩下的 BND.ADDR + PORT 讀掉(資料量依 atyp 變)
 	switch head[3] {
-	case 0x01: // IPv4
+	case 0x01:
 		io.ReadFull(conn, make([]byte, 4+2))
-	case 0x03: // FQDN
+	case 0x03:
 		l := make([]byte, 1)
 		io.ReadFull(conn, l)
 		io.ReadFull(conn, make([]byte, int(l[0])+2))
-	case 0x04: // IPv6
+	case 0x04:
 		io.ReadFull(conn, make([]byte, 16+2))
 	}
 
@@ -225,16 +213,15 @@ func socks5RepText(rep byte) string {
 	return "unknown"
 }
 
-// dialViaHTTP 連到 HTTP proxy 並送 CONNECT 請求
-// useTLS=true 表示對 proxy 本身做 TLS(目前未實作)
-func dialViaHTTP(ctx context.Context, cfg upstreamConfig, target string, timeout time.Duration, useTLS bool) (net.Conn, error) {
+// dialHTTP 連到 HTTP proxy 並送 CONNECT 請求。
+func dialHTTP(ctx context.Context, s Settings, target string, timeout time.Duration, useTLS bool) (net.Conn, error) {
 	if useTLS {
 		return nil, errors.New("upstream https proxy not implemented")
 	}
 	d := net.Dialer{Timeout: timeout}
-	conn, err := d.DialContext(ctx, "tcp", cfg.parsed.Host)
+	conn, err := d.DialContext(ctx, "tcp", s.Parsed.Host)
 	if err != nil {
-		return nil, fmt.Errorf("upstream http: dial %s: %w", cfg.parsed.Host, err)
+		return nil, fmt.Errorf("upstream http: dial %s: %w", s.Parsed.Host, err)
 	}
 	conn.SetDeadline(time.Now().Add(timeout))
 
@@ -242,8 +229,8 @@ func dialViaHTTP(ctx context.Context, cfg upstreamConfig, target string, timeout
 	fmt.Fprintf(&sb, "CONNECT %s HTTP/1.1\r\n", target)
 	fmt.Fprintf(&sb, "Host: %s\r\n", target)
 	fmt.Fprintf(&sb, "User-Agent: wstunnel-go\r\n")
-	if cfg.username != "" || cfg.password != "" {
-		token := base64.StdEncoding.EncodeToString([]byte(cfg.username + ":" + cfg.password))
+	if s.Username != "" || s.Password != "" {
+		token := base64.StdEncoding.EncodeToString([]byte(s.Username + ":" + s.Password))
 		fmt.Fprintf(&sb, "Proxy-Authorization: Basic %s\r\n", token)
 	}
 	sb.WriteString("Proxy-Connection: Keep-Alive\r\n\r\n")
@@ -253,7 +240,6 @@ func dialViaHTTP(ctx context.Context, cfg upstreamConfig, target string, timeout
 		return nil, fmt.Errorf("upstream http: CONNECT write: %w", err)
 	}
 
-	// 讀 status line
 	statusLine, err := readHTTPLine(conn)
 	if err != nil {
 		conn.Close()
@@ -261,12 +247,10 @@ func dialViaHTTP(ctx context.Context, cfg upstreamConfig, target string, timeout
 	}
 	parts := strings.SplitN(statusLine, " ", 3)
 	if len(parts) < 2 || !strings.HasPrefix(parts[1], "2") {
-		// 把剩下的 header 也讀完免得殘留資料(失敗了反正要關 conn)
 		conn.Close()
 		return nil, fmt.Errorf("upstream http: CONNECT rejected: %s", strings.TrimSpace(statusLine))
 	}
 
-	// 讀掉所有 header 直到空行
 	for {
 		line, err := readHTTPLine(conn)
 		if err != nil {
@@ -282,7 +266,7 @@ func dialViaHTTP(ctx context.Context, cfg upstreamConfig, target string, timeout
 	return conn, nil
 }
 
-// readHTTPLine 讀一行 \r\n 結尾的文字(不使用 bufio,避免吞掉 CONNECT 之後的資料)
+// readHTTPLine 讀一行 \r\n 結尾的文字(不使用 bufio,避免吞掉 CONNECT 之後的資料)。
 func readHTTPLine(conn net.Conn) (string, error) {
 	var buf []byte
 	one := make([]byte, 1)
@@ -301,36 +285,35 @@ func readHTTPLine(conn net.Conn) (string, error) {
 	}
 }
 
-// upstreamHealthCheck 啟動時測試上游 proxy 是否可達
-func upstreamHealthCheck() {
-	cfg := getUpstreamConfig()
-	if !cfg.enabled {
+// HealthCheck 啟動時測試上游 proxy 是否可達。
+func HealthCheck() {
+	s := CurrentSettings()
+	if !s.Enabled {
 		log.Printf("UPSTREAM: ⏸  disabled (direct dial)")
 		return
 	}
 
-	// 試對 proxy 本身做一次 TCP 連線(不做完整握手,避免造成無謂的對外查詢)
 	d := net.Dialer{Timeout: 3 * time.Second}
-	conn, err := d.Dial("tcp", cfg.parsed.Host)
+	conn, err := d.Dial("tcp", s.Parsed.Host)
 	if err != nil {
-		log.Printf("UPSTREAM HEALTH-CHECK: ❌ proxy %s NOT reachable — %v", cfg.parsed.Host, err)
+		log.Printf("UPSTREAM HEALTH-CHECK: ❌ proxy %s NOT reachable — %v", s.Parsed.Host, err)
 		log.Printf("UPSTREAM HEALTH-CHECK:    所有出站連線會失敗,請從後台修正設定或先停用 upstream")
 		return
 	}
 	conn.Close()
 
 	authNote := "no auth"
-	if cfg.username != "" {
-		authNote = fmt.Sprintf("auth user=%q", cfg.username)
+	if s.Username != "" {
+		authNote = fmt.Sprintf("auth user=%q", s.Username)
 	}
 	log.Printf("UPSTREAM: ✅ enabled — scheme=%s host=%s %s",
-		strings.ToLower(cfg.parsed.Scheme), cfg.parsed.Host, authNote)
+		strings.ToLower(s.Parsed.Scheme), s.Parsed.Host, authNote)
 }
 
-// redactProxyURL 把 URL 中的密碼換成 *** 用於 log,避免敏感資料外洩
+// RedactURL 把 URL 中的密碼換成 *** 用於 log。
 //
-// 不能用 url.URL.String() 因為它會把 * 做 percent-encode 變 %2A,所以手動拼接。
-func redactProxyURL(raw string) string {
+// 不能用 url.URL.String() 因為它會把 * 做 percent-encode 變 %2A。
+func RedactURL(raw string) string {
 	if raw == "" {
 		return ""
 	}

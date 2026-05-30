@@ -25,7 +25,7 @@ RUN CASE_ARCH="$(uname -m)" && \
 # 3. 複製編譯好的服務
 COPY --from=builder /app/target/release/slipstream-server /usr/local/bin/
 
-COPY entrypoint.dnstt.sh /entrypoint.sh
+COPY build/entrypoint.dnstt.sh /entrypoint.sh
 RUN chmod +x /entrypoint.sh
 
 WORKDIR /data

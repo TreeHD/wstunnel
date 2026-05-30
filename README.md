@@ -112,21 +112,31 @@
 
 ### 程式碼結構
 
-| 檔案 | 職責 |
-|------|------|
-| `main.go` | 程式進入點與 listener 編排 |
-| `config.go` | 設定結構、env 解析、儲存/載入 |
-| `traffic.go` | 流量統計 sync.Map 與持久化 |
-| `session.go` | 後台登入 cookie 管理 |
-| `tls.go` | 自簽憑證生成、SNI 白名單 |
-| `logging.go` | 中央 log 收集器、降噪輔助 |
-| `ssh_server.go` | SSH 握手、tolerantCopy、direct-tcpip |
-| `dispatcher.go` | 80/443 入口分流、HTTP Upgrade 偽裝 |
-| `api.go` | Admin 後台 HTTP API |
-| `dns.go` | DNS 解析子系統(多 server、UDP→TCP fallback) |
-| `udpgw.go` | UDPGW 協定攔截、DNS 短路 |
-| `ip_tunnel.go` | IP-over-SSH 隧道(可選) |
-| `nat_setup.go` | iptables NAT 與 IP forward |
+依 [golang-standards/project-layout](https://github.com/golang-standards/project-layout) 慣例組織:
+
+```
+wstunnel/
+├── cmd/wstunnel/         # 程式進入點(薄殼,只做 wiring)
+├── internal/             # 不對外公開的子套件
+│   ├── config/           # 設定結構、env、save/load
+│   ├── logging/          # log 收集器、降噪輔助
+│   ├── traffic/          # 流量統計與持久化
+│   ├── session/          # 後台 admin login cookie
+│   ├── tlsutil/          # 自簽憑證 + SNI 白名單
+│   ├── dnsx/             # DNS resolver(多 server、UDP→TCP fallback)
+│   ├── proxy/            # 上游 SOCKS5/HTTP CONNECT (帶 Auth)
+│   ├── iptun/            # IP-over-SSH 隧道
+│   ├── udpgw/            # UDPGW 攔截 + DNS 短路
+│   ├── sshsrv/           # SSH 握手、tolerantCopy、direct-tcpip
+│   ├── dispatcher/       # 80/443 入口分流 + HTTP Upgrade 偽裝
+│   └── adminapi/         # 9090 後台所有 HTTP handler
+├── web/                  # 控制面板 HTML
+├── build/                # Dockerfile / entrypoint
+├── docs/                 # 開發文件
+├── docker-compose.yml
+├── go.mod / go.sum
+└── README.md
+```
 
 ---
 
@@ -395,11 +405,11 @@ API 端點(需 cookie 認證):
 git clone https://github.com/TreeHD/wstunnel.git
 cd wstunnel
 go mod download
-CGO_ENABLED=0 go build -ldflags "-s -w" -o wstunnel-go
+CGO_ENABLED=0 go build -ldflags "-s -w" -o wstunnel-go ./cmd/wstunnel
 ./wstunnel-go
 ```
 
-啟動後預設讀 `./data/config.json`,前端檔在 `./frontend/`。
+啟動後預設讀 `./data/config.json`,前端檔在 `./web/`。
 
 ### Docker 自行 build
 
@@ -418,7 +428,7 @@ docker run -d \
 - 文件與 log 文字使用台灣正體中文
 - 新增功能請整合既有的 `globalConfig.Accounts` 認證、`globalTraffic` 流量統計、
   `sync.WaitGroup` 優雅關閉機制
-- 詳見 [`agents.md`](agents.md)
+- 詳見 [`docs/agents.md`](docs/agents.md)
 
 ---
 
@@ -441,5 +451,5 @@ docker run -d \
 
 MIT License
 
-歡迎提交 Issue 與 Pull Request。在貢獻 PR 前請先閱讀 [`agents.md`](agents.md)
+歡迎提交 Issue 與 Pull Request。在貢獻 PR 前請先閱讀 [`docs/agents.md`](docs/agents.md)
 了解專案的命名規範與貢獻指引。
