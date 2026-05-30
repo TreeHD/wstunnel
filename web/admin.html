@@ -466,6 +466,54 @@
             transition: all 0.3s;
         }
 
+        .modal-content.wide {
+            max-width: 560px;
+            text-align: left;
+        }
+
+        .modal-content.wide h3 {
+            margin: 0 0 6px;
+        }
+
+        .modal-content.wide .help {
+            font-size: 12px;
+            color: #64748b;
+            margin: 4px 0 0;
+            line-height: 1.5;
+        }
+
+        .modal-content.wide .field {
+            margin-top: 14px;
+        }
+
+        .modal-content.wide .field label {
+            display: block;
+            font-weight: 600;
+            font-size: 13px;
+            margin-bottom: 4px;
+        }
+
+        .modal-content.wide .field input[type=text],
+        .modal-content.wide .field input[type=number] {
+            width: 100%;
+            padding: 8px 10px;
+            border: 1px solid #cbd5e1;
+            border-radius: 6px;
+            font-size: 13px;
+            box-sizing: border-box;
+        }
+
+        .modal-content.wide .field.checkbox {
+            display: flex;
+            align-items: center;
+            gap: 8px;
+        }
+
+        .modal-content.wide .field.checkbox label {
+            margin: 0;
+            font-weight: 500;
+        }
+
         .modal-overlay.show .modal-content {
             transform: scale(1);
         }
@@ -601,6 +649,82 @@
             const closeModal = () => { overlay.classList.remove('show'); setTimeout(() => container.innerHTML = '', 300); };
             gid('modal-confirm').onclick = () => { onConfirm(); closeModal(); };
             gid('modal-cancel').onclick = closeModal;
+        }
+
+        // showFormModal — 顯示一個 HTML 表單彈窗,fields = [{name, label, type, value, help, placeholder, options}]
+        // type 支援:'text' / 'number' / 'checkbox' / 'static'(純說明文字)
+        // 回傳一個 Promise:用戶點「確認」resolve(values),點「取消」resolve(null)
+        function showFormModal({ title, intro, fields, confirmLabel = '確認', confirmClass = 'primary' }) {
+            return new Promise(resolve => {
+                const container = gid('modal-container');
+                const fieldHtml = fields.map(f => {
+                    if (f.type === 'static') {
+                        return `<div class="field"><div class="help" style="font-size:13px;color:#475569;">${f.label}</div></div>`;
+                    }
+                    if (f.type === 'checkbox') {
+                        return `<div class="field checkbox">
+                            <input type="checkbox" id="fm-${f.name}" ${f.value ? 'checked' : ''}>
+                            <label for="fm-${f.name}">${f.label}</label>
+                            ${f.help ? `<div class="help" style="margin-left:24px;flex-basis:100%;">${f.help}</div>` : ''}
+                        </div>`;
+                    }
+                    const showWhen = f.showWhen ? ` data-show-when="${f.showWhen}"` : '';
+                    return `<div class="field"${showWhen}>
+                        <label for="fm-${f.name}">${f.label}</label>
+                        <input type="${f.type || 'text'}" id="fm-${f.name}" value="${(f.value ?? '').toString().replace(/"/g, '&quot;')}" placeholder="${(f.placeholder || '').replace(/"/g, '&quot;')}">
+                        ${f.help ? `<div class="help">${f.help}</div>` : ''}
+                    </div>`;
+                }).join('');
+
+                container.innerHTML = `<div class="modal-overlay"><div class="modal-content wide">
+                    <h3>${title}</h3>
+                    ${intro ? `<p class="help">${intro}</p>` : ''}
+                    ${fieldHtml}
+                    <div class="modal-buttons" style="justify-content:flex-end;margin-top:20px;">
+                        <button class="btn secondary" id="fm-cancel">取消</button>
+                        <button class="btn ${confirmClass}" id="fm-ok">${confirmLabel}</button>
+                    </div>
+                </div></div>`;
+
+                const overlay = container.querySelector('.modal-overlay');
+                setTimeout(() => overlay.classList.add('show'), 10);
+                const close = (val) => {
+                    overlay.classList.remove('show');
+                    setTimeout(() => { container.innerHTML = ''; resolve(val); }, 300);
+                };
+
+                // 處理 showWhen:依照其他 checkbox 的 checked 狀態顯示/隱藏
+                const refreshShowWhen = () => {
+                    fields.forEach(f => {
+                        if (!f.showWhen) return;
+                        const target = container.querySelector(`[data-show-when="${f.showWhen}"]`);
+                        if (!target) return;
+                        const cb = gid(`fm-${f.showWhen}`);
+                        target.style.display = (cb && cb.checked) ? '' : 'none';
+                    });
+                };
+                fields.forEach(f => {
+                    if (f.type === 'checkbox') {
+                        const cb = gid(`fm-${f.name}`);
+                        if (cb) cb.addEventListener('change', refreshShowWhen);
+                    }
+                });
+                refreshShowWhen();
+
+                gid('fm-cancel').onclick = () => close(null);
+                gid('fm-ok').onclick = () => {
+                    const out = {};
+                    fields.forEach(f => {
+                        if (f.type === 'static') return;
+                        const el = gid('fm-' + f.name);
+                        if (!el) return;
+                        if (f.type === 'checkbox') out[f.name] = el.checked;
+                        else if (f.type === 'number') out[f.name] = el.value === '' ? null : Number(el.value);
+                        else out[f.name] = el.value.trim();
+                    });
+                    close(out);
+                };
+            });
         }
         async function apiRequest(url, options = {}) {
             if (options.body) options.headers = { ...options.headers, 'Content-Type': 'application/json' };
@@ -860,11 +984,18 @@
         function escapeAttr(s) { return (s || '').replace(/['"\\]/g, '\\$&'); }
 
         async function clusterAddNodePrompt() {
-            const name = prompt('節點名稱(例: 東京-A):');
-            if (!name) return;
-            const notes = prompt('備註(可空白):', '') || '';
+            const r = await showFormModal({
+                title: '新增 Slave 節點',
+                intro: '建立後會立刻產生一份 docker-compose.yml,複製到目標機器即可部署。Token 由系統自動產生,不會在此顯示。',
+                confirmLabel: '建立節點',
+                fields: [
+                    { name: 'name', label: '節點名稱', type: 'text', placeholder: '例:東京-A', help: '後台用來辨識的友善名稱,可任意填寫。' },
+                    { name: 'notes', label: '備註(可空白)', type: 'text', placeholder: '例:Vultr 4G / 用於日本流量', help: '只給管理員看的備忘,不影響運作。' }
+                ]
+            });
+            if (!r || !r.name) return;
             const rec = await apiRequest('/api/cluster/slaves', {
-                method: 'POST', body: JSON.stringify({ name, notes })
+                method: 'POST', body: JSON.stringify({ name: r.name, notes: r.notes })
             });
             if (rec) {
                 showToast(`已建立節點 ${rec.node_id}`);
@@ -881,28 +1012,93 @@
         }
 
         async function clusterShowCompose(id, name) {
-            const masterURL = prompt('Master 對外網址(例: https://master.example.com:9090):', window.location.origin);
-            if (!masterURL) return;
-            const publicAddr = prompt(`Slave「${name}」的對外連線位址(用戶會連的網址,例: tunnel-jp.example.com:443):`, '') || '';
-            const skipTLS = !masterURL.startsWith('https://');
-            const r = await apiRequest('/api/cluster/slaves/' + encodeURIComponent(id) + '/compose', {
-                method: 'POST',
-                body: JSON.stringify({
-                    master_url: masterURL,
-                    public_addr: publicAddr,
-                    skip_tls_verify: skipTLS,
-                    heartbeat_sec: 30
-                })
+            const r = await showFormModal({
+                title: `產生「${name}」的 docker-compose.yml`,
+                intro: '請填入下列資訊,系統會把 NodeID / Token 等敏感欄位自動填好。完成後可直接複製到目標機器使用。',
+                confirmLabel: '產生 YAML',
+                fields: [
+                    {
+                        name: '__cluster_section', type: 'static',
+                        label: '<strong>① 叢集通訊(Slave → Master)</strong> &mdash; 走 Master 的 <strong>9090 admin port</strong>,不會佔用 80/443。'
+                    },
+                    {
+                        name: 'master_url', label: 'Master 對外網址(admin port)', type: 'text',
+                        value: window.location.origin,
+                        placeholder: 'http://master.example.com:9090',
+                        help: 'Slave 會把 heartbeat POST 到這個位址。<strong>必須是 admin port(預設 9090)</strong>,不是 80/443。預設帶入目前後台網址。'
+                    },
+                    {
+                        name: 'skip_tls_verify', label: '略過 Master TLS 憑證驗證(自簽憑證請勾選)', type: 'checkbox',
+                        value: !window.location.origin.startsWith('https://'),
+                        help: 'Master 用自簽 / 純 HTTP 時必須勾選。正式 CA 簽發的憑證請保持關閉。'
+                    },
+                    {
+                        name: 'heartbeat_sec', label: '心跳間隔(秒)', type: 'number',
+                        value: 30,
+                        placeholder: '30',
+                        help: '建議 30。Master 會在每次回應中動態調整,範圍 10–300。'
+                    },
+                    {
+                        name: '__user_section', type: 'static',
+                        label: '<strong>② 使用者連線(End User → Slave)</strong> &mdash; 走 Slave 的 <strong>80 / 443</strong>(TLS Multiplexer / HTTP Upgrade),由用戶端 App 連線。'
+                    },
+                    {
+                        name: 'public_addr', label: 'Slave 對外連線位址(僅後台顯示用)', type: 'text',
+                        placeholder: 'tunnel-jp.example.com:443',
+                        help: '使用者連 Slave 時用的網址。後台只用來顯示,不影響功能,可留空。<strong>跟叢集通訊無關。</strong>'
+                    },
+                    {
+                        name: '__dnstt_section', type: 'static',
+                        label: '<strong>③ 進階:DNSTT (DNS 隧道)</strong>'
+                    },
+                    {
+                        name: 'include_dnstt', label: '同時部署 DNSTT 服務', type: 'checkbox', value: false,
+                        help: '會額外啟動 dnstt 容器(profile: dnstt),監聽 53/UDP 提供 DNS 隧道。需自備網域 NS/A 設定。'
+                    },
+                    {
+                        name: 'dnstt_domain', label: 'DNSTT 網域', type: 'text', placeholder: 't.example.com',
+                        help: '對應你 DNS NS 記錄指向 tns.* 的子網域。憑證與種子會在首次啟動時自動產生於 ./data/dnstt。',
+                        showWhen: 'include_dnstt'
+                    }
+                ]
             });
             if (!r) return;
+            if (!r.master_url) { showToast('Master 網址必填', 'error'); return; }
+            if (r.include_dnstt && !r.dnstt_domain) { showToast('啟用 DNSTT 必須填網域', 'error'); return; }
+
+            const resp = await apiRequest('/api/cluster/slaves/' + encodeURIComponent(id) + '/compose', {
+                method: 'POST',
+                body: JSON.stringify({
+                    master_url: r.master_url,
+                    public_addr: r.public_addr,
+                    skip_tls_verify: !!r.skip_tls_verify,
+                    include_dnstt: !!r.include_dnstt,
+                    dnstt_domain: r.dnstt_domain || '',
+                    heartbeat_sec: r.heartbeat_sec || 30
+                })
+            });
+            if (!resp) return;
+
             const detail = gid('cluster-detail');
             const body = gid('cluster-detail-body');
             detail.style.display = '';
+            const dnsttHelp = r.include_dnstt ? `
+                <div style="background:#fef3c7;border-left:3px solid #f59e0b;padding:10px 12px;border-radius:4px;font-size:12px;margin:8px 0;">
+                    <strong>DNSTT 部署提醒:</strong>
+                    <ol style="margin:6px 0 0 18px;padding:0;">
+                        <li>到 DNS 註冊商加 A 記錄:<code>tns.${escapeHtml(r.dnstt_domain.split('.').slice(-2).join('.'))} → Slave 機器 IP</code></li>
+                        <li>加 NS 記錄:<code>${escapeHtml(r.dnstt_domain)} → tns.${escapeHtml(r.dnstt_domain.split('.').slice(-2).join('.'))}</code></li>
+                        <li>啟動時用 <code>docker compose --profile dnstt up -d</code></li>
+                    </ol>
+                </div>` : '';
             body.innerHTML = `
-                <p style="font-size:13px;color:#64748b">複製下方 YAML 到目標機器存成 <code>docker-compose.yml</code>,執行 <code>docker compose up -d</code> 即可。</p>
-                <textarea readonly style="width:100%;height:320px;font-family:monospace;font-size:12px;">${escapeHtml(r.yaml)}</textarea>
+                <p style="font-size:13px;color:#64748b">
+                    複製下方 YAML 到目標機器存成 <code>docker-compose.yml</code>,執行 <code>docker compose up -d</code> 即可。
+                </p>
+                ${dnsttHelp}
+                <textarea id="compose-yaml-output" readonly style="width:100%;height:320px;font-family:monospace;font-size:12px;box-sizing:border-box;">${escapeHtml(resp.yaml)}</textarea>
                 <div style="display:flex;gap:8px;margin-top:8px;">
-                    <button class="btn primary" onclick="navigator.clipboard.writeText(this.previousElementSibling.previousElementSibling.value);showToast('已複製到剪貼簿')">複製</button>
+                    <button class="btn primary" onclick="navigator.clipboard.writeText(gid('compose-yaml-output').value);showToast('已複製到剪貼簿')">複製 YAML</button>
                 </div>`;
         }
 

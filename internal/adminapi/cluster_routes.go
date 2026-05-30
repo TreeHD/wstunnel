@@ -184,6 +184,7 @@ func clusterCompose(w http.ResponseWriter, r *http.Request) {
 		PublicAddr    string `json:"public_addr"`
 		SkipTLSVerify bool   `json:"skip_tls_verify"`
 		IncludeDNSTT  bool   `json:"include_dnstt"`
+		DNSTTDomain   string `json:"dnstt_domain"`
 		HeartbeatSec  int    `json:"heartbeat_sec"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&p); err != nil {
@@ -196,6 +197,7 @@ func clusterCompose(w http.ResponseWriter, r *http.Request) {
 		PublicAddr:    strings.TrimSpace(p.PublicAddr),
 		SkipTLSVerify: p.SkipTLSVerify,
 		IncludeDNSTT:  p.IncludeDNSTT,
+		DNSTTDomain:   strings.TrimSpace(p.DNSTTDomain),
 		HeartbeatSec:  p.HeartbeatSec,
 	})
 	if err != nil {

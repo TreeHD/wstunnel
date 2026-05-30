@@ -16,12 +16,13 @@ import (
 
 // ComposeOptions 是產生 compose 時前端可調整的參數。
 type ComposeOptions struct {
-	NodeID         string
-	MasterURL      string // 例:https://master.example.com:9090
-	PublicAddr     string // 給使用者連的對外位址
-	SkipTLSVerify  bool
-	IncludeDNSTT   bool
-	HeartbeatSec   int
+	NodeID        string
+	MasterURL     string // 例:https://master.example.com:9090
+	PublicAddr    string // 給使用者連的對外位址
+	SkipTLSVerify bool
+	IncludeDNSTT  bool
+	DNSTTDomain   string // 啟用 DNSTT 時的網域,例:t.example.com
+	HeartbeatSec  int
 }
 
 // GenerateSlaveCompose 對指定 NodeID 產生一份 docker-compose.yml。
@@ -93,7 +94,9 @@ func GenerateSlaveCompose(opt ComposeOptions) (string, error) {
 		sb.WriteString("    ports:\n")
 		sb.WriteString("      - \"53:5353/udp\"\n")
 		sb.WriteString("    environment:\n")
-		sb.WriteString("      - DNSTT_DOMAIN=\n")
+		fmt.Fprintf(&sb, "      - DNSTT_DOMAIN=%s\n", q(opt.DNSTTDomain))
+		sb.WriteString("    volumes:\n")
+		sb.WriteString("      - ./data/dnstt:/app/data\n")
 	}
 	return sb.String(), nil
 }
