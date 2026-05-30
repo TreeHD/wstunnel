@@ -70,6 +70,8 @@ type Config struct {
 	// 留空則使用容器預設 DNS（/etc/resolv.conf）。
 	// 範例: "8.8.8.8:53" 或 "1.1.1.1:53"
 	DNSServer                   string                 `json:"dns_server,omitempty"`
+	// UDPGWPort 指定本機 udpgw 進程監聽的 port,留空則用預設 7300
+	UDPGWPort                   int                    `json:"udpgw_port,omitempty"`
 	lock                        sync.RWMutex
 }
 
@@ -525,7 +527,12 @@ func handleSshConnection(c net.Conn, r io.Reader, sshCfg *ssh.ServerConfig) {
 				OriginatorPort uint32
 			}
 			ssh.Unmarshal(newChan.ExtraData(), &payload)
-			go handleDirectTCPIP(ch, payload.Host, payload.Port, sshConn.RemoteAddr(), username)
+			// 若目標是 udpgw,接管以攔截 DNS 並透明轉發其他 UDP (見 udpgw.go)
+			if isUDPGWTarget(payload.Host, payload.Port) {
+				go handleUDPGWChannel(ch, sshConn.RemoteAddr(), username)
+			} else {
+				go handleDirectTCPIP(ch, payload.Host, payload.Port, sshConn.RemoteAddr(), username)
+			}
 		case "tun-tcpip", "ip-tunnel":
 			ch, _, err := newChan.Accept()
 			if err != nil {
@@ -938,6 +945,7 @@ func apiHandler(w http.ResponseWriter, r *http.Request) {
 			globalConfig.DefaultLimitGB = newSettings.DefaultLimitGB
 			globalConfig.AllowedSNI = newSettings.AllowedSNI
 			globalConfig.DNSServer = newSettings.DNSServer
+			globalConfig.UDPGWPort = newSettings.UDPGWPort
 			globalConfig.lock.Unlock()
 			// DNS server 可能已變更，重建 resolver（dns.go）
 			rebuildResolver()
@@ -961,6 +969,9 @@ func apiHandler(w http.ResponseWriter, r *http.Request) {
 		if user, ok := validateSession(r); ok {
 			sendJSON(w, http.StatusOK, map[string]string{"username": user})
 		}
+	case r.URL.Path == "/api/udpgw/status":
+		// 暴露 UDPGW 攔截統計與健康狀態,用於前端顯示與排查
+		sendJSON(w, http.StatusOK, udpgwStatsSnapshot())
 	default:
 		http.NotFound(w, r)
 	}
@@ -1130,6 +1141,9 @@ func main() {
 		// 延遲一下讓 listener 先就緒，再做健檢；不阻塞主流程
 		time.Sleep(2 * time.Second)
 		dnsHealthCheck()
+		// udpgw 透過 entrypoint.sh 啟動,稍等其就緒後再檢查
+		time.Sleep(1 * time.Second)
+		udpgwHealthCheck()
 	}()
 
 	if err := createTunDevice(); err != nil {
