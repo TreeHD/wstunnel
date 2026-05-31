@@ -10,12 +10,16 @@ import (
 // SlaveRecord 對應 cluster.SlaveRecord 在 store 層的副本。
 // 之所以複製一份而不直接借用 config.SlaveRecord,是為了讓 store
 // 不依賴上層 package(避免循環匯入)。cluster 端會自己做 mapping。
+//
+// JSON tags 是必要的:這個 struct 會直接在 admin API
+// (POST /api/cluster/slaves)的 response 中序列化給前端使用,
+// 前端讀的是 snake_case 欄位。
 type SlaveRecord struct {
-	NodeID    string
-	NodeName  string
-	Token     string
-	Notes     string
-	CreatedAt int64
+	NodeID    string `json:"node_id"`
+	NodeName  string `json:"node_name"`
+	Token     string `json:"token"`
+	Notes     string `json:"notes,omitempty"`
+	CreatedAt int64  `json:"created_at"`
 }
 
 // ErrSlaveNotFound 指定節點不存在。
