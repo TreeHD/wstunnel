@@ -9,9 +9,10 @@
 * **目錄結構** (依 [golang-standards/project-layout](https://github.com/golang-standards/project-layout) 慣例):
   * `cmd/wstunnel/`: 程式進入點(薄殼),只做 wiring 與 listener 啟動
   * `internal/`: 不對外公開的子套件,Go compiler 強制只能本 module import
-    * `config`: Config 結構、env、save/load
+    * `store`: SQLite 持久化層 (modernc.org/sqlite,**保持 CGO_ENABLED=0**)。帳號 / admin / slaves / traffic 全部走這
+    * `config`: 系統設定(listen 位址、握手、上游 proxy、cluster 角色)。帳號相關欄位已移到 store
     * `logging`: log 收集器、降噪輔助、`WSTUNNEL_DEBUG` 開關
-    * `traffic`: 流量統計與持久化
+    * `traffic`: 流量統計與 SQLite 持久化(write-through)
     * `session`: 後台 admin login cookie
     * `tlsutil`: 自簽憑證生成 + SNI 白名單
     * `dnsx`: DNS resolver chain + 多 server failover + UDP→TCP fallback
@@ -31,16 +32,25 @@
   * `docker-compose.yml`: 部署設定(刻意保留 repo root,符合慣例)
 
 * **package singleton 模式**:每個 package 內部仍保留 singleton(如 `config.current`、`traffic.store`),透過 exported getter/setter 對外暴露。這是刻意選擇的最小改動策略,避免改成 dependency injection 的大量改寫成本。
+* **儲存層**:`internal/store` 用 [modernc.org/sqlite](https://gitlab.com/cznic/sqlite)(純 Go,**不需要 CGO**)。
+  * 四張表:`accounts` / `admin_accounts` / `traffic` / `slaves`,加上 `meta` 記 schema_version。
+  * Migration 寫法:在 `migrations` slice 後面 `append`,**永遠不要修改舊的 entry**。
+  * 啟動時 `store.Init()` → `config.MigrateFromLegacy()` 會把舊 `config.json` 內的 `accounts/admin_accounts/slaves` 搬到 SQLite,明文密碼 bcrypt-hash,原檔備份成 `data/config.json.pre-sqlite.bak`。
+* **密碼安全模型**:
+  * SSH 使用者密碼、後台 admin 密碼一律 **bcrypt(cost=12)**,單向不可逆。
+  * 後台**不能顯示**使用者密碼,管理員只能「重設」。
+  * 叢集同步只傳 hash(`AccountSync.PasswordHash`),Master/Slave **不需共享 key**。
+  * 通訊靠 HTTPS + HMAC-SHA256;hash 永不出現在 admin API response(`store.Account.PasswordHash` 標 `json:"-"`)。
 * **UDP 支援 (UDPGW)**:採用 `tun2proxy` 專案的 `udpgw-server`。**故意只綁 127.0.0.1 並不對外公開 port**,避免被當匿名 UDP 出口代理。
 * **DNS 解析**:wstunnel 主程式直接攔截 SSH `direct-tcpip` 通往 udpgw 的連線(`internal/udpgw`),DNS 查詢由主程式自行解析(`internal/dnsx`),不依賴外部 udpgw 進程。
 * **DNS 隧道 (DNSTT)**:內建 [Slipstream-rust](https://github.com/Mygod/slipstream-rust) 支援,獨立 image。
-* **流量統計**:`internal/traffic` 用 sync.Map + atomic 累加,定期存盤。
+* **流量統計**:`internal/traffic` 用 sync.Map + atomic 累加,定期 batch upsert 到 SQLite。
 * **Port 複用**:`443` 入口在 `internal/dispatcher` 做 Peek 判斷 SSH-direct vs HTTP-Upgrade 偽裝。**修改這一塊時請特別注意不要破壞原有的 Peek 邏輯。**
 * **叢集模式 (Master/Slaves)**:`internal/cluster` 提供 Pull-mode 心跳協定。
   * 角色由 `cluster_role` (config) 或 `CLUSTER_ROLE` (env) 決定,值為 `standalone`/`master`/`slave`。
   * Master 在 `/api/cluster/heartbeat` 接收 Slave 心跳(token + HMAC-SHA256 雙重認證,**不走 admin cookie**)。
-  * Slave 啟動後在 main 註冊 `cluster.SlaveHooks`,定期上報 traffic delta、線上連線、log tail,並套用 Master 下發的帳號/共用設定/踢除指令。
-  * 「節點登錄」資料持久化在 `config.Slaves` (NodeID → Token);runtime 狀態(LastSeen 等)在記憶體。
+  * Slave 啟動後在 main 註冊 `cluster.SlaveHooks`,定期上報 traffic delta、線上連線、log tail,並套用 Master 下發的帳號(含 hash)/共用設定/踢除指令。
+  * 「節點登錄」資料持久化在 store.slaves(NodeID → Token);runtime 狀態(LastSeen 等)在記憶體。
   * UI 會在登入後查 `/api/cluster/role`,僅 Master 顯示「節點管理」頁籤。Slave 端 admin 仍可獨立登入但管理面是唯讀屬性。
   * 上游帳號/SNI/握手等共享設定由 Master 強制覆寫,**ListenAddr/AdminAddr/DNSServer/UDPGWPort 等本機資源欄位刻意不下發**,讓節點可獨立調整。
 

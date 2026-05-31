@@ -25,6 +25,7 @@ import (
 	"wstunnel/internal/iptun"
 	"wstunnel/internal/logging"
 	"wstunnel/internal/proxy"
+	"wstunnel/internal/store"
 	"wstunnel/internal/traffic"
 	"wstunnel/internal/udpgw"
 )
@@ -155,13 +156,13 @@ func BuildServerConfig() *ssh.ServerConfig {
 }
 
 // passwordCallback SSH 密碼認證,整合帳號狀態/到期/流量上限/連線數。
+//
+// 順序刻意設計:先做廉價檢查(查 row、enabled、expiry、流量、連線數),
+// 再做昂貴的 bcrypt 比對。bcrypt cost=12 約 300ms,可避免被當枚舉預言機。
 func passwordCallback(c ssh.ConnMetadata, p []byte) (*ssh.Permissions, error) {
 	user := c.User()
-	cfg := config.Get()
-	cfg.Lock.RLock()
-	acc, ok := cfg.Accounts[user]
-	cfg.Lock.RUnlock()
-	if !ok || !acc.Enabled {
+	acc, err := store.GetAccount(user)
+	if err != nil || !acc.Enabled {
 		return nil, fmt.Errorf("auth failed")
 	}
 	if acc.ExpiryDate != "" {
@@ -184,9 +185,10 @@ func passwordCallback(c ssh.ConnMetadata, p []byte) (*ssh.Permissions, error) {
 		}
 		atomic.AddInt32(countPtr, 1)
 	}
-	if string(p) == acc.Password {
+	if store.VerifyPassword(acc.PasswordHash, string(p)) {
 		return nil, nil
 	}
+	// bcrypt 失敗:把剛剛累加的 session 計數退回去
 	if acc.MaxSessions > 0 {
 		if v, ok := userConnectionCount.Load(user); ok {
 			atomic.AddInt32(v.(*int32), -1)

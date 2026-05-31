@@ -1,7 +1,11 @@
 package cluster
 
 import (
+	"os"
+	"path/filepath"
 	"testing"
+
+	"wstunnel/internal/store"
 )
 
 func TestSignVerify(t *testing.T) {
@@ -34,16 +38,45 @@ func TestSignVerify(t *testing.T) {
 }
 
 func TestComposeContainsRequiredFields(t *testing.T) {
-	// 直接打到 config 套用最小設定;cluster 用 config singleton。
-	// 這裡不真的 init config,而是測單純呼叫不會 panic 的 path。
-	// (完整 e2e 留給整合測試。)
-	defer func() {
-		if r := recover(); r != nil {
-			t.Fatalf("panic: %v", r)
-		}
-	}()
-	_, err := GenerateSlaveCompose(ComposeOptions{NodeID: "non-existent"})
-	if err == nil {
+	// store 需要 init,用 tmp dir 跑
+	tmp := t.TempDir()
+	os.Setenv("WSTUNNEL_DB_PATH", filepath.Join(tmp, "test.db"))
+	t.Cleanup(func() { os.Unsetenv("WSTUNNEL_DB_PATH") })
+	if err := store.Init(); err != nil {
+		t.Fatalf("store init: %v", err)
+	}
+
+	if _, err := GenerateSlaveCompose(ComposeOptions{NodeID: "non-existent"}); err == nil {
 		t.Fatal("expected error for non-existent node")
 	}
+
+	// 加一個再產出來看看內容
+	rec, err := AddSlave("test-node", "")
+	if err != nil {
+		t.Fatalf("AddSlave: %v", err)
+	}
+	yaml, err := GenerateSlaveCompose(ComposeOptions{
+		NodeID:       rec.NodeID,
+		MasterURL:    "http://example.com:9090",
+		HeartbeatSec: 30,
+	})
+	if err != nil {
+		t.Fatalf("GenerateSlaveCompose: %v", err)
+	}
+	for _, want := range []string{"CLUSTER_ROLE", "MASTER_URL", "MASTER_TOKEN", rec.Token, rec.NodeID} {
+		if !contains(yaml, want) {
+			t.Errorf("yaml missing %q", want)
+		}
+	}
+}
+
+func contains(s, sub string) bool {
+	return len(s) >= len(sub) && (func() bool {
+		for i := 0; i+len(sub) <= len(s); i++ {
+			if s[i:i+len(sub)] == sub {
+				return true
+			}
+		}
+		return false
+	}())
 }

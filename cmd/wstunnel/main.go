@@ -32,6 +32,7 @@ import (
 	"wstunnel/internal/logging"
 	"wstunnel/internal/proxy"
 	"wstunnel/internal/sshsrv"
+	"wstunnel/internal/store"
 	"wstunnel/internal/tlsutil"
 	"wstunnel/internal/traffic"
 	"wstunnel/internal/udpgw"
@@ -42,6 +43,14 @@ func main() {
 	log.SetFlags(0)
 
 	config.LoadOrInit()
+	if err := store.Init(); err != nil {
+		log.Fatalf("FATAL: cannot init SQLite store: %v", err)
+	}
+	if err := config.MigrateFromLegacy(); err != nil {
+		log.Fatalf("FATAL: legacy config migration failed: %v", err)
+	}
+	config.EnsureDefaultAdmin()
+
 	printStartupBanner()
 	traffic.Load()
 
@@ -72,6 +81,7 @@ func main() {
 	// 叢集 hooks(僅 Slave 模式會用,但安全起見一律註冊)
 	cluster.RegisterSlaveHooks(cluster.SlaveHooks{
 		KickConnID:    sshsrv.KickByConnID,
+		KickUsername:  sshsrv.KickByUsername,
 		ListOnline:    onlineSnapshotForCluster,
 		ApplySettings: func(_ cluster.SharedSettings) { sshsrv.InitBufferPool() },
 	})
@@ -211,7 +221,8 @@ func printStartupBanner() {
 	}
 	switch c.ClusterRole {
 	case "master":
-		log.Printf("  Cluster Role: MASTER (registered slaves: %d)", len(c.Slaves))
+		slaves, _ := store.ListSlaves()
+		log.Printf("  Cluster Role: MASTER (registered slaves: %d)", len(slaves))
 	case "slave":
 		log.Printf("  Cluster Role: SLAVE (master=%s, node=%s)", c.MasterURL, c.NodeID)
 	default:

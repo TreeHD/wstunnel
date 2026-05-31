@@ -23,27 +23,23 @@ import (
 
 	"wstunnel/internal/config"
 	"wstunnel/internal/logging"
+	"wstunnel/internal/store"
 	"wstunnel/internal/traffic"
 )
 
 // SlaveHooks 是 Slave runtime 需要從外部注入的 callback,
 // 主要為了避免 cluster package 反向依賴 sshsrv / adminapi 造成 import 循環。
-//
-// main 啟動 Slave 時填入這些函式即可:
-//	cluster.RegisterSlaveHooks(cluster.SlaveHooks{
-//		KickConnID:   sshsrv.KickConnID,
-//		ListOnline:   sshsrv.OnlineSnapshotForCluster,
-//		ApplySettings: applyClusterSettings,
-//	})
 type SlaveHooks struct {
 	// KickConnID 強制斷開指定 conn_id 的 SSH 連線。找不到該回 false(會記錄但不影響運作)。
 	KickConnID func(connID string) bool
+
+	// KickUsername 踢光指定 user 的所有活躍連線(帳號被刪除/停用時用)。
+	KickUsername func(username string)
 
 	// ListOnline 回傳目前活躍連線的快照,給 heartbeat 上報用。
 	ListOnline func() []OnlineSnapshot
 
 	// ApplySettings 把 Master 下發的 SharedSettings 套用到本機 config。
-	// 由 main(或 wrapper)實作以呼叫 sshsrv.InitBufferPool / dnsx.Rebuild 等。
 	ApplySettings func(s SharedSettings)
 }
 
@@ -260,34 +256,44 @@ func applyHeartbeatResponse(resp *HeartbeatResponse) {
 	cfg := config.Get()
 	dirty := false
 
-	// 帳號:nil = 不變;非 nil 即整批覆蓋
+	// 帳號:nil = 不變;非 nil 即整批覆蓋(逐筆 upsert,並把 hash 直接寫進去)
 	if resp.Accounts != nil {
-		cfg.Lock.Lock()
-		// 偵測哪些帳號被刪除/停用,以便踢線(必須在替換前比對)
+		// 找出本地有但 Master 沒下發的帳號 → delete
+		existing, _ := store.ListAccounts()
 		killUsers := map[string]struct{}{}
-		for u, old := range cfg.Accounts {
-			newAcc, stillExists := resp.Accounts[u]
+		for _, old := range existing {
+			newAcc, stillExists := resp.Accounts[old.Username]
 			if !stillExists {
-				killUsers[u] = struct{}{}
+				killUsers[old.Username] = struct{}{}
+				_ = store.DeleteAccount(old.Username)
 				continue
 			}
 			if old.Enabled && !newAcc.Enabled {
-				killUsers[u] = struct{}{}
+				killUsers[old.Username] = struct{}{}
 			}
 		}
-		cfg.Accounts = make(map[string]config.AccountInfo, len(resp.Accounts))
-		for u, a := range resp.Accounts {
-			cfg.Accounts[u] = a
+		// 寫入 / 更新 Master 下發的帳號(密碼 hash 直接帶進去,不重新 hash)
+		for _, a := range resp.Accounts {
+			acc := store.Account{
+				Username:     a.Username,
+				PasswordHash: a.PasswordHash,
+				Enabled:      a.Enabled,
+				ExpiryDate:   a.ExpiryDate,
+				LimitGB:      a.LimitGB,
+				MaxSessions:  a.MaxSessions,
+				FriendlyName: a.FriendlyName,
+			}
+			// 傳空 newPlain → UpsertAccount 會用 acc.PasswordHash 寫進去
+			if err := store.UpsertAccount(acc, ""); err != nil {
+				log.Printf("Cluster: apply account %s failed: %v", a.Username, err)
+			}
 		}
-		cfg.Lock.Unlock()
-		dirty = true
-
-		// 踢除被刪/被停用的帳號(在鎖外做,避免和 sshsrv 互鎖)
-		h := getHooks()
-		_ = h // 帳號踢線走 sshsrv.KickByUsername,但目前 hooks 用 connID 模型;
-		// 為避免 cluster import sshsrv,讓 main 端在 ApplySettings hook 中或定期工作裡掃描
-		// 這裡先放著 — 不主動踢,等下一次 SSH 認證時自然失敗即可。
-		_ = killUsers
+		// 踢除被刪/被停用的帳號
+		if h := getHooks(); h.KickUsername != nil {
+			for u := range killUsers {
+				h.KickUsername(u)
+			}
+		}
 	}
 
 	// 共用設定
@@ -306,7 +312,6 @@ func applyHeartbeatResponse(resp *HeartbeatResponse) {
 		cfg.Lock.Unlock()
 		dirty = true
 
-		// 套用副作用(例如 buffer pool 重建)
 		if h := getHooks(); h.ApplySettings != nil {
 			h.ApplySettings(*resp.SharedSettings)
 		}

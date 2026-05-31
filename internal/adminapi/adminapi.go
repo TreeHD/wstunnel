@@ -5,7 +5,6 @@
 package adminapi
 
 import (
-	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -15,7 +14,6 @@ import (
 	"net/url"
 	"strings"
 	"sync"
-	"sync/atomic"
 	"time"
 
 	"github.com/shirou/gopsutil/v3/cpu"
@@ -28,6 +26,7 @@ import (
 	"wstunnel/internal/proxy"
 	"wstunnel/internal/session"
 	"wstunnel/internal/sshsrv"
+	"wstunnel/internal/store"
 	"wstunnel/internal/traffic"
 	"wstunnel/internal/udpgw"
 )
@@ -63,11 +62,7 @@ func loginHandler(w http.ResponseWriter, r *http.Request) {
 		session.SendJSON(w, http.StatusBadRequest, map[string]string{"message": "无效请求"})
 		return
 	}
-	cfg := config.Get()
-	cfg.Lock.RLock()
-	p, ok := cfg.AdminAccounts[creds.Username]
-	cfg.Lock.RUnlock()
-	if !ok || p != creds.Password {
+	if !store.VerifyAdminPassword(creds.Username, creds.Password) {
 		session.SendJSON(w, http.StatusUnauthorized, map[string]string{"message": "用户名或密码错误"})
 		return
 	}
@@ -150,12 +145,9 @@ func apiServerStatus(w http.ResponseWriter, r *http.Request) {
 
 func apiConnections(w http.ResponseWriter, r *http.Request) {
 	var conns []map[string]interface{}
-	cfg := config.Get()
 	sshsrv.OnlineRange(func(u *sshsrv.OnlineUser) bool {
-		cfg.Lock.RLock()
-		acc, ok := cfg.Accounts[u.Username]
-		cfg.Lock.RUnlock()
-		if !ok {
+		acc, err := store.GetAccount(u.Username)
+		if err != nil {
 			return true
 		}
 		t := traffic.Get(u.Username)
@@ -185,11 +177,19 @@ func apiConnections(w http.ResponseWriter, r *http.Request) {
 	session.SendJSON(w, http.StatusOK, conns)
 }
 
+// apiAccountsList 回傳所有帳號(密碼 hash 不會被序列化,Account.PasswordHash 是 json:"-")。
 func apiAccountsList(w http.ResponseWriter, r *http.Request) {
-	cfg := config.Get()
-	cfg.Lock.RLock()
-	defer cfg.Lock.RUnlock()
-	session.SendJSON(w, http.StatusOK, cfg.Accounts)
+	accounts, err := store.ListAccounts()
+	if err != nil {
+		session.SendJSON(w, http.StatusInternalServerError, map[string]string{"message": err.Error()})
+		return
+	}
+	// 為了和舊 UI 的 map<username, AccountInfo> 結構相容,把 list 轉成 map
+	out := make(map[string]store.Account, len(accounts))
+	for _, a := range accounts {
+		out[a.Username] = a
+	}
+	session.SendJSON(w, http.StatusOK, out)
 }
 
 func apiSetAccountStatus(w http.ResponseWriter, r *http.Request) {
@@ -205,17 +205,14 @@ func apiSetAccountStatus(w http.ResponseWriter, r *http.Request) {
 		session.SendJSON(w, http.StatusBadRequest, map[string]string{"message": "错误：用户名不能为空"})
 		return
 	}
-	cfg := config.Get()
-	cfg.Lock.Lock()
-	acc, ok := cfg.Accounts[payload.Username]
-	if !ok {
-		cfg.Lock.Unlock()
-		session.SendJSON(w, http.StatusNotFound, map[string]string{"message": "错误：用户不存在"})
+	if err := store.SetAccountEnabled(payload.Username, payload.Enabled); err != nil {
+		if err == store.ErrAccountNotFound {
+			session.SendJSON(w, http.StatusNotFound, map[string]string{"message": "错误：用户不存在"})
+			return
+		}
+		session.SendJSON(w, http.StatusInternalServerError, map[string]string{"message": err.Error()})
 		return
 	}
-	acc.Enabled = payload.Enabled
-	cfg.Accounts[payload.Username] = acc
-	cfg.Lock.Unlock()
 
 	if !payload.Enabled {
 		sshsrv.KickByUsername(payload.Username)
@@ -256,32 +253,35 @@ func apiUpsertAccount(w http.ResponseWriter, r *http.Request) {
 		session.SendJSON(w, http.StatusBadRequest, map[string]string{"message": "错误：用户名不能为空"})
 		return
 	}
-	var newInfo config.AccountInfo
 	bodyBytes, _ := ioutil.ReadAll(r.Body)
-	r.Body = ioutil.NopCloser(bytes.NewBuffer(bodyBytes))
-	tempInfo := struct {
-		Password *string `json:"password"`
-	}{}
-	json.Unmarshal(bodyBytes, &tempInfo)
-	json.Unmarshal(bodyBytes, &newInfo)
-
-	cfg := config.Get()
-	cfg.Lock.Lock()
-	existingInfo, isUpdate := cfg.Accounts[username]
-	if isUpdate {
-		if tempInfo.Password == nil {
-			newInfo.Password = existingInfo.Password
-		}
-	} else if newInfo.Password == "" {
-		cfg.Lock.Unlock()
-		session.SendJSON(w, http.StatusBadRequest, map[string]string{"message": "新用户必须提供密码"})
+	// 用 *string 區分「沒帶 password」與「帶了空字串」(後者視同想清空,但這裡不允許)
+	var payload struct {
+		Password     *string `json:"password"`
+		Enabled      bool    `json:"enabled"`
+		ExpiryDate   string  `json:"expiry_date"`
+		LimitGB      float64 `json:"limit_gb"`
+		MaxSessions  int     `json:"max_sessions"`
+		FriendlyName string  `json:"friendly_name"`
+	}
+	if err := json.Unmarshal(bodyBytes, &payload); err != nil {
+		session.SendJSON(w, http.StatusBadRequest, map[string]string{"message": "无效请求"})
 		return
 	}
-	cfg.Accounts[username] = newInfo
-	cfg.Lock.Unlock()
 
-	if err := config.Save(); err != nil {
-		session.SendJSON(w, http.StatusInternalServerError, map[string]string{"message": "保存配置失败: " + err.Error()})
+	newPlain := ""
+	if payload.Password != nil {
+		newPlain = *payload.Password
+	}
+	acc := store.Account{
+		Username:     username,
+		Enabled:      payload.Enabled,
+		ExpiryDate:   payload.ExpiryDate,
+		LimitGB:      payload.LimitGB,
+		MaxSessions:  payload.MaxSessions,
+		FriendlyName: payload.FriendlyName,
+	}
+	if err := store.UpsertAccount(acc, newPlain); err != nil {
+		session.SendJSON(w, http.StatusBadRequest, map[string]string{"message": err.Error()})
 		return
 	}
 	session.SendJSON(w, http.StatusOK, map[string]string{"message": "账户 " + username + " 更新成功"})
@@ -293,11 +293,10 @@ func apiDeleteAccount(w http.ResponseWriter, r *http.Request) {
 		session.SendJSON(w, http.StatusBadRequest, map[string]string{"message": "错误：不能删除空用户名的账户"})
 		return
 	}
-	cfg := config.Get()
-	cfg.Lock.Lock()
-	delete(cfg.Accounts, username)
-	cfg.Lock.Unlock()
-	config.Save()
+	if err := store.DeleteAccount(username); err != nil {
+		session.SendJSON(w, http.StatusInternalServerError, map[string]string{"message": err.Error()})
+		return
+	}
 	session.SendJSON(w, http.StatusOK, map[string]string{"message": "账户 " + username + " 删除成功"})
 }
 
@@ -319,17 +318,11 @@ func apiUpdateAdminPassword(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	user, _ := session.Validate(r)
-	cfg := config.Get()
-	cfg.Lock.Lock()
-	if cfg.AdminAccounts[user] == payload.OldPassword {
-		cfg.AdminAccounts[user] = payload.NewPassword
-		cfg.Lock.Unlock()
-		config.Save()
-		session.SendJSON(w, http.StatusOK, map[string]string{"message": "密码更新成功"})
-	} else {
-		cfg.Lock.Unlock()
+	if err := store.VerifyAndUpdateAdminPassword(user, payload.OldPassword, payload.NewPassword); err != nil {
 		session.SendJSON(w, http.StatusForbidden, map[string]string{"message": "旧密码错误"})
+		return
 	}
+	session.SendJSON(w, http.StatusOK, map[string]string{"message": "密码更新成功"})
 }
 
 func apiSettings(w http.ResponseWriter, r *http.Request) {
@@ -464,6 +457,3 @@ func Start(wg *sync.WaitGroup) *http.Server {
 	}()
 	return srv
 }
-
-// 抑制 unused import 警告:atomic 留著供未來使用
-var _ = atomic.Int64{}

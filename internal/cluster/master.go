@@ -4,10 +4,9 @@
 //   1. 維護 NodeID → *SlaveRuntime 的「即時狀態」記憶體表
 //   2. 提供 HTTP handler 供 Slave 心跳呼叫
 //   3. 將 Slave 回報的 traffic delta 累加進本機 traffic store
-//      (使 Master 能看到全叢集聚合的使用者總流量)
 //   4. 維護 per-slave 的踢除待辦佇列(由後台呼叫 RequestKick 加入)
 //
-// 持久化資料(node_id/token/name)放在 config.Slaves;runtime 狀態僅在記憶體。
+// 持久化資料(node_id/token/name)放在 store(SQLite);runtime 狀態僅在記憶體。
 package cluster
 
 import (
@@ -22,6 +21,7 @@ import (
 	"time"
 
 	"wstunnel/internal/config"
+	"wstunnel/internal/store"
 	"wstunnel/internal/traffic"
 )
 
@@ -41,15 +41,11 @@ type SlaveRuntime struct {
 	// Online 是 Slave 上次心跳所回報的活躍連線快照
 	Online []OnlineSnapshot
 
-	// LogTail 是來自此 Slave 的最近 log(由心跳累積,有上限以免吃記憶體)
+	// LogTail 是來自此 Slave 的最近 log
 	LogTail []LogEntry
 
 	// PendingKicks 是 Master 待 Slave 處理的踢除指令(map 為了去重)
 	PendingKicks map[string]struct{}
-
-	// totalRcvSent / totalRcvRcvd 用來偵測 Slave 重啟回報異常增量(目前只記錄,未強制處理)
-	totalRcvSent uint64
-	totalRcvRcvd uint64
 }
 
 // 單一 Master 進程的全域狀態。
@@ -90,54 +86,36 @@ func GenerateToken() string {
 	return hex.EncodeToString(buf[:])
 }
 
-// AddSlave 在 config.Slaves 中註冊一個新的 Slave 節點,回傳產生的 SlaveRecord(包含新 token)。
-func AddSlave(name, notes string) (config.SlaveRecord, error) {
-	cfg := config.Get()
-	cfg.Lock.Lock()
-	if cfg.Slaves == nil {
-		cfg.Slaves = make(map[string]config.SlaveRecord)
-	}
+// AddSlave 在 store 中註冊一個新節點,回傳產生的 SlaveRecord(包含新 token)。
+func AddSlave(name, notes string) (store.SlaveRecord, error) {
 	id := "node-" + GenerateToken()[:12]
-	rec := config.SlaveRecord{
+	rec := store.SlaveRecord{
 		NodeID:    id,
 		NodeName:  name,
 		Token:     GenerateToken(),
 		CreatedAt: time.Now().Unix(),
 		Notes:     notes,
 	}
-	cfg.Slaves[id] = rec
-	cfg.Lock.Unlock()
-	if err := config.Save(); err != nil {
-		return config.SlaveRecord{}, err
+	if err := store.UpsertSlave(rec); err != nil {
+		return store.SlaveRecord{}, err
 	}
 	return rec, nil
 }
 
-// RemoveSlave 從 config.Slaves 中移除一個節點,並丟棄其 runtime。
+// RemoveSlave 從 store 中移除一個節點,並丟棄其 runtime。
 func RemoveSlave(nodeID string) error {
-	cfg := config.Get()
-	cfg.Lock.Lock()
-	delete(cfg.Slaves, nodeID)
-	cfg.Lock.Unlock()
+	if err := store.DeleteSlave(nodeID); err != nil {
+		return err
+	}
 	masterMu.Lock()
 	delete(masterRuntimes, nodeID)
 	masterMu.Unlock()
-	return config.Save()
+	return nil
 }
 
 // RenameSlave 更新 Slave 的友善名稱。
 func RenameSlave(nodeID, newName string) error {
-	cfg := config.Get()
-	cfg.Lock.Lock()
-	rec, ok := cfg.Slaves[nodeID]
-	if !ok {
-		cfg.Lock.Unlock()
-		return fmt.Errorf("node not found")
-	}
-	rec.NodeName = newName
-	cfg.Slaves[nodeID] = rec
-	cfg.Lock.Unlock()
-	return config.Save()
+	return store.RenameSlave(nodeID, newName)
 }
 
 // RequestKick 把 conn_id 排入指定 Slave 的踢除佇列,等下次心跳下發。
@@ -176,13 +154,7 @@ const offlineThresholdSec = 90
 
 // ListSlaves 回傳所有已註冊節點 + runtime 狀態,給 UI 使用。
 func ListSlaves() []SlaveSummary {
-	cfg := config.Get()
-	cfg.Lock.RLock()
-	records := make([]config.SlaveRecord, 0, len(cfg.Slaves))
-	for _, v := range cfg.Slaves {
-		records = append(records, v)
-	}
-	cfg.Lock.RUnlock()
+	records, _ := store.ListSlaves()
 
 	masterMu.RLock()
 	defer masterMu.RUnlock()
@@ -213,29 +185,26 @@ func ListSlaves() []SlaveSummary {
 	return out
 }
 
-// SlaveOnlineSnapshot 同時回傳所有 Slave 上的線上連線(展開為單一 list,each tagged with node)。
+// SlaveOnlineEntry 同時帶上「在哪台 Slave」的線上連線快照。
 type SlaveOnlineEntry struct {
-	NodeID     string `json:"node_id"`
-	NodeName   string `json:"node_name"`
+	NodeID   string `json:"node_id"`
+	NodeName string `json:"node_name"`
 	OnlineSnapshot
 }
 
 // AllOnline 給 Master UI 拉取「跨節點線上連線」清單。
 func AllOnline() []SlaveOnlineEntry {
-	cfg := config.Get()
+	records, _ := store.ListSlaves()
 	nameMap := map[string]string{}
-	cfg.Lock.RLock()
-	for id, r := range cfg.Slaves {
-		nameMap[id] = r.NodeName
+	for _, r := range records {
+		nameMap[r.NodeID] = r.NodeName
 	}
-	cfg.Lock.RUnlock()
 
 	masterMu.RLock()
 	defer masterMu.RUnlock()
 	var out []SlaveOnlineEntry
 	now := time.Now().Unix()
 	for id, rt := range masterRuntimes {
-		// 已離線太久就不展示
 		if rt.LastSeen.IsZero() || now-rt.LastSeen.Unix() > offlineThresholdSec {
 			continue
 		}
@@ -267,19 +236,11 @@ func SlaveLogTail(nodeID string, limit int) []LogEntry {
 }
 
 // HandleHeartbeat 是 Master 對 /api/cluster/heartbeat 的 HTTP handler。
-//
-// 流程:
-//   1. 讀 body(限制大小防 DoS)
-//   2. 用 X-Cluster-Node-ID 找對應 token
-//   3. 驗 Bearer + HMAC
-//   4. 反序列化 → 更新 runtime → 累計 traffic
-//   5. 組裝 response 回送
 func HandleHeartbeat(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		writeJSON(w, http.StatusMethodNotAllowed, map[string]string{"error": "method not allowed"})
 		return
 	}
-	// 1MB 上限,單一心跳不可能更大
 	body, err := io.ReadAll(io.LimitReader(r.Body, 1<<20))
 	if err != nil {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "read body failed"})
@@ -300,11 +261,8 @@ func HandleHeartbeat(w http.ResponseWriter, r *http.Request) {
 	}
 	token := auth[len(bearer):]
 
-	cfg := config.Get()
-	cfg.Lock.RLock()
-	rec, ok := cfg.Slaves[nodeID]
-	cfg.Lock.RUnlock()
-	if !ok || rec.Token != token {
+	rec, err := store.GetSlave(nodeID)
+	if err != nil || rec.Token != token {
 		writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "unknown node or token"})
 		return
 	}
@@ -346,19 +304,17 @@ func HandleHeartbeat(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	// 處理 ack 的踢除指令
 	for _, cid := range req.AckKick {
 		delete(rt.PendingKicks, cid)
 	}
 
-	// 收集要下發的 kick(複製出來,避免持鎖跨包邊界)
 	kicks := make([]string, 0, len(rt.PendingKicks))
 	for cid := range rt.PendingKicks {
 		kicks = append(kicks, cid)
 	}
 	masterMu.Unlock()
 
-	// === 流量聚合:把 Slave 增量累加到 Master 的 traffic store ===
+	// === 流量聚合 ===
 	for user, d := range req.TrafficDelta {
 		t := traffic.Get(user)
 		traffic.AddSent(t, d.Sent)
@@ -366,11 +322,23 @@ func HandleHeartbeat(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// === 組裝 response ===
-	cfg.Lock.RLock()
-	accounts := make(map[string]config.AccountInfo, len(cfg.Accounts))
-	for u, a := range cfg.Accounts {
-		accounts[u] = a
+	// Accounts:從 store 拉所有帳號,連 hash 一起送(Slave 端要拿 hash 寫回 SQLite)
+	accountList, _ := store.ListAccounts()
+	accounts := make(map[string]AccountSync, len(accountList))
+	for _, a := range accountList {
+		accounts[a.Username] = AccountSync{
+			Username:     a.Username,
+			PasswordHash: a.PasswordHash,
+			Enabled:      a.Enabled,
+			ExpiryDate:   a.ExpiryDate,
+			LimitGB:      a.LimitGB,
+			MaxSessions:  a.MaxSessions,
+			FriendlyName: a.FriendlyName,
+		}
 	}
+
+	cfg := config.Get()
+	cfg.Lock.RLock()
 	shared := &SharedSettings{
 		HandshakeTimeout:            cfg.HandshakeTimeout,
 		ConnectUA:                   cfg.ConnectUA,

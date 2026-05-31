@@ -15,8 +15,6 @@ import (
 	"crypto/hmac"
 	"crypto/sha256"
 	"encoding/hex"
-
-	"wstunnel/internal/config"
 )
 
 // 通訊協定版本,日後欄位變動時可用來做相容判斷。
@@ -37,6 +35,21 @@ const (
 	RoleMaster     Role = "master"     // 集中管理者
 	RoleSlave      Role = "slave"      // 工作節點,定期向 Master 心跳
 )
+
+// AccountSync 是叢集同步用的帳號封裝。
+//
+// 為何不直接用 store.Account?store.Account 的 PasswordHash 標 json:"-",
+// 對外永不暴露(避免 admin API 不小心吐出來)。叢集同步需要把 hash 跨機傳遞,
+// 所以這裡用一份「明確序列化 hash」的副本。傳輸通道靠 HTTPS + HMAC 保護。
+type AccountSync struct {
+	Username     string  `json:"username"`
+	PasswordHash string  `json:"password_hash"`
+	Enabled      bool    `json:"enabled"`
+	ExpiryDate   string  `json:"expiry_date"`
+	LimitGB      float64 `json:"limit_gb"`
+	MaxSessions  int     `json:"max_sessions"`
+	FriendlyName string  `json:"friendly_name"`
+}
 
 // TrafficDelta 是一次心跳要回報的單一使用者流量增量。
 //
@@ -112,7 +125,7 @@ type HeartbeatResponse struct {
 
 	// Accounts:Master 上所有要下發到 Slave 的帳號 (nil 表示「不變動」)。
 	// 注意是 nil 才是不變;空 map {} 表示「清空所有帳號」。
-	Accounts map[string]config.AccountInfo `json:"accounts,omitempty"`
+	Accounts map[string]AccountSync `json:"accounts,omitempty"`
 
 	// SharedSettings:要下發的共用設定。同樣 nil = 不變。
 	SharedSettings *SharedSettings `json:"shared_settings,omitempty"`

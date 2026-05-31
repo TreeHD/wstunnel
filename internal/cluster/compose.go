@@ -1,17 +1,11 @@
 // compose.go — Master 端依 SlaveRecord 動態產生 Slave 端 docker-compose.yml。
-//
-// 設計目標:使用者在 Master UI 加完節點後,直接複製貼到 Slave 機器即可運作,
-// 不需手動填 NodeID/Token。
-//
-// 注意:Master URL 由前端傳入(因為 Master 不知道自己的對外 URL),
-// 後端僅做基本欄位代換 + YAML escape。
 package cluster
 
 import (
 	"fmt"
 	"strings"
 
-	"wstunnel/internal/config"
+	"wstunnel/internal/store"
 )
 
 // ComposeOptions 是產生 compose 時前端可調整的參數。
@@ -26,16 +20,9 @@ type ComposeOptions struct {
 }
 
 // GenerateSlaveCompose 對指定 NodeID 產生一份 docker-compose.yml。
-// 找不到該 node 會回傳 error。
 func GenerateSlaveCompose(opt ComposeOptions) (string, error) {
-	cfg := config.Get()
-	if cfg == nil {
-		return "", fmt.Errorf("config not initialized")
-	}
-	cfg.Lock.RLock()
-	rec, ok := cfg.Slaves[opt.NodeID]
-	cfg.Lock.RUnlock()
-	if !ok {
+	rec, err := store.GetSlave(opt.NodeID)
+	if err != nil {
 		return "", fmt.Errorf("node %s not found", opt.NodeID)
 	}
 
