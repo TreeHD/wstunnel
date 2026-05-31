@@ -67,17 +67,19 @@ func GenerateSlaveCompose(opt ComposeOptions) (string, error) {
 	sb.WriteString("      - \"80:80\"\n")
 	sb.WriteString("      - \"443:443\"\n")
 	sb.WriteString("      - \"9090:9090\"\n")
+	// 用 YAML map form 寫 environment;array form (- KEY=VAL) 不會剝引號,
+	// 之前用過 - MASTER_URL='https://x' 結果 docker-compose 把單引號當值的一部分
 	sb.WriteString("    environment:\n")
-	sb.WriteString("      - CLUSTER_ROLE=slave\n")
-	fmt.Fprintf(&sb, "      - MASTER_URL=%s\n", q(opt.MasterURL))
-	fmt.Fprintf(&sb, "      - MASTER_TOKEN=%s\n", q(rec.Token))
-	fmt.Fprintf(&sb, "      - NODE_ID=%s\n", q(rec.NodeID))
-	fmt.Fprintf(&sb, "      - NODE_NAME=%s\n", q(rec.NodeName))
+	sb.WriteString("      CLUSTER_ROLE: slave\n")
+	fmt.Fprintf(&sb, "      MASTER_URL: %s\n", q(opt.MasterURL))
+	fmt.Fprintf(&sb, "      MASTER_TOKEN: %s\n", q(rec.Token))
+	fmt.Fprintf(&sb, "      NODE_ID: %s\n", q(rec.NodeID))
+	fmt.Fprintf(&sb, "      NODE_NAME: %s\n", q(rec.NodeName))
 	if opt.PublicAddr != "" {
-		fmt.Fprintf(&sb, "      - PUBLIC_ADDR=%s\n", q(opt.PublicAddr))
+		fmt.Fprintf(&sb, "      PUBLIC_ADDR: %s\n", q(opt.PublicAddr))
 	}
-	fmt.Fprintf(&sb, "      - HEARTBEAT_INTERVAL_SEC=%d\n", opt.HeartbeatSec)
-	fmt.Fprintf(&sb, "      - SKIP_MASTER_TLS_VERIFY=%s\n", skip)
+	fmt.Fprintf(&sb, "      HEARTBEAT_INTERVAL_SEC: %d\n", opt.HeartbeatSec)
+	fmt.Fprintf(&sb, "      SKIP_MASTER_TLS_VERIFY: %s\n", skip)
 	sb.WriteString("    volumes:\n")
 	sb.WriteString("      - ./data:/app/data\n")
 	sb.WriteString("    healthcheck:\n")
@@ -94,7 +96,7 @@ func GenerateSlaveCompose(opt ComposeOptions) (string, error) {
 		sb.WriteString("    ports:\n")
 		sb.WriteString("      - \"53:5353/udp\"\n")
 		sb.WriteString("    environment:\n")
-		fmt.Fprintf(&sb, "      - DNSTT_DOMAIN=%s\n", q(opt.DNSTTDomain))
+		fmt.Fprintf(&sb, "      DNSTT_DOMAIN: %s\n", q(opt.DNSTTDomain))
 		sb.WriteString("    volumes:\n")
 		sb.WriteString("      - ./data/dnstt:/app/data\n")
 	}
